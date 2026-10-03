@@ -12,6 +12,13 @@ npm run dev
 
 Then open http://localhost:5180 in Chrome or Edge. Press **F11** for full screen.
 
+### Play online (iPad, any computer)
+
+Play it at **https://daniellmurphy76-coder.github.io/foam-fleet/**
+
+Every push to `main` builds the game and publishes it to GitHub Pages
+(`.github/workflows/deploy.yml`). Open the Pages address in Safari or Chrome; no install needed.
+
 ## Modes
 
 - **Dart Battle**: tag other boats with foam darts. Every hit is a point. Most points when the clock runs out wins.
