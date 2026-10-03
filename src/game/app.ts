@@ -285,7 +285,10 @@ class FoamApp {
     // touches the live layer, so the results overlay shown right below is unaffected.
     this.hud.hide();
     this.hud.showResults(match.result(), () => this.startMatch(match.setup), () => this.enterMenu());
-    this.sfx.victory();
+    // Boats vs. Sharks that the sharks won gets a friendly wah-wah instead of the fanfare.
+    const lost = match.setup.mode === 'sharks' && !match.mode.outcome(match.boats[0]?.id ?? 0).won;
+    if (lost) this.sfx.defeat();
+    else this.sfx.victory();
   }
 
   private disposeMatch(): void {
@@ -438,6 +441,7 @@ class FoamApp {
       case 'race': return 'Race through the gates!';
       case 'team': return `${CONFIG.team.names[0]} vs ${CONFIG.team.names[1]}!`;
       case 'practice': return 'Pop all the balloons!';
+      case 'sharks': return 'Team up and scare off the sharks!';
       default: return 'Tag the other boats!';
     }
   }
@@ -505,7 +509,8 @@ class FoamApp {
         rank: mode.rankOf(i),
         race: mode.raceInfo(i),
         arrow,
-        lockedTarget: lockId != null ? m.boats[lockId]?.name ?? null : null,
+        // A boat's name, or "Shark" / "MEGA SHARK" when the blaster is locked onto a shark (ids from SHARK_ID_BASE up).
+        lockedTarget: lockId != null ? m.targetName(lockId) : null,
         boatId: boat.id,
         team: boat.team,
         viewHeading: m.cams[i].viewHeading,
@@ -528,6 +533,7 @@ class FoamApp {
       scoreboard,
       teams: mode.teams(),
       balloons: mode.balloonCount(),
+      sharks: mode.sharkHud(),
       map: m.mapState(),
     };
   }
@@ -674,6 +680,8 @@ class FoamApp {
       raceTime: null,
       balloons: null,
       teams: null,
+      sharks: null,
+      sharkRules: null,
       humans: [],
       fallbacks: foam.fallbacks.slice(),
       touchActive: this.input.touchActive === true,
@@ -692,6 +700,13 @@ class FoamApp {
       snap.raceTime = m.mode.raceTime();
       snap.balloons = m.mode.balloonCount();
       snap.teams = m.mode.teams();
+      const mega = m.sharks.mega;
+      snap.sharks = {
+        waveLeft: m.sharks.waveLeft,
+        mega: mega ? { health: mega.health, maxHealth: mega.maxHealth } : null,
+        count: m.sharks.targets.length,
+      };
+      snap.sharkRules = m.mode.sharkHud();
       for (const p of m.players) {
         snap.humans.push({
           slot: p.slot,
@@ -703,6 +718,8 @@ class FoamApp {
           pickups: p.pickups,
           honks: p.honks,
           rescues: p.rescues,
+          sharkTags: p.sharkTags,
+          sharkBumps: p.sharkBumps,
         });
       }
       for (const b of m.boats) {

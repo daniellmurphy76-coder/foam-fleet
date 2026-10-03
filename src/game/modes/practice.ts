@@ -5,7 +5,7 @@
  */
 import type * as THREE from 'three';
 import { CONFIG } from '../../config';
-import type { BalloonPop, Boat, Checkpoint, RaceHudInfo, ResultRow, TeamScore } from '../../types';
+import type { BalloonPop, Boat, Checkpoint, RaceHudInfo, ResultRow, SharkHud, TeamScore } from '../../types';
 import { formatTime } from '../util';
 import type { GameMode, GateTargets, ModeHost, ModeOutcome, ModeResult } from './mode';
 
@@ -67,6 +67,9 @@ export class PracticeMode implements GameMode {
   }
 
   onTag(): void {}
+  /** Sharks cruise through Balloon Pop for looks only: nothing they do counts. */
+  onSharkBump(): void {}
+  onSharkTag(): void {}
 
   onBalloon(pop: BalloonPop): void {
     if (pop.boatId < 0 || pop.boatId >= this.score.length) return;
@@ -88,6 +91,7 @@ export class PracticeMode implements GameMode {
   rankOf(boatId: number): number { return this.rank[boatId] || 1; }
   raceInfo(): RaceHudInfo | null { return null; }
   teams(): TeamScore[] | null { return null; }
+  sharkHud(): SharkHud | null { return null; }
 
   balloonCount(): { remaining: number; total: number } | null {
     const b = this.host.balloons;

@@ -4,7 +4,7 @@ import type { Boat, Effects, WorldQuery } from '../types';
 import { BillboardLayer, FoamLayer, F, P } from './particles';
 
 /**
- * Splashes, hit bursts, sparkles, balloon pops, honk notes and boat wakes.
+ * Splashes, hit bursts, sparkles, shark-dive bubbles, balloon pops, honk notes and boat wakes.
  *
  * Everything here is drawn by two pooled particle layers (see particles.ts), so the whole
  * effects system costs two draw calls however busy the lagoon gets.
@@ -31,6 +31,17 @@ const NOTE_GAP = 0.1;
 const NOTE_LIFT = 2.3;
 /** Notes still waiting for their turn. Mashing the horn can't queue more than this. */
 const NOTE_QUEUE = 24;
+
+// Shark-dive bubbles: module-private numbers a kid would not normally touch.
+/** How many bubbles one dive sends up. They set off a beat apart, so the column lasts about a second. */
+const BUBBLE_COUNT = 13;
+const BUBBLE_STAGGER = 0.045;
+/** Bubbles still waiting for their turn. Several sharks diving at once fit; mashing can't queue more than this. */
+const BUBBLE_QUEUE = 120;
+/** Bubbles are born this far under the water (and rise to it), so the deepest are only just hidden by the waves. */
+const BUBBLE_DEPTH_MIN = 0.15;
+const BUBBLE_DEPTH_MAX = 0.5;
+const BUBBLE_COLOR = new THREE.Color(0xd2f2ff);
 
 // Wake tuning: module-private numbers a kid would not normally touch.
 /** Distance from the boat's waterline point back to the end of its hull. */
@@ -74,6 +85,14 @@ interface QueuedNote {
   pair: boolean; // two beamed notes instead of one
 }
 
+/** A dive bubble waiting for its turn to rise. */
+interface QueuedBubble {
+  wait: number; // seconds until it is born
+  x: number;
+  z: number;
+  big: boolean;
+}
+
 export function createEffects(scene: THREE.Scene): Effects {
   const sparks = new BillboardLayer(BILLBOARD_CAPACITY);
   const foam = new FoamLayer(FOAM_CAPACITY, WAKE_CAP);
@@ -96,6 +115,13 @@ export function createEffects(scene: THREE.Scene): Effects {
   for (let i = 0; i < NOTE_QUEUE; i++) {
     notesIdle.push({ wait: 0, x: 0, y: 0, z: 0, color: new THREE.Color(), pair: false });
   }
+
+  // Dive bubbles waiting to rise (pooled the same way). The surface height comes from the latest update().
+  const bubblesIdle: QueuedBubble[] = [];
+  const bubblesWaiting: QueuedBubble[] = [];
+  for (let i = 0; i < BUBBLE_QUEUE; i++) bubblesIdle.push({ wait: 0, x: 0, z: 0, big: false });
+  let lastWorld: WorldQuery | null = null;
+  let lastT = 0;
 
   /** Random direction on a sphere, pushed upward a bit so bursts pop up and out. */
   function randomDir(upBias: number): void {
@@ -367,6 +393,64 @@ export function createEffects(scene: THREE.Scene): Effects {
     }
   }
 
+  // ───────────────────────────── bubbles ─────────────────────────────
+
+  /**
+   * A shark dives: a column of bubbles rises where it went down and pops at the surface, over about a second.
+   * The bubbles set off one after another (a few of them big), scattered around `p` the way a shark's body
+   * is long. Only p.x and p.z matter: the bubbles start just under the waves and climb to the water.
+   */
+  function bubbles(p: THREE.Vector3): void {
+    for (let k = 0; k < BUBBLE_COUNT; k++) {
+      const b = bubblesIdle.pop();
+      if (!b) return; // too many dives at once: skip the extras
+      b.wait = k * BUBBLE_STAGGER + rand(0, 0.03);
+      b.x = p.x + rand(-1.0, 1.0);
+      b.z = p.z + rand(-1.0, 1.0);
+      b.big = k % 5 === 2;
+      bubblesWaiting.push(b);
+    }
+  }
+
+  /** Send up every queued bubble whose turn has come (born a little under the water, rising to it). */
+  function launchBubbles(dt: number): void {
+    for (let i = bubblesWaiting.length - 1; i >= 0; i--) {
+      const b = bubblesWaiting[i];
+      b.wait -= dt;
+      if (b.wait > 0) continue;
+      const surface = lastWorld ? lastWorld.waveHeight(b.x, b.z, lastT) : 0;
+      const size = b.big ? rand(0.5, 0.66) : rand(0.2, 0.4);
+      sparks.emit(
+        P.BUBBLE,
+        b.x, surface - rand(BUBBLE_DEPTH_MIN, BUBBLE_DEPTH_MAX), b.z,
+        rand(-0.1, 0.1), rand(0.7, 1.05), rand(-0.1, 0.1),
+        2.0, size, size * 1.25, // the long life is only a safety net: it pops at the surface long before that
+        BUBBLE_COLOR,
+      );
+      bubblesWaiting[i] = bubblesWaiting[bubblesWaiting.length - 1];
+      bubblesWaiting.pop();
+      bubblesIdle.push(b);
+    }
+  }
+
+  /** A bubble reached the surface: a pinch of droplets and a tiny ripple. */
+  function bubblePop(x: number, y: number, z: number): void {
+    for (let i = 0; i < 3; i++) {
+      const a = Math.random() * TAU;
+      const sp = rand(0.3, 0.9);
+      const d = rand(0.06, 0.11);
+      sparks.emit(
+        P.DROPLET,
+        x, y + 0.03, z,
+        Math.cos(a) * sp, rand(1.4, 2.4), Math.sin(a) * sp,
+        rand(0.5, 0.7), d, d * 0.5,
+        WHITE,
+      );
+    }
+    foam.emit(F.RIPPLE, x, z, 0, 0, 0.55, 0.12, 0.7, 0.6, 1.0, 0);
+  }
+  sparks.onSurfacePop = bubblePop;
+
   // ───────────────────────────── wake ─────────────────────────────
 
   /**
@@ -505,7 +589,10 @@ export function createEffects(scene: THREE.Scene): Effects {
 
   function update(dt: number, t: number, world: WorldQuery): void {
     lastDt = clamp(dt, 0, 0.05);
+    lastWorld = world;
+    lastT = t;
     launchNotes(lastDt);
+    launchBubbles(lastDt);
     sparks.update(lastDt, t, world);
     foam.update(lastDt, t, world);
   }
@@ -515,15 +602,18 @@ export function createEffects(scene: THREE.Scene): Effects {
     foam.clear();
     wakeStates.clear();
     while (notesWaiting.length > 0) notesIdle.push(notesWaiting.pop() as QueuedNote);
+    while (bubblesWaiting.length > 0) bubblesIdle.push(bubblesWaiting.pop() as QueuedBubble);
   }
 
   function dispose(): void {
     clear();
+    sparks.onSurfacePop = null;
+    lastWorld = null;
     sparks.dispose();
     foam.dispose();
   }
 
   // `puff` is an extra beyond the Effects contract (see its comment); typed as Effects on the way out.
-  const effects = { splash, hitBurst, sparkle, pop, notes, puff, wake, update, clear, dispose };
+  const effects = { splash, hitBurst, sparkle, bubbles, pop, notes, puff, wake, update, clear, dispose };
   return effects;
 }

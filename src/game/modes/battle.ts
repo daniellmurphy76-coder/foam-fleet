@@ -6,7 +6,7 @@
  */
 import type * as THREE from 'three';
 import { CONFIG } from '../../config';
-import type { Boat, Checkpoint, ModeId, RaceHudInfo, ResultRow, TeamScore } from '../../types';
+import type { Boat, Checkpoint, ModeId, RaceHudInfo, ResultRow, SharkHud, TeamScore } from '../../types';
 import type { GameMode, GateTargets, ModeHost, ModeOutcome, ModeResult } from './mode';
 
 const NO_GATES: readonly Checkpoint[] = [];
@@ -69,6 +69,8 @@ export class BattleMode implements GameMode {
   }
 
   onBalloon(): void {}
+  onSharkBump(): void {}
+  onSharkTag(): void {}
 
   gates(_boatId: number, out: GateTargets): void {
     out.next = null;
@@ -85,6 +87,7 @@ export class BattleMode implements GameMode {
   raceInfo(): RaceHudInfo | null { return null; }
   teams(): TeamScore[] | null { return null; }
   balloonCount(): { remaining: number; total: number } | null { return null; }
+  sharkHud(): SharkHud | null { return null; }
 
   outcome(boatId: number): ModeOutcome {
     return { won: !this.isTied() && this.ranking[0]?.id === boatId, finished: false, finishTime: null };

@@ -9,7 +9,7 @@
  */
 import { CONFIG } from '../../config';
 import type * as THREE from 'three';
-import type { Boat, Checkpoint, RaceHudInfo, ResultRow, TeamScore } from '../../types';
+import type { Boat, Checkpoint, RaceHudInfo, ResultRow, SharkHud, TeamScore } from '../../types';
 import { fallbackCheckpoints } from '../fallbacks';
 import { formatTime, ordinal } from '../util';
 import type { GameMode, GateTargets, ModeHost, ModeOutcome, ModeResult } from './mode';
@@ -106,6 +106,8 @@ export class RaceMode implements GameMode {
   /** Darts only stun in a race (the dart system does that); no points to hand out. */
   onTag(): void {}
   onBalloon(): void {}
+  onSharkBump(): void {}
+  onSharkTag(): void {}
 
   gates(boatId: number, out: GateTargets): void {
     if (this.finished[boatId]) {
@@ -136,6 +138,7 @@ export class RaceMode implements GameMode {
   rankOf(boatId: number): number { return this.rank[boatId] || 1; }
   teams(): TeamScore[] | null { return null; }
   balloonCount(): { remaining: number; total: number } | null { return null; }
+  sharkHud(): SharkHud | null { return null; }
 
   raceInfo(boatId: number): RaceHudInfo {
     return {

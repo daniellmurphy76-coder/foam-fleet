@@ -23,6 +23,8 @@ const SETTLE_FADE = 0.14;
 const FOAM_LIFT = 0.07;
 /** Billboards are nudged this many meters toward the camera so they never get buried in a hull or the sea. */
 const CAMERA_BIAS = 0.35;
+/** A bubble that reaches the surface swells by this much (a share of its size) while it pops. */
+const BUBBLE_SWELL = 0.6;
 
 // ───────────────────────────── Billboard particle kinds ─────────────────────────────
 
@@ -41,6 +43,7 @@ export const P = {
   MIST: 10, // faint soft cloud off a fast boat (low priority)
   NOTE: 11, // cartoon music note (one head with a flag), floats up
   NOTE2: 12, // cartoon music notes (two heads joined by a beam), floats up
+  BUBBLE: 13, // see-through bubble that rises, sways, and pops when it reaches the water surface
 } as const;
 
 /** Kinds of flat foam on the water. */
@@ -63,6 +66,7 @@ const SHAPE_SOFT = 5;
 const SHAPE_FLASH = 6; // like SOFT, but drawn in front of whatever it overlaps
 const SHAPE_NOTE = 7; // music note with a dark outline
 const SHAPE_NOTE2 = 8; // beamed pair of music notes with a dark outline
+const SHAPE_BUBBLE = 9; // clear ring with a faint fill and a shiny spot
 
 // How a particle's size changes over its life.
 const SIZE_LERP = 0; // ease from size0 to size1
@@ -85,6 +89,10 @@ interface KindDef {
   water: boolean;
   /** Skipped when the pool is nearly full, so wake spray can never crowd out hit bursts. */
   soft: boolean;
+  /** Rises through the water: pops (and tells `onSurfacePop`) the moment it reaches the surface. */
+  surface?: boolean;
+  /** Sways sideways by up to this many meters while alive. */
+  wobble?: number;
 }
 
 const KINDS: KindDef[] = [
@@ -101,6 +109,7 @@ const KINDS: KindDef[] = [
   /* MIST     */ { shape: SHAPE_SOFT, sizeMode: SIZE_LERP, gravity: 0.4, drag: 3.0, spin: 0, fade: 0.7, water: false, soft: true },
   /* NOTE     */ { shape: SHAPE_NOTE, sizeMode: SIZE_HOLD, gravity: -2.2, drag: 1.4, spin: 0.35, fade: 0.4, water: false, soft: false },
   /* NOTE2    */ { shape: SHAPE_NOTE2, sizeMode: SIZE_HOLD, gravity: -2.2, drag: 1.4, spin: 0.35, fade: 0.4, water: false, soft: false },
+  /* BUBBLE   */ { shape: SHAPE_BUBBLE, sizeMode: SIZE_LERP, gravity: 0, drag: 0, spin: 0, fade: 0.2, water: false, soft: false, surface: true, wobble: 0.12 },
 ];
 
 // Layout of one particle inside the `sim` Float32Array.
@@ -171,7 +180,8 @@ void main() {
   mvPosition.xy += r * aSizeRot.x * 0.5;   // build the quad in view space = always faces the camera
   // Nudge toward the camera so particles are never buried in a hull or the sea.
   // Flashes and rings (shapes 3 and 6) get a big nudge so they show in full even when centred on a hull.
-  mvPosition.z += ((aShape > 5.5 && aShape < 6.5) || (aShape > 2.5 && aShape < 3.5)) ? uBias * 4.5 : uBias;
+  // Bubbles (shape 9) get it too: they start a little under the water and still need to show through it.
+  mvPosition.z += ((aShape > 5.5 && aShape < 6.5) || (aShape > 2.5 && aShape < 3.5) || aShape > 8.5) ? uBias * 4.5 : uBias;
   vCorner = q;
   vColor = aColor;
   vShape = aShape;
@@ -258,6 +268,12 @@ void main() {
     a = 1.0 - smoothstep(-0.04, 0.04, sd);
   } else if (vShape < 6.5) {     // soft puff / flash
     a = 1.0 - smoothstep(0.35, 1.0, d);
+  } else if (vShape > 8.5) {     // bubble: a clear rim, a faint fill, and a shiny spot
+    float rim = 1.0 - smoothstep(0.07, 0.17, abs(d - 0.8));
+    float fill = (1.0 - smoothstep(0.7, 0.9, d)) * 0.24;
+    float shine = 1.0 - smoothstep(0.08, 0.2, length(p - vec2(-0.32, 0.34)));
+    a = max(max(rim * 0.9, fill), shine);
+    rgb = mix(rgb, vec3(1.0), max(rim * 0.5, shine));
   } else {                       // music note: the particle's color with a dark outline so it reads on sky and sea
     float sd = noteShape(p, vShape > 7.5);
     a = 1.0 - smoothstep(0.06, 0.11, sd);
@@ -280,6 +296,8 @@ export class BillboardLayer {
   /** Soft kinds (wake spray) stop spawning above this many live particles. */
   private readonly softCap: number;
   private count = 0;
+  /** Called with the spot where a rising bubble reaches the water, so the effects can add a pinch of spray. */
+  onSurfacePop: ((x: number, y: number, z: number) => void) | null = null;
 
   private readonly sim: Float32Array;
   private readonly aOffset: THREE.InstancedBufferAttribute;
@@ -378,12 +396,14 @@ export class BillboardLayer {
       let alphaMul = 1;
 
       const die = s[o + DIE];
+      let swell = 1;
       if (die > 0) {
-        // Touched the water: frozen in place, melting away.
+        // Touched the water: frozen in place, melting away (a bubble swells a little as it pops).
         const left = die - dt;
         if (left <= 0) { this.removeAt(i); continue; }
         s[o + DIE] = left;
         alphaMul = left / SETTLE_FADE;
+        if (kd.surface) swell = 1 + BUBBLE_SWELL * (1 - alphaMul);
       } else {
         age += dt;
         if (age >= life) { this.removeAt(i); continue; }
@@ -409,6 +429,15 @@ export class BillboardLayer {
           s[o + DRAG] = 0;
           s[o + DIE] = SETTLE_FADE;
         }
+      } else if (kd.surface && vy > 0 && die <= 0) {
+        // A bubble that has come up to the surface: pop.
+        const wy = world.waveHeight(x, z, t);
+        if (y >= wy) {
+          y = wy;
+          vx = 0; vy = 0; vz = 0;
+          s[o + DIE] = SETTLE_FADE;
+          if (this.onSurfacePop) this.onSurfacePop(x, y, z);
+        }
       }
       s[o + X] = x; s[o + Y] = y; s[o + Z] = z;
       s[o + VX] = vx; s[o + VY] = vy; s[o + VZ] = vz;
@@ -431,9 +460,12 @@ export class BillboardLayer {
       let a = (1 - u) / kd.fade;
       if (a > 1) a = 1;
       a *= alphaMul;
+      size *= swell;
 
       const p3 = i * 3;
-      off[p3] = x; off[p3 + 1] = y; off[p3 + 2] = z;
+      // Bubbles sway as they rise (only what is drawn moves, so the path itself stays a straight climb).
+      const sway = kd.wobble ? kd.wobble * Math.sin(age * 9 + rot * 3) : 0;
+      off[p3] = x + sway; off[p3 + 1] = y; off[p3 + 2] = z + sway * 0.6;
       col[i * 4 + 3] = a < 0 ? 0 : a;
       sr[i * 2] = size < 0 ? 0 : size;
       sr[i * 2 + 1] = rot;

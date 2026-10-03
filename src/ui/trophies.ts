@@ -24,7 +24,14 @@ export const TROPHIES: readonly TrophyDef[] = [
   { id: 'rocket-boat', name: 'Rocket Boat', icon: '🚀', description: 'Boost for 10 seconds in one game.' },
   { id: 'honk-honk', name: 'Honk Honk', icon: '📯', description: 'Honk your horn 10 times in one game.' },
   { id: 'treasure-hunter', name: 'Treasure Hunter', icon: '🎁', description: 'Grab 3 power-ups in one game.' },
+  { id: 'shark-tamer', name: 'Shark Tamer', icon: '🦈', description: 'Tag 10 sharks in one game.' },
+  { id: 'shark-snack', name: 'Shark Snack', icon: '🍤', description: 'Get bumped by a shark. Chomp!' },
+  { id: 'mega-hero', name: 'Mega Hero', icon: '🦸', description: 'Beat the MEGA SHARK in Boats vs. Sharks.' },
+  { id: 'bone-captain', name: 'Bone Captain', icon: '🦴', description: 'Play a game in the BoneBoat.' },
 ];
+
+/** The BoneBoat is hull 3 (see `BoatLook.hull` in types.ts). */
+const BONE_HULL = 3;
 
 /** How a match earns each trophy (by id). */
 const CHECKS: Record<string, (s: PlayerMatchStats) => boolean> = {
@@ -41,6 +48,10 @@ const CHECKS: Record<string, (s: PlayerMatchStats) => boolean> = {
   'rocket-boat': (s) => s.boostSeconds >= 10,
   'honk-honk': (s) => s.honks >= 10,
   'treasure-hunter': (s) => s.pickups >= 3,
+  'shark-tamer': (s) => s.sharkTags >= 10,
+  'shark-snack': (s) => s.sharkBumps >= 1,
+  'mega-hero': (s) => s.mode === 'sharks' && s.megaDefeated,
+  'bone-captain': (s) => s.hull === BONE_HULL,
 };
 
 // ───────────── saving ─────────────

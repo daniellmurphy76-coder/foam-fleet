@@ -7,8 +7,9 @@
  * flag, propeller, team marker) stay as separate objects, and `buildBoatRig` hands them to
  * boat.ts as handles.
  *
- * The look comes from a `BoatLook` (Boat Garage): the hull (boatStyles.ts), the paint pattern
- * (boatPaint.ts), the hat (boatHats.ts) and the flag (boatFlags.ts). It works without a game
+ * The look comes from a `BoatLook` (Boat Garage): the hull (boatStyles.ts; hull 3, the BoneBoat, is built
+ * in boneBoat.ts), the paint pattern (boatPaint.ts, or tinted tips on the BoneBoat), the hat (boatHats.ts)
+ * and the flag (boatFlags.ts). It works without a game
  * world: a freshly built rig is already in a nice resting pose.
  *
  * Local axes: +Z = bow (front), +Y = up, +X = the boat's LEFT. Waterline is y = 0.
@@ -19,8 +20,9 @@ import type { BoatLook } from '../types';
 import { buildFlag, buildMarker } from './boatFlags';
 import { extrude, limb, MaterialBag, Part, roundedRect, xf } from './boatGeo';
 import { buildHat } from './boatHats';
-import { buildPaint } from './boatPaint';
+import { buildPaint, type PaintJob } from './boatPaint';
 import { planPoints, styleFor, type StyleSpec } from './boatStyles';
+import { buildBoneHull } from './boneBoat';
 
 export { FLAG_YAW, MARKER_HEIGHT } from './boatFlags';
 
@@ -58,6 +60,8 @@ export interface BoatRig {
   hasFlag: boolean;
   /** Floating team diamond (null when the boat has no marker). Bob it and spin it about Y. */
   marker: THREE.Group | null;
+  /** BoneBoat only (else null): the soft glow around the skull's eyes. Pulse its opacity. */
+  eyeHalo: THREE.MeshBasicMaterial | null;
   /** Holder for the translucent bubble: show/hide it and scale it (use SHIELD_SIZE for the base scale). */
   shield: THREE.Group;
   /** The bubble itself, inside `shield`. Spin it for a shimmer (spinning the group would spin the ellipsoid). */
@@ -137,6 +141,8 @@ function buildCatHull(s: StyleSpec, P: Parts, deck: Part): void {
 export function buildBoatRig(look: BoatLook, color: number, id: number, markerColor: number | null): BoatRig {
   const s = styleFor(look.hull);
   const y = s.deckY;
+  const bone = s.kind === 'bone'; // the BoneBoat has its own builder: no windshield, paint decals or sandy deck
+  const lift = s.turretLift ?? 0;
 
   // Materials: every boat gets its own so colors and flashes never leak between boats.
   const mats = new MaterialBag();
@@ -163,19 +169,25 @@ export function buildBoatRig(look: BoatLook, color: number, id: number, markerCo
     vest: new Part(), dark: new Part(), blue: new Part(), shorts: new Part(),
   };
 
-  // ── paint pattern (decides which deck we build) ──
-  const job = buildPaint(s, look.pattern, color, mats);
+  // ── paint pattern (decides which deck we build; on the BoneBoat it tints the bone tips instead) ──
+  const job: PaintJob = bone ? { paintDeck: false, decals: [], flash: [] } : buildPaint(s, look.pattern, color, mats);
 
   // ── hull ──
   const deckPart = job.paintDeck ? P.paintDeck : P.deck;
   if (s.kind === 'mono') buildMonoHull(s, P, deckPart);
-  else buildCatHull(s, P, deckPart);
+  else if (s.kind === 'cat') buildCatHull(s, P, deckPart);
+  const boneHull = bone ? buildBoneHull(s, look.pattern, color, hullMat, mats) : null;
 
   // ── dashboard, windshield, seat ──
-  P.trim.add(new THREE.BoxGeometry(s.windW * 0.95, 0.28, 0.34), xf(0, y + 0.14, s.windZ - 0.12));
-  P.glass.add(new THREE.BoxGeometry(s.windW, 0.44, 0.04), xf(0, y + 0.5, s.windZ + 0.1, -0.6));
-  for (const sx of [-1, 1]) {
-    P.trim.add(new THREE.BoxGeometry(0.05, 0.5, 0.06), xf(sx * (s.windW / 2), y + 0.5, s.windZ + 0.1, -0.6));
+  if (bone) {
+    // no glass on a skeleton: just a bone post holding the steering wheel
+    P.trim.add(new THREE.CylinderGeometry(0.035, 0.045, 0.5, 6), xf(0, y + 0.27, s.windZ - 0.3));
+  } else {
+    P.trim.add(new THREE.BoxGeometry(s.windW * 0.95, 0.28, 0.34), xf(0, y + 0.14, s.windZ - 0.12));
+    P.glass.add(new THREE.BoxGeometry(s.windW, 0.44, 0.04), xf(0, y + 0.5, s.windZ + 0.1, -0.6));
+    for (const sx of [-1, 1]) {
+      P.trim.add(new THREE.BoxGeometry(0.05, 0.5, 0.06), xf(sx * (s.windW / 2), y + 0.5, s.windZ + 0.1, -0.6));
+    }
   }
   P.trim.add(new THREE.BoxGeometry(0.74, 0.2, 0.5), xf(0, y + 0.1, s.seatZ)); // seat
   P.trim.add(new THREE.BoxGeometry(0.74, 0.55, 0.12), xf(0, y + 0.4, s.seatZ - 0.3, -0.15)); // backrest
@@ -205,11 +217,13 @@ export function buildBoatRig(look: BoatLook, color: number, id: number, markerCo
   P.dark.add(new THREE.BoxGeometry(0.14, 0.7, 0.2), xf(0, 0.0, s.motorZ)); // leg
   P.dark.add(new THREE.CylinderGeometry(0.1, 0.12, 0.16, 8), xf(0, 0.38, s.motorZ - 0.28, Math.PI / 2)); // exhaust nozzle
 
-  // ── flag on its little stern mast (the pole goes into the trim mesh; the cloth is built below) ──
+  // ── flag on its little stern mast (the pole goes into the trim mesh; the cloth is built below).
+  //    On the BoneBoat the mast stands on the tail's stern bone. ──
   const flagBuild = buildFlag(look.flag, markerColor ?? color, s.mastX, s.mastZ, y, P.trim, mats);
 
-  // ── the blaster's fixed base ──
-  P.blue.add(new THREE.CylinderGeometry(0.4, 0.46, 0.22, 10), xf(0, y + 0.11, s.turretZ));
+  // ── the blaster's fixed base (on a short pedestal when the hull asks for a lift: the BoneBoat's skull is tall) ──
+  P.blue.add(new THREE.CylinderGeometry(0.4, 0.46, 0.22, 10), xf(0, y + 0.11 + lift, s.turretZ));
+  if (lift > 0) P.trim.add(new THREE.CylinderGeometry(0.27, 0.36, lift + 0.04, 8), xf(0, y + lift / 2, s.turretZ));
 
   // ───────── assemble the static meshes ─────────
   const root = new THREE.Group();
@@ -228,6 +242,7 @@ export function buildBoatRig(look: BoatLook, color: number, id: number, markerCo
   staticMesh(P.deck, deckMat, true, true);
   staticMesh(P.paintDeck, hullMat, true, true);
   for (const d of job.decals) staticMesh(d.part, d.mat, false);
+  if (boneHull) for (const m of boneHull.meshes) root.add(m);
   staticMesh(P.glass, glassMat, false);
   staticMesh(P.vest, vestMat);
   staticMesh(P.shorts, shortsMat);
@@ -271,7 +286,7 @@ export function buildBoatRig(look: BoatLook, color: number, id: number, markerCo
 
   // ───────── blaster turret ─────────
   const turret = new THREE.Group();
-  turret.position.set(0, y + 0.22, s.turretZ);
+  turret.position.set(0, y + 0.22 + lift, s.turretZ);
   root.add(turret);
   const turretYaw = new THREE.Group();
   turret.add(turretYaw);
@@ -335,7 +350,7 @@ export function buildBoatRig(look: BoatLook, color: number, id: number, markerCo
   return {
     root,
     hullMat,
-    paintMats: [hullMat, ...job.flash],
+    paintMats: [hullMat, ...(boneHull ? boneHull.flash : []), ...job.flash],
     blasterGlowMat: blueMat,
     turretYaw,
     turretPitch,
@@ -349,6 +364,7 @@ export function buildBoatRig(look: BoatLook, color: number, id: number, markerCo
     flag: flagBuild.group,
     hasFlag: flagBuild.hasFlag,
     marker,
+    eyeHalo: boneHull ? boneHull.eyeHalo : null,
     shield,
     shieldSpin,
     shieldMat,

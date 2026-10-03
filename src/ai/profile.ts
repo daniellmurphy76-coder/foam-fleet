@@ -67,6 +67,8 @@ export interface Skill {
   rangeScale: number;
   /** Multiplies the little side-to-side weave. */
   wobbleScale: number;
+  /** Chance (0..1) of turning to dart a shark that is chasing it, in games where sharks are only a nuisance. */
+  sharkFight: number;
 }
 
 export const SKILLS: Readonly<Record<BotDifficulty, Skill>> = {
@@ -95,6 +97,7 @@ export const SKILLS: Readonly<Record<BotDifficulty, Skill>> = {
     pickupRange: 28,
     rangeScale: 1.15,
     wobbleScale: 1.3,
+    sharkFight: 0,
   },
   normal: {
     reaction: 0.25,
@@ -120,6 +123,7 @@ export const SKILLS: Readonly<Record<BotDifficulty, Skill>> = {
     pickupRange: 36,
     rangeScale: 1,
     wobbleScale: 1,
+    sharkFight: 0.7,
   },
   hard: {
     reaction: 0.1,
@@ -145,6 +149,7 @@ export const SKILLS: Readonly<Record<BotDifficulty, Skill>> = {
     pickupRange: 46,
     rangeScale: 0.9,
     wobbleScale: 0.8,
+    sharkFight: 1,
   },
 };
 

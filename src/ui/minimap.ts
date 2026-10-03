@@ -8,7 +8,7 @@ import { clamp, cssColor, el } from './dom';
  * The whole lagoon always fits in the circle and is turned so the way the camera faces is UP.
  * Islands never change, so they are painted once onto a hidden canvas (cached by the `obstacles`
  * array identity) and that picture is just turned and stamped each time. Everything that moves
- * (boats, crates, balloons, race gates) is drawn fresh, but only ~20 times a second.
+ * (boats, sharks, crates, balloons, race gates) is drawn fresh, but only ~20 times a second.
  */
 
 const DRAW_EVERY_MS = 46; // ~20 Hz; a redraw is skipped if the last one was this recent
@@ -21,6 +21,8 @@ const NAVY = '#06173d';
 const RIM = 3; // white edge around the radar, in CSS px
 const SUN = '#ffd23f';
 const ORANGE = '#ff8a1f';
+const SHARK_GREY = '#59647a'; // dark enough to read on the blue water, with a white edge
+const MEGA_PURPLE = '#a465ff';
 
 export interface Minimap {
   /** The element to put in the page (made round by CSS). */
@@ -41,6 +43,15 @@ function arrowPath(ctx: CanvasRenderingContext2D, len: number): void {
   ctx.lineTo(len * 0.5, len * 0.5);
   ctx.lineTo(0, len * 0.2);
   ctx.lineTo(-len * 0.5, len * 0.5);
+  ctx.closePath();
+}
+
+/** A little shark fin: a triangle with its point straight up (the way the shark swims), `len` px tall, centered on (0, 0). */
+function finPath(ctx: CanvasRenderingContext2D, len: number): void {
+  ctx.beginPath();
+  ctx.moveTo(0, -len * 0.6);
+  ctx.lineTo(len * 0.42, len * 0.45);
+  ctx.lineTo(-len * 0.42, len * 0.45);
   ctx.closePath();
 }
 
@@ -260,6 +271,33 @@ export function createMinimap(): Minimap {
       ctx.lineWidth = 1.6;
       ctx.fill();
       ctx.stroke();
+    }
+
+    // sharks (every mode): small dark-grey fins pointing the way they swim; the MEGA SHARK is big and purple.
+    // Under the boats, so a boat is never hidden by one.
+    const sharks = map.sharks; // (an older game core may not send any)
+    if (sharks && sharks.length > 0) {
+      const fin = clamp(size * 0.065, 7, 11);
+      ctx.lineJoin = 'round';
+      for (let pass = 0; pass < 2; pass++) {
+        const megaPass = pass === 1; // MEGA last, so it is never covered
+        for (let i = 0; i < sharks.length; i++) {
+          const sh = sharks[i];
+          if (sh.mega !== megaPass) continue;
+          const sx = half + (-sh.x * cosH + sh.z * sinH) * s;
+          const sy = half - (sh.x * sinH + sh.z * cosH) * s;
+          ctx.save();
+          ctx.translate(sx, sy);
+          ctx.rotate(hv - sh.heading); // 0 = pointing up the radar
+          finPath(ctx, megaPass ? fin * 2 : fin);
+          ctx.lineWidth = megaPass ? 2.4 : 1.4;
+          ctx.strokeStyle = '#ffffff';
+          ctx.stroke();
+          ctx.fillStyle = megaPass ? MEGA_PURPLE : SHARK_GREY;
+          ctx.fill();
+          ctx.restore();
+        }
+      }
     }
 
     // boats: computer boats first, other humans over them, you on top

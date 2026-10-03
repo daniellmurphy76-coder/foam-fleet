@@ -27,6 +27,7 @@ import { TROPHIES, loadShelf, loadShelfColors } from './trophies';
 const STORAGE_KEY = 'foamfleet.setup.v1';
 const NAME_MAX = 12;
 const MAX_BOTS = 5; // the setup screen offers 0..5 bots
+const MAX_HELPERS = 3; // Boats vs. Sharks: 0..3 helper boats on your team
 const BATTLE_SECONDS = [120, 180, 300]; // 2 / 3 / 5 minutes
 const RACE_LAPS = [1, 3, 5];
 
@@ -35,13 +36,27 @@ const MODES: ReadonlyArray<{ id: ModeId; label: string; icon: string; sub: strin
   { id: 'race', label: 'Buoy Race', icon: '🏁', sub: 'Zip through the gates. First across wins!' },
   { id: 'team', label: 'Team Up', icon: '🤝', sub: `Your team vs. the ${CONFIG.team.names[1]}. Most tags wins!` },
   { id: 'practice', label: 'Balloon Pop', icon: '🎈', sub: 'Pop all the balloons! Dart them or just drive through.' },
+  {
+    id: 'sharks',
+    label: 'Boats vs. Sharks',
+    icon: '🦈',
+    sub: `Team up! Scare off ${CONFIG.sharks.waves.length} waves of sharks, then the MEGA SHARK!`,
+  },
 ];
+
+// The bot-skill buttons double as the sharks' swimming speed in Boats vs. Sharks.
+const SKILL_LABELS: readonly string[] = ['Easy', 'Normal', 'Hard'];
+const SPEED_LABELS: readonly string[] = ['Slow', 'Normal', 'Fast'];
+const BOT_SKILL_HINT = 'Add some computer boats to pick their skill.';
+const SHARK_SPEED_HINT = 'Slow sharks are easy to dodge. Fast ones keep you busy!';
 
 /** Everything the setup screen edits. (Both players are kept so switching 1 <-> 2 players remembers them.) */
 interface Form {
   humans: 1 | 2;
   mode: ModeId;
   bots: number;
+  /** Boats vs. Sharks: helper boats on your team (kept apart from `bots`, so each mode remembers its own number). */
+  helpers: number;
   skill: BotDifficulty;
   names: [string, string];
   colors: [number, number];
@@ -64,6 +79,7 @@ function defaultForm(): Form {
     humans: 1,
     mode: 'battle',
     bots: Math.min(MAX_BOTS, CONFIG.match.defaultBots),
+    helpers: Math.max(0, Math.min(MAX_HELPERS, CONFIG.sharks.defaultHelpers)),
     skill: 'normal',
     names: ['Player 1', 'Player 2'],
     colors: [CONFIG.colors[0], CONFIG.colors[1] ?? CONFIG.colors[0]],
@@ -100,9 +116,13 @@ function sanitize(raw: unknown, base: Form): Form {
   if (!raw || typeof raw !== 'object') return f;
   const r = raw as Record<string, unknown>;
   if (r.humans === 1 || r.humans === 2) f.humans = r.humans;
-  if (isMode(r.mode)) f.mode = r.mode;
+  // A mode this version doesn't know (an old or damaged save) falls back to the classic Dart Battle.
+  if (r.mode !== undefined) f.mode = isMode(r.mode) ? r.mode : 'battle';
   if (typeof r.bots === 'number' && Number.isFinite(r.bots)) {
     f.bots = Math.max(0, Math.min(MAX_BOTS, Math.round(r.bots)));
+  }
+  if (typeof r.helpers === 'number' && Number.isFinite(r.helpers)) {
+    f.helpers = Math.max(0, Math.min(MAX_HELPERS, Math.round(r.helpers)));
   }
   if (r.skill === 'easy' || r.skill === 'normal' || r.skill === 'hard') f.skill = r.skill;
   if (Array.isArray(r.names)) {
@@ -244,9 +264,10 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
   function minBots(): number {
     return form.mode === 'team' ? 1 : 0;
   }
-  /** The computer boats this setup really gets (the saved number is kept for the other modes). */
+  /** The computer boats this setup really gets (the saved numbers are kept for the other modes). */
   function botCount(): number {
     if (form.mode === 'practice') return 0;
+    if (form.mode === 'sharks') return Math.max(0, Math.min(form.helpers, MAX_HELPERS, maxBots())); // helper boats
     return Math.max(minBots(), Math.min(form.bots, maxBots()));
   }
 
@@ -382,6 +403,15 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
       changed();
     },
   );
+  const helpersSeg = makeSeg<number>(
+    sfx,
+    'Helper boats',
+    Array.from({ length: MAX_HELPERS + 1 }, (_, n) => ({ value: n, label: String(n) })),
+    (v) => {
+      form.helpers = v;
+      changed();
+    },
+  );
   const modeSeg = makeSeg<ModeId>(
     sfx,
     'Game mode',
@@ -414,9 +444,9 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     sfx,
     'Bot skill',
     [
-      { value: 'easy', label: 'Easy' },
-      { value: 'normal', label: 'Normal' },
-      { value: 'hard', label: 'Hard' },
+      { value: 'easy', label: SKILL_LABELS[0] },
+      { value: 'normal', label: SKILL_LABELS[1] },
+      { value: 'hard', label: SKILL_LABELS[2] },
     ],
     (v) => {
       form.skill = v;
@@ -428,14 +458,22 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
   const playersField = field('Players', playersSeg.row);
   const teamHint = el('div', 'ff-help');
   const botsField = field('Computer boats', botsSeg.row, teamHint);
+  const helpersHint = el('div', 'ff-help', 'Helper boats are on your team. They scare off sharks too!');
+  const helpersField = field('Helper boats', helpersSeg.row, helpersHint);
   const lengthField = field('Battle length', battleSeg.row, lapsSeg.row);
-  const skillHint = el('div', 'ff-help', 'Add some computer boats to pick their skill.');
+  const skillHint = el('div', 'ff-help', BOT_SKILL_HINT);
   const skillField = field('Bot skill', skillSeg.row, skillHint);
   const practiceNote = el(
     'div',
     'ff-note',
     `No computer boats here! Pop all ${CONFIG.practice.balloons} balloons as fast as you can. ` +
       'Gold balloons are worth 3. Dart them, or just drive right through them!',
+  );
+  const sharksNote = el(
+    'div',
+    'ff-note',
+    `Scare off ${CONFIG.sharks.waves.length} waves of sharks with your darts, then the MEGA SHARK! ` +
+      `Every bump pops a life ring. Your team has ${CONFIG.sharks.lifeRings}.`,
   );
 
   // per-player name + color + Easy Driving + garage
@@ -510,7 +548,15 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
   const pcards: [PlayerCard, PlayerCard] = [buildPlayerCard(0), buildPlayerCard(1)];
 
   const optsCol = el('div', 'ff-col');
-  optsCol.append(playersField.box, botsField.box, skillField.box, lengthField.box, practiceNote);
+  optsCol.append(
+    playersField.box,
+    botsField.box,
+    helpersField.box,
+    skillField.box,
+    lengthField.box,
+    practiceNote,
+    sharksNote,
+  );
   const grid = el('div', 'ff-grid');
   grid.append(optsCol, pcards[0].card, pcards[1].card);
   const setupCard = el('div', 'ff-card ff-setup-card');
@@ -632,12 +678,14 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     const f = form;
     const cap = maxBots();
     const count = botCount();
-    const hasBots = f.mode !== 'practice';
+    const practice = f.mode === 'practice';
+    const sharks = f.mode === 'sharks';
+    const hasBots = !practice && !sharks;
 
     playersSeg.select(f.humans);
     modeSeg.select(f.mode);
 
-    // computer boats (not in Balloon Pop; Team Up needs at least one rival)
+    // computer boats (not in Balloon Pop; Team Up needs at least one rival; Boats vs. Sharks has helper boats instead)
     botsField.box.hidden = !hasBots;
     botsField.label.textContent = f.mode === 'team' ? 'Computer boats (both teams)' : 'Computer boats';
     botsSeg.select(count);
@@ -646,22 +694,36 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     });
     teamHint.hidden = f.mode !== 'team';
     if (f.mode === 'team') teamHint.textContent = teamSplitText();
-    skillField.box.hidden = !hasBots;
+    helpersField.box.hidden = !sharks;
+    helpersSeg.select(count);
+    helpersSeg.buttons.forEach((b, n) => {
+      b.disabled = n > cap;
+    });
+
+    // the skill buttons: bot skill, or in Boats vs. Sharks how fast the sharks swim
+    skillField.box.hidden = practice;
+    skillField.label.textContent = sharks ? 'Shark speed' : 'Bot skill';
+    skillSeg.row.setAttribute('aria-label', sharks ? 'Shark speed' : 'Bot skill');
+    skillSeg.buttons.forEach((b, i) => {
+      b.textContent = (sharks ? SPEED_LABELS : SKILL_LABELS)[i];
+    });
     skillSeg.select(f.skill);
-    const noBots = count === 0;
+    const noBots = count === 0 && !sharks; // sharks swim whether or not any helpers come along
     skillSeg.buttons.forEach((b) => {
       b.disabled = noBots;
     });
-    skillHint.hidden = !noBots;
+    skillHint.textContent = sharks ? SHARK_SPEED_HINT : BOT_SKILL_HINT;
+    skillHint.hidden = !(noBots || sharks);
 
-    // length: minutes (Dart Battle, Team Up), laps (Buoy Race), nothing (Balloon Pop counts up)
-    lengthField.box.hidden = f.mode === 'practice';
+    // length: minutes (Dart Battle, Team Up), laps (Buoy Race), nothing (Balloon Pop counts up; Boats vs. Sharks has waves)
+    lengthField.box.hidden = practice || sharks;
     lengthField.label.textContent = f.mode === 'race' ? 'Race laps' : f.mode === 'team' ? 'Match length' : 'Battle length';
     battleSeg.row.hidden = f.mode === 'race';
     lapsSeg.row.hidden = f.mode !== 'race';
     battleSeg.select(f.durationSec);
     lapsSeg.select(f.laps);
-    practiceNote.hidden = f.mode !== 'practice';
+    practiceNote.hidden = !practice;
+    sharksNote.hidden = !sharks;
 
     pcards.forEach((pc, i) => {
       pc.card.hidden = i >= f.humans;
@@ -822,9 +884,11 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     form = loadForm();
     if (initial) {
       form.humans = initial.humans === 2 ? 2 : 1;
-      if (isMode(initial.mode)) form.mode = initial.mode;
+      form.mode = isMode(initial.mode) ? initial.mode : 'battle';
       // Balloon Pop has no computer boats (its setup says 0): keep the saved number for the other modes.
-      if (initial.mode !== 'practice') form.bots = Math.max(0, Math.min(MAX_BOTS, initial.bots));
+      // Boats vs. Sharks keeps its helper boats in a number of its own.
+      if (form.mode === 'sharks') form.helpers = Math.max(0, Math.min(MAX_HELPERS, initial.bots));
+      else if (form.mode !== 'practice') form.bots = Math.max(0, Math.min(MAX_BOTS, initial.bots));
       form.skill = initial.botDifficulty;
       form.durationSec = nearest(BATTLE_SECONDS, initial.durationSec);
       form.laps = nearest(RACE_LAPS, initial.laps);

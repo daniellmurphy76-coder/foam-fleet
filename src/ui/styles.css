@@ -508,24 +508,31 @@
 .ff-seg-ico .base {
   fill: var(--boat, #ff3b30);
 }
+/* The BoneBoat skull's eye sockets glow in the boat's color. */
+.ff-seg-ico .eye {
+  fill: var(--boat, #ff3b30);
+}
 
-/* The four game cards: one row of big cards, two by two on narrow windows. */
+/* The five game cards: one row of big cards, two by two (the odd one out across the bottom) on narrow windows. */
 .ff-modes {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
 }
 .ff-modes .ff-seg-btn {
   min-height: clamp(96px, 17vmin, 150px);
-  padding: 0.35em 0.5em 0.5em;
-  font-size: clamp(17px, 2.8vmin, 26px);
+  padding: 0.35em 0.4em 0.5em;
+  font-size: clamp(16px, 2.5vmin, 24px);
   gap: 0.1em;
 }
 .ff-modes .ff-seg-sub {
   font-size: max(13px, 0.6em);
 }
-@media (max-width: 860px) {
+@media (max-width: 960px) {
   .ff-modes {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .ff-modes .ff-seg-btn:last-child:nth-child(odd) {
+    grid-column: 1 / -1;
   }
 }
 /* Selected = sunny face + navy border + check badge (never color alone). */

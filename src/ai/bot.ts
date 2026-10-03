@@ -13,14 +13,33 @@
  * Teams (Team Up): a bot never chases or shoots a teammate, holds its fire while a teammate is
  * in the line of fire, and an ally prefers opponents that are close to its human buddy.
  *
+ * Sharks: in Boats vs. Sharks the bots are HELPERS (`planSharks()`): they dart the shark closest to a
+ * human, everybody piles onto the MEGA SHARK, they keep a safe distance and swerve away (boosting)
+ * from a shark about to bump them. In the other games a bot mostly ignores sharks, steering round
+ * one only when it is very close; a normal or hard bot may turn and dart a shark that is chasing it
+ * (`planSharkDuel()`). Both use `engageShark()`.
+ *
  * Difficulty and personality live in profile.ts. The math helpers are in steering.ts.
  *
  * Handy reminder (types.ts): steer +1 turns RIGHT, which DECREASES heading. All the sign
  * handling is in `turnRightAngle()` in steering.ts, with a worked example.
  */
-import type { Boat, BotDifficulty, BoatControls, Controller, ControllerContext } from '../types';
+import type { AimTarget, Boat, BotDifficulty, BoatControls, Controller, ControllerContext } from '../types';
 import { CONFIG } from '../config';
-import { Avoider, DEG, clamp, headingOf, lerp, moveToward, nearSolid, smoothstep, turnRightAngle, wrapPi } from './steering';
+import {
+  Avoider,
+  DEG,
+  MEGA_SHARK_RADIUS,
+  clamp,
+  headingOf,
+  lerp,
+  moveToward,
+  nearSolid,
+  sharkBumpGap,
+  smoothstep,
+  turnRightAngle,
+  wrapPi,
+} from './steering';
 import { SKILLS, makePersonality, makeRng } from './profile';
 import type { Personality, Skill } from './profile';
 
@@ -74,6 +93,58 @@ const GUARD_FACTOR = 0.45;
 /** ...within GUARD_NEAR meters of the human; the pull fades out to nothing by GUARD_FAR meters. */
 const GUARD_NEAR = 15;
 const GUARD_FAR = 55;
+
+// ---- sharks ----
+const NO_SHARKS: readonly AimTarget[] = [];
+/** A helper keeps this far (meters) from the shark it is darting: near enough to hit, far enough to dodge. */
+const SHARK_RANGE_MIN = 15;
+const SHARK_RANGE_MAX = 25;
+/** Cruising sharks swim at about 5 m/s, chasing ones at 9 or more: faster than this means "chasing". */
+const SHARK_CHASE_SPEED = 8;
+/** A chasing shark this close and swimming our way is "chasing me" (games where sharks are only a nuisance). */
+const SHARK_NOTICE_M = 20;
+/** Helpers only go out to sharks within this many meters of a human; farther ones are left to come to us. */
+const SHARK_LEASH_M = 70;
+/** A shark this close to a human is a fight right now: no crate detours. */
+const SHARK_URGENT_M = 45;
+/** Holding the nose on a shark: throttle drops to this share as the gap closes, so we stay at range. */
+const SHARK_STAND_THROTTLE = 0.45;
+/** Swerving away from a bump: this far (degrees) from the line to the shark (125 = mostly sideways, a bit away). */
+const DODGE_ANGLE = 125 * DEG;
+/** After the danger passes the swerve (and the boost) lasts this long. */
+const DODGE_TAIL_SEC = 0.4;
+/**
+ * How much room a boat wants before it swerves: the shark's bump gap plus a margin, plus how far the shark
+ * (DODGE_SHARK_SEC of its speed toward us) and we (DODGE_SELF_SEC of ours toward it) travel while we swing round.
+ * Small enough that a helper still gets its shots in as a shark comes at it, big enough that it mostly gets away.
+ */
+const DODGE_MARGIN = 1.5;
+const DODGE_SHARK_SEC = 0.6;
+const DODGE_SELF_SEC = 0.35;
+/** Turning on a chasing shark (other games): give up after this long, or when it is this far away. */
+const DUEL_MAX_SEC = 5;
+const DUEL_GIVE_UP_M = 32;
+const DUEL_COOLDOWN_SEC = 3;
+/** Helpers wait between waves in a loose ring this far from the nearest human. */
+const ESCORT_MIN = 14;
+const ESCORT_MAX = 22;
+
+/** Distance from (x, z) to the nearest human boat (any team, `self` included if it is one); Infinity if there are none. */
+function distToAnyHuman(boats: readonly Boat[], x: number, z: number): number {
+  let best = Infinity;
+  for (let i = 0; i < boats.length; i++) {
+    if (!boats[i].isHuman) continue;
+    const d = Math.hypot(boats[i].position.x - x, boats[i].position.z - z);
+    if (d < best) best = d;
+  }
+  return best;
+}
+
+/** The live shark with this id, or null (sharks that dive leave the list). */
+function findShark(sharks: readonly AimTarget[], id: number): AimTarget | null {
+  for (let i = 0; i < sharks.length; i++) if (sharks[i].id === id) return sharks[i];
+  return null;
+}
 
 /** Distance from (x, z) to the nearest HUMAN teammate of `self` (not counting itself); Infinity if it has none. */
 function distToHumanBuddy(boats: readonly Boat[], self: Boat, x: number, z: number): number {
@@ -221,6 +292,31 @@ class Bot implements Controller {
   private aimErrGoal = 0;
   private aimErrIn = 0;
 
+  // ---- sharks: target, what the bot "sees" of it, and dodging ----
+  /** Id of the shark we are darting (Boats vs. Sharks), or -1. */
+  private sharkId = -1;
+  private sharkRetargetIn = 0;
+  private sPerceiveIn = 0;
+  private sSeenAt = 0;
+  private sSeenX = 0;
+  private sSeenZ = 0;
+  private sSeenVX = 0;
+  private sSeenVZ = 0;
+  private sPeelLeft = 0;
+  private sStrafeMix = 0;
+  private dodgeLeft = 0;
+  private dodgeHeading = 0;
+  private dodgeSide = 1;
+  private threatFor = 0;
+  /** Which way round the human we circle while waiting for sharks: -1 or +1. */
+  private escortDir: number;
+  private escortRadius: number;
+  /** Other games: the chasing shark we decided to fight (-1 = none), for how long, and the one we decided to ignore. */
+  private duelId = -1;
+  private duelLeft = 0;
+  private duelCool = 0;
+  private declinedId = -1;
+
   // ---- race: noticing that we keep missing a gate ----
   private gateX = 0;
   private gateZ = 0;
@@ -259,6 +355,10 @@ class Bot implements Controller {
     this.boostPermit = this.rng() < this.skill.boostChance;
     this.burstLeft = this.skill.burstOnMin;
     this.wanderLeft = 0;
+
+    // (Rolled last, so adding sharks did not change what the older rolls above give for a seed.)
+    this.escortDir = this.rng() < 0.5 ? -1 : 1;
+    this.escortRadius = lerp(ESCORT_MIN, ESCORT_MAX, this.rng());
   }
 
   update(ctx: ControllerContext, dt: number): BoatControls {
@@ -271,9 +371,13 @@ class Bot implements Controller {
     const sk = this.skill;
 
     // Notice being tagged (the boat becomes "stunned"). Battles and Team Up care; in a race a hit is only a stun.
+    // In Boats vs. Sharks a bump is what stuns a helper: it swerves away like it was tagged.
     const stunned = self.stunned;
-    if (stunned && !this.wasStunned && (ctx.mode === 'battle' || ctx.mode === 'team')) this.onTagged(self.heading);
+    if (stunned && !this.wasStunned && (ctx.mode === 'battle' || ctx.mode === 'team' || ctx.mode === 'sharks')) {
+      this.onTagged(self.heading);
+    }
     this.wasStunned = stunned;
+    const sharks = ctx.sharks ?? NO_SHARKS;
 
     // Stuck on something? Reversing takes over everything until we are free.
     if (this.runUnstick(ctx, dt)) return out;
@@ -290,12 +394,16 @@ class Bot implements Controller {
     this.planIgnore = null;
     this.cruising = false;
     if (ctx.mode === 'race') this.planRace(ctx, dt);
+    else if (ctx.mode === 'sharks') this.planSharks(ctx, dt);
     else this.planBattle(ctx, dt);
+    // Sharks only bother the other games when one chases us, and then only a bot that is up to it turns on it.
+    if (ctx.mode !== 'sharks') this.planSharkDuel(ctx, dt);
 
     // ---- 2. AVOID ----
     // Look farther ahead the faster we go (a boat at 22 m/s needs about 30 m to swing around a rock).
+    // Sharks count too, but only when they are very close.
     const look = clamp(Math.abs(self.speed) * 1.3 + 8, 12, 42) * sk.lookScale;
-    this.avoid.pick(self, ctx.boats, this.planIgnore, ctx.world, this.planDesired, look);
+    this.avoid.pick(self, ctx.boats, this.planIgnore, ctx.world, this.planDesired, look, sharks);
 
     // ---- 3. STEER ----
     // turnRight > 0 means "the wanted heading is to my right", so steer positive.
@@ -459,27 +567,29 @@ class Bot implements Controller {
     this.boostPermit = this.rng() < clamp(sk.boostChance * (0.6 + 0.8 * this.me.aggression), 0, 1);
 
     // Sometimes go for a power-up crate that is close by (less often while a fight is on).
-    if (!this.hasGoal && ctx.pickups.length > 0) {
-      let bestD2 = sk.pickupRange * sk.pickupRange;
-      let bx = 0;
-      let bz = 0;
-      let found = false;
-      for (let i = 0; i < ctx.pickups.length; i++) {
-        const p = ctx.pickups[i];
-        const d2 = (p.x - px) * (p.x - px) + (p.z - pz) * (p.z - pz);
-        if (d2 < bestD2 && crateIsReachable(ctx, p.x, p.z)) {
-          bestD2 = d2;
-          bx = p.x;
-          bz = p.z;
-          found = true;
-        }
-      }
-      if (found) {
-        let eagerness = this.me.greed;
-        if (best && Math.hypot(best.position.x - px, best.position.z - pz) < this.me.preferredRange * 1.1) eagerness *= 0.35;
-        if (this.rng() < eagerness) this.startCrateDetour(bx, bz, 8);
+    let eagerness = this.me.greed;
+    if (best && Math.hypot(best.position.x - px, best.position.z - pz) < this.me.preferredRange * 1.1) eagerness *= 0.35;
+    this.considerCrate(ctx, px, pz, eagerness);
+  }
+
+  /** Maybe start a detour to the nearest reachable crate within this bot's pickup range (`eagerness` = the chance, 0..1). */
+  private considerCrate(ctx: ControllerContext, px: number, pz: number, eagerness: number): void {
+    if (this.hasGoal || ctx.pickups.length === 0) return;
+    let bestD2 = this.skill.pickupRange * this.skill.pickupRange;
+    let bx = 0;
+    let bz = 0;
+    let found = false;
+    for (let i = 0; i < ctx.pickups.length; i++) {
+      const p = ctx.pickups[i];
+      const d2 = (p.x - px) * (p.x - px) + (p.z - pz) * (p.z - pz);
+      if (d2 < bestD2 && crateIsReachable(ctx, p.x, p.z)) {
+        bestD2 = d2;
+        bx = p.x;
+        bz = p.z;
+        found = true;
       }
     }
+    if (found && this.rng() < eagerness) this.startCrateDetour(bx, bz, 8);
   }
 
   /** Nobody to chase: cruise between random spots in the middle of the lagoon. */
@@ -621,6 +731,314 @@ class Bot implements Controller {
     this.cruising = true;
   }
 
+  // ───────────────────────────── Sharks ─────────────────────────────
+
+  /**
+   * Boats vs. Sharks: this bot is a helper. In order: swerve away from a shark about to bump us; dart the
+   * shark closest to a human (the MEGA SHARK first, for everybody); with no shark to deal with, grab a
+   * crate or wait near a human.
+   */
+  private planSharks(ctx: ControllerContext, dt: number): void {
+    const self = ctx.self;
+    const sharks = ctx.sharks ?? NO_SHARKS;
+    const px = self.position.x;
+    const pz = self.position.z;
+
+    // After being bumped: swerve away for a moment, boosting if we feel like it.
+    if (this.escapeLeft > 0 && this.escapeBoost) this.planBoost = true;
+    if (this.evadeLeft > 0) {
+      this.planDesired = this.evadeHeading;
+      return;
+    }
+    // A shark about to bump us beats everything else.
+    if (this.dodgeSharks(ctx, dt, sharks)) return;
+
+    // Re-think which shark to go after every second or two (or right away if it dove).
+    this.sharkRetargetIn -= dt;
+    let shark = this.sharkId >= 0 ? findShark(sharks, this.sharkId) : null;
+    if (this.sharkRetargetIn <= 0 || (this.sharkId >= 0 && !shark)) {
+      this.chooseShark(ctx, px, pz, sharks);
+      shark = this.sharkId >= 0 ? findShark(sharks, this.sharkId) : null;
+    }
+
+    // A crate is fine while no shark is near a human.
+    const urgent = shark !== null && distToAnyHuman(ctx.boats, shark.position.x, shark.position.z) < SHARK_URGENT_M;
+    if (!urgent && this.followCrate(ctx, dt, px, pz)) return;
+
+    if (shark) this.engageShark(ctx, dt, shark);
+    else this.planEscort(ctx, dt, px, pz);
+  }
+
+  /** The shark to dart: the MEGA SHARK if it is out, else the one closest to a human (protect the players). */
+  private chooseShark(ctx: ControllerContext, px: number, pz: number, sharks: readonly AimTarget[]): void {
+    let best = -1;
+    let bestScore = Infinity;
+    let bestGuard = Infinity;
+    for (let i = 0; i < sharks.length; i++) {
+      const s = sharks[i];
+      const mine = Math.hypot(s.position.x - px, s.position.z - pz);
+      // How far it is from the people we protect (from us, when no human is around).
+      let guard = distToAnyHuman(ctx.boats, s.position.x, s.position.z);
+      if (!Number.isFinite(guard)) guard = mine;
+      if (guard > SHARK_LEASH_M) continue; // too far away: let it come to us
+      let score = (guard + 0.15 * mine) * (0.9 + 0.2 * this.rng());
+      if (s.radius > MEGA_SHARK_RADIUS) score *= 0.05; // everybody piles onto the MEGA SHARK
+      if (s.id === this.sharkId) score *= 0.8; // stick with this one unless another is clearly closer
+      if (score < bestScore) {
+        bestScore = score;
+        best = s.id;
+        bestGuard = guard;
+      }
+    }
+    if (best !== this.sharkId) {
+      this.sharkId = best;
+      this.sPerceiveIn = 0; // take a fresh look at the new shark
+      this.sPeelLeft = 0;
+    }
+    this.sharkRetargetIn = 1 + 1.5 * this.rng();
+    this.boostPermit = this.rng() < clamp(this.skill.boostChance * (0.6 + 0.8 * this.me.aggression), 0, 1);
+
+    // With no shark near a human, a crate close by is worth a detour.
+    if (bestGuard >= SHARK_URGENT_M) this.considerCrate(ctx, px, pz, this.me.greed);
+  }
+
+  /**
+   * Fight one shark: close in until we are at a safe range (15-25 m, never inside its bump reach), keep the nose
+   * on it and shoot, curve round it while the blaster reloads, and break away if it gets too close. A shark only
+   * counts as an obstacle for avoidance when very close (see Avoider), so steering straight at it is fine.
+   */
+  private engageShark(ctx: ControllerContext, dt: number, shark: AimTarget): void {
+    const self = ctx.self;
+    const sk = this.skill;
+    const me = this.me;
+    const px = self.position.x;
+    const pz = self.position.z;
+
+    // Steer by a snapshot of the shark that refreshes every `reaction` seconds (stale news = slower bot).
+    this.sPerceiveIn -= dt;
+    if (this.sPerceiveIn <= 0 || this.clock - this.sSeenAt > 1) {
+      this.sSeenX = shark.position.x;
+      this.sSeenZ = shark.position.z;
+      this.sSeenVX = shark.velocity.x;
+      this.sSeenVZ = shark.velocity.z;
+      this.sSeenAt = this.clock;
+      this.sPerceiveIn = sk.reaction * (0.7 + 0.6 * this.rng());
+    }
+    const age = this.clock - this.sSeenAt;
+    const tx = this.sSeenX + this.sSeenVX * age * sk.predict;
+    const tz = this.sSeenZ + this.sSeenVZ * age * sk.predict;
+    const dist = Math.hypot(tx - px, tz - pz);
+    const leadTime = sk.predict * clamp(dist / Math.max(Math.abs(self.speed) + 12, 14), 0, 1.2);
+    const bearing = headingOf(tx - px, tz - pz);
+    const bearingLead = headingOf(tx + this.sSeenVX * leadTime - px, tz + this.sSeenVZ * leadTime - pz);
+
+    // The MEGA SHARK bumps from farther away, so stay a bit farther from it.
+    const gap = sharkBumpGap(self.radius, shark);
+    const base = clamp(me.preferredRange, SHARK_RANGE_MIN, SHARK_RANGE_MAX);
+    const range = shark.radius > MEGA_SHARK_RADIUS ? Math.max(base, gap + 8) : base;
+    const peelEnter = Math.max(gap + 4, range * 0.55);
+
+    if (this.sPeelLeft > 0) {
+      // Too close: break away to the side, then come back round for another run.
+      this.sPeelLeft -= dt;
+      this.planDesired = bearing + this.strafe * PEEL_ANGLE;
+      if (this.sPeelLeft <= 0 || (PEEL_SEC_MAX - this.sPeelLeft > PEEL_SEC_MIN && dist > range * PEEL_EXIT)) {
+        this.sPeelLeft = 0;
+        if (this.rng() < 0.5) this.strafe = -this.strafe;
+      }
+    } else if (dist < peelEnter) {
+      this.sPeelLeft = PEEL_SEC_MAX;
+      this.planDesired = bearing + this.strafe * PEEL_ANGLE;
+    } else {
+      // Same idea as the battle circle-strafe: nose on the shark while the blaster is loaded, curving
+      // round it while reloading.
+      const closeness = smoothstep(range * 1.25, range * 0.8, dist); // 0 far .. 1 close
+      const reloading = self.ammo <= 0 || self.reloading;
+      this.sStrafeMix += ((reloading ? 1 : STRAFE_ARMED) - this.sStrafeMix) * (1 - Math.exp(-dt / 0.25));
+      const sideways = this.strafe * me.engageOffsetDeg * DEG * closeness * this.sStrafeMix;
+      this.planDesired = bearingLead + sideways + this.aimErr + this.weave();
+      // Do not charge in: ease off as we come into range so we stay out of bump reach.
+      this.planThrottle = lerp(1, SHARK_STAND_THROTTLE, smoothstep(range * 2, range * 1.1, dist));
+      if (dist > range * CHASE_FACTOR && this.boostPermit) this.planBoost = true;
+    }
+  }
+
+  /**
+   * Is a shark about to bump us? If so (after a short "notice" delay, longer for easier bots) swerve away from
+   * it and boost; the swerve outlasts the danger a little. Returns true while swerving.
+   */
+  private dodgeSharks(ctx: ControllerContext, dt: number, sharks: readonly AimTarget[]): boolean {
+    const self = ctx.self;
+    this.dodgeLeft = Math.max(0, this.dodgeLeft - dt);
+    const threat = this.findThreat(self, sharks);
+    if (threat) {
+      this.threatFor += dt;
+      if (this.threatFor >= this.skill.reaction * 0.3) {
+        const toShark = headingOf(threat.position.x - self.position.x, threat.position.z - self.position.z);
+        // Swing out to the side that is the shorter turn from the nose (and keep that side while dodging).
+        if (this.dodgeLeft <= 0) this.dodgeSide = wrapPi(toShark - self.heading) > 0 ? -1 : 1;
+        this.dodgeHeading = toShark + this.dodgeSide * DODGE_ANGLE;
+        this.dodgeLeft = DODGE_TAIL_SEC;
+      }
+    } else {
+      this.threatFor = 0;
+    }
+    if (this.dodgeLeft <= 0) return false;
+    this.planDesired = this.dodgeHeading;
+    this.planBoost = true;
+    this.sPeelLeft = 0;
+    return true;
+  }
+
+  /**
+   * The shark closest to bumping us, or null. A shark is a danger when it is swimming and we are closing on each
+   * other, and it is nearer than the room we need to turn away: its bump gap, plus the distance both of us
+   * travel while the boat swings round (so a fast head-on approach counts from farther away).
+   */
+  private findThreat(self: Boat, sharks: readonly AimTarget[]): AimTarget | null {
+    const px = self.position.x;
+    const pz = self.position.z;
+    let worst: AimTarget | null = null;
+    let worstMargin = 0;
+    for (let i = 0; i < sharks.length; i++) {
+      const s = sharks[i];
+      if (Math.hypot(s.velocity.x, s.velocity.z) < 2) continue; // not swimming at anybody
+      const dx = s.position.x - px;
+      const dz = s.position.z - pz;
+      const dist = Math.hypot(dx, dz) || 0.01;
+      const ux = dx / dist;
+      const uz = dz / dist;
+      const sharkIn = Math.max(0, -(s.velocity.x * ux + s.velocity.z * uz)); // how fast it comes at us
+      const meIn = Math.max(0, self.velocity.x * ux + self.velocity.z * uz); // how fast we go at it
+      if (sharkIn + meIn < 1) continue; // just passing by
+      const room = sharkBumpGap(self.radius, s) + DODGE_MARGIN + sharkIn * DODGE_SHARK_SEC + meIn * DODGE_SELF_SEC;
+      if (room - dist > worstMargin) {
+        worstMargin = room - dist;
+        worst = s;
+      }
+    }
+    return worst;
+  }
+
+  /** No shark to fight: loop slowly round the nearest human, so the helpers are close when the sharks arrive. */
+  private planEscort(ctx: ControllerContext, dt: number, px: number, pz: number): void {
+    const self = ctx.self;
+    let buddy: Boat | null = null;
+    let buddyDist = Infinity;
+    for (let i = 0; i < ctx.boats.length; i++) {
+      const b = ctx.boats[i];
+      if (!b.isHuman || b.id === self.id) continue;
+      const d = Math.hypot(b.position.x - px, b.position.z - pz);
+      if (d < buddyDist) {
+        buddyDist = d;
+        buddy = b;
+      }
+    }
+    if (!buddy) {
+      this.planWander(ctx, dt, px, pz);
+      return;
+    }
+    const hx = buddy.position.x;
+    const hz = buddy.position.z;
+    const r = this.escortRadius;
+    if (buddyDist > r * 2.5) {
+      // Fell behind: catch up.
+      this.planDesired = headingOf(hx - px, hz - pz);
+      if (buddyDist > r * 4 && this.boostPermit) this.planBoost = true;
+      return;
+    }
+    // Aim for a spot a little further round the ring from where we are.
+    const here = Math.atan2(px - hx, pz - hz);
+    const ahead = here + this.escortDir * 0.7;
+    const limit = ctx.world.arenaRadius * 0.85;
+    let gx = hx + Math.sin(ahead) * r;
+    let gz = hz + Math.cos(ahead) * r;
+    const gr = Math.hypot(gx, gz);
+    if (gr > limit) {
+      gx *= limit / gr;
+      gz *= limit / gr;
+    }
+    if (!crateIsReachable(ctx, gx, gz)) this.escortDir = -this.escortDir; // that spot is on an island: go round the other way
+    this.planDesired = headingOf(gx - px, gz - pz);
+    this.planThrottle = 0.75;
+  }
+
+  /**
+   * Games where sharks are only a nuisance: a shark swimming at us may be worth turning round for. Bots that are up
+   * to it (normal and hard) roll the dice when a chase starts, then face the shark and shoot (swerving away if it
+   * gets about to bump us). After the chase, or after a few seconds, the bot goes back to its game. A racer never
+   * leaves the course: it only takes pot-shots at the chaser (see decideFire).
+   */
+  private planSharkDuel(ctx: ControllerContext, dt: number): void {
+    const self = ctx.self;
+    const sharks = ctx.sharks ?? NO_SHARKS;
+    this.duelCool = Math.max(0, this.duelCool - dt);
+    if (this.skill.sharkFight <= 0 || sharks.length === 0) {
+      if (this.duelId >= 0) this.endDuel();
+      this.declinedId = -1;
+      return;
+    }
+
+    if (this.duelId >= 0) {
+      this.duelLeft -= dt;
+      const s = findShark(sharks, this.duelId);
+      if (!s || this.duelLeft <= 0 || Math.hypot(s.position.x - self.position.x, s.position.z - self.position.z) > DUEL_GIVE_UP_M) {
+        this.endDuel(); // it left, it gave up, or we did
+      } else {
+        if (ctx.mode !== 'race') {
+          this.planBoost = false;
+          this.planThrottle = 1;
+          this.planIgnore = null;
+          if (!this.dodgeSharks(ctx, dt, sharks)) this.engageShark(ctx, dt, s);
+        }
+        return;
+      }
+    }
+
+    if (this.duelCool > 0) return;
+    const chaser = this.chaserOf(self, sharks);
+    if (!chaser) {
+      this.declinedId = -1;
+      return;
+    }
+    if (chaser.id === this.declinedId) return;
+    if (this.rng() < this.skill.sharkFight) {
+      this.duelId = chaser.id;
+      this.duelLeft = DUEL_MAX_SEC;
+      this.sPerceiveIn = 0;
+      this.sPeelLeft = 0;
+    } else {
+      this.declinedId = chaser.id; // not this time: ignore this chase
+    }
+  }
+
+  private endDuel(): void {
+    this.duelId = -1;
+    this.duelCool = DUEL_COOLDOWN_SEC;
+    this.dodgeLeft = 0;
+    this.threatFor = 0;
+    this.sPeelLeft = 0;
+  }
+
+  /** A shark swimming at us (at chasing speed, pointed our way) within SHARK_NOTICE_M, or null. */
+  private chaserOf(self: Boat, sharks: readonly AimTarget[]): AimTarget | null {
+    let best: AimTarget | null = null;
+    let bestDist = SHARK_NOTICE_M;
+    for (let i = 0; i < sharks.length; i++) {
+      const s = sharks[i];
+      const dx = self.position.x - s.position.x; // from the shark to us
+      const dz = self.position.z - s.position.z;
+      const dist = Math.hypot(dx, dz);
+      if (dist >= bestDist) continue;
+      const speed = Math.hypot(s.velocity.x, s.velocity.z);
+      if (speed < SHARK_CHASE_SPEED) continue; // just cruising
+      if ((s.velocity.x * dx + s.velocity.z * dz) / (speed * (dist || 1)) < 0.5) continue; // not pointed at us
+      best = s;
+      bestDist = dist;
+    }
+    return best;
+  }
+
   // ───────────────────────────── Power-up crates ─────────────────────────────
 
   private startCrateDetour(x: number, z: number, seconds: number): void {
@@ -703,7 +1121,8 @@ class Bot implements Controller {
       // or something is suddenly close ahead.
       if (meter < sk.boostOff || this.avoid.clearance < 0.4 || (!want && this.boostHold <= 0)) this.boosting = false;
     } else if (want) {
-      const needed = this.escapeLeft > 0 ? Math.min(sk.boostOn, 0.2) : sk.boostOn;
+      // Running from a tag or a shark bump, any boost in the tank will do.
+      const needed = this.escapeLeft > 0 || this.dodgeLeft > 0 ? Math.min(sk.boostOn, 0.2) : sk.boostOn;
       if (meter >= needed) {
         this.boosting = true;
         this.boostHold = 0.5;
@@ -714,8 +1133,8 @@ class Bot implements Controller {
   // ───────────────────────────── Shooting ─────────────────────────────
 
   /**
-   * Fire when any other boat is lined up with the nose and in range. The blaster's own aim
-   * assist does the precise aiming; the bot just has to point roughly the right way.
+   * Fire when any other boat (or a shark we are after) is lined up with the nose and in range. The
+   * blaster's own aim assist does the precise aiming; the bot just has to point roughly the right way.
    */
   private decideFire(ctx: ControllerContext, dt: number): boolean {
     const self = ctx.self;
@@ -743,6 +1162,7 @@ class Bot implements Controller {
         break;
       }
     }
+    if (!aligned) aligned = this.sharkInCone(ctx, px, pz, fx, fz, tanCone, range2);
 
     // The bot only reacts after it has had the boat lined up for a moment.
     this.alignedFor = aligned ? this.alignedFor + dt : 0;
@@ -771,10 +1191,32 @@ class Bot implements Controller {
   }
 
   /**
+   * Is a shark we are allowed to shoot at lined up with the nose? In Boats vs. Sharks every shark is fair game;
+   * elsewhere only the one chasing us that we decided to fight (so a bot never wastes darts on the cruisers).
+   * The shark's own size widens the cone a little (the dart only has to hit its hit-sphere).
+   */
+  private sharkInCone(ctx: ControllerContext, px: number, pz: number, fx: number, fz: number, tanCone: number, range2: number): boolean {
+    const all = ctx.mode === 'sharks';
+    if (!all && this.duelId < 0) return false;
+    const sharks = ctx.sharks ?? NO_SHARKS;
+    for (let i = 0; i < sharks.length; i++) {
+      const s = sharks[i];
+      if (!all && s.id !== this.duelId) continue;
+      const dx = s.position.x - px;
+      const dz = s.position.z - pz;
+      const ahead = dx * fx + dz * fz;
+      if (ahead <= 1 || dx * dx + dz * dz > range2) continue;
+      const sideways = Math.abs(dx * fz - dz * fx);
+      if (sideways <= ahead * tanCone + s.radius * 0.5) return true;
+    }
+    return false;
+  }
+
+  /**
    * Is a teammate on the path the darts would take, within HOLD_FIRE_M? The darts fly toward the
-   * boat the blaster is locked onto, or straight ahead when nothing is locked. (Darts pass through
-   * teammates anyway; holding fire just looks and feels friendlier.) A teammate beyond the locked
-   * boat is not in the way, so the check only reaches as far as that boat.
+   * boat or shark the blaster is locked onto, or straight ahead when nothing is locked. (Darts pass
+   * through teammates anyway; holding fire just looks and feels friendlier.) A teammate beyond the
+   * locked target is not in the way, so the check only reaches as far as that target.
    */
   private teammateInLine(ctx: ControllerContext): boolean {
     const self = ctx.self;
@@ -785,18 +1227,33 @@ class Bot implements Controller {
     let uz = Math.cos(self.heading);
     let reach = HOLD_FIRE_M;
     if (self.aimTargetId !== null) {
-      for (let i = 0; i < boats.length; i++) {
+      // The locked thing is a boat, or (id >= SHARK_ID_BASE) a shark.
+      let lockX = 0;
+      let lockZ = 0;
+      let locked = false;
+      for (let i = 0; i < boats.length && !locked; i++) {
         const b = boats[i];
         if (b.id !== self.aimTargetId) continue;
-        const dx = b.position.x - px;
-        const dz = b.position.z - pz;
+        lockX = b.position.x;
+        lockZ = b.position.z;
+        locked = true;
+      }
+      const sharks = ctx.sharks ?? NO_SHARKS;
+      for (let i = 0; i < sharks.length && !locked; i++) {
+        if (sharks[i].id !== self.aimTargetId) continue;
+        lockX = sharks[i].position.x;
+        lockZ = sharks[i].position.z;
+        locked = true;
+      }
+      if (locked) {
+        const dx = lockX - px;
+        const dz = lockZ - pz;
         const d = Math.hypot(dx, dz);
         if (d > 1) {
           ux = dx / d;
           uz = dz / d;
           reach = Math.min(reach, d);
         }
-        break;
       }
     }
     for (let i = 0; i < boats.length; i++) {

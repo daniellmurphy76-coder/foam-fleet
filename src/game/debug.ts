@@ -8,11 +8,11 @@
  *   __foam.errors             everything that threw, collected instead of crashing the game
  *
  * Extra helpers: start(setup?), menu(), pause(), resume().
- * URL params that start a match with no menu: ?quick=battle|race|team|practice&humans=1|2&bots=N&difficulty=easy|normal|hard
+ * URL params that start a match with no menu: ?quick=battle|race|team|practice|sharks&humans=1|2&bots=N&difficulty=easy|normal|hard
  * (also &easy=0|1 for Easy Driving, &duration=SECONDS, &laps=N, &autopilot=1, &timescale=N, &nopause=1, &fps=1,
  * &mute=1 for a silent page load that is never saved).
  */
-import type { MatchSetup, ModeId } from '../types';
+import type { MatchSetup, ModeId, SharkHud } from '../types';
 
 export interface FoamBoatSnapshot {
   id: number;
@@ -26,7 +26,7 @@ export interface FoamBoatSnapshot {
   stunned: boolean;
   boost: number;
   shielded: boolean;
-  /** Team Up: 0 = the humans' side. Otherwise the boat id. */
+  /** Team Up: 0 = the humans' side. Boats vs. Sharks: 0 for everyone. Otherwise the boat id. */
   team: number;
   /** Easy Driving handling on? */
   easy: boolean;
@@ -48,6 +48,9 @@ export interface FoamHumanSnapshot {
   pickups: number;
   honks: number;
   rescues: number;
+  /** Sharks scared off with darts, and bumps taken from sharks. */
+  sharkTags: number;
+  sharkBumps: number;
 }
 
 export interface FoamSnapshot {
@@ -67,6 +70,13 @@ export interface FoamSnapshot {
   balloons: { remaining: number; total: number } | null;
   /** Team Up: both teams' scores (humans' team first). */
   teams: { team: number; name: string; color: number; score: number }[] | null;
+  /**
+   * The sharks in the lagoon right now (every mode): wave sharks not yet tagged, the MEGA SHARK's health while
+   * it is out, and how many live sharks can be hit.
+   */
+  sharks: { waveLeft: number; mega: { health: number; maxHealth: number } | null; count: number } | null;
+  /** Boats vs. Sharks only: wave, sharks left, life rings, MEGA health, between waves? (what the HUD banner shows). */
+  sharkRules: SharkHud | null;
   /** One entry per human. */
   humans: FoamHumanSnapshot[];
   /** Modules whose real implementation threw at creation and were replaced by a stand-in. */
@@ -103,7 +113,8 @@ declare global {
 function emptySnapshot(): FoamSnapshot {
   return {
     state: foam.state, t: 0, fps: 0, mode: null, boats: [], darts: 0, hits: 0,
-    errors: foam.errors.slice(), timeLeft: null, raceTime: null, balloons: null, teams: null, humans: [],
+    errors: foam.errors.slice(), timeLeft: null, raceTime: null, balloons: null, teams: null, sharks: null,
+    sharkRules: null, humans: [],
     fallbacks: foam.fallbacks.slice(), touchActive: false, muted: false, render: null,
   };
 }

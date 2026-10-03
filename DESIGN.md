@@ -563,3 +563,174 @@ keyboard must keep working exactly as before. Contract change in `src/types.ts`:
   - releasing every finger zeroes the controls.
 - Portrait shows the rotate overlay.
 - Keyboard and gamepad still work; `touchActive` flips back on a key press.
+
+---
+
+# v4: Sharks! (the son's ideas)
+
+The son asked for three things:
+1. a new game, **Boats vs. Sharks**;
+2. a new boat, the shark-skeleton **BoneBoat**;
+3. **sharks in the water in every game**.
+
+Contracts in `src/types.ts` are updated (`ModeId 'sharks'`, `SHARK_ID_BASE`, `AimTarget`, `Sharks`, `SharkBump`,
+`SharkTag`, `SharkHud`, `ControllerContext.sharks`, `Boat.update/tryFire aimTargets`, `Effects.bubbles`, new
+`Sfx` methods, `MapState.sharks`, `HudState.sharks`, new `PlayerMatchStats` fields). Knobs live in
+`CONFIG.sharks`, and the new stub is `src/sharks/sharks.ts`.
+
+**Tone:** cartoon sharks, never scary.
+- Big friendly eyes, a goofy toothy grin, rounded shapes, slate-blue with a white belly.
+- No blood, no "eat", no "kill". Words: bump, chomp (a silly sound), splash, dive, scare off, tag.
+- A shark that gets darted does a comic flip and dives away with bubbles. The MEGA SHARK is a big
+  purple-grey goofball with a little captain's hat and a scar-free grin.
+
+## Sharks module (`src/sharks/**`, new; `createSharks(scene, world, mode, fx, skill)`)
+
+**Models.** Low-poly, flat-shaded, pooled. Up to 16 normal sharks plus 1 MEGA (x3 size).
+- Body about 3.2 m long, with dorsal fin, tail fin, pectoral fins, eyes and teeth.
+- Tail-wag swim animation.
+- Only the dorsal fin (plus a faint V of spray) shows while cruising; the body sits about 0.7 m under the
+  surface, following `waveHeight`.
+- While chasing, the shark rides higher (back and fin out).
+
+**Bump.** A quick lunge, half out of the water with the jaw open, then a splash.
+- Detected when the shark's nose is within `boat.radius + 1.2` (MEGA: + 3) of a boat.
+- Call `boat.onHit(dir, CONFIG.sharks.bumpStun)` and return a `SharkBump` (blocked = the onHit result
+  was false).
+- The bumping shark then turns away and won't bump anyone for 4 s.
+
+**Dart hit** (`hit()`).
+- Normal shark: a comic flip, `fx.bubbles` and `fx.splash`, then it dives, sinks out of sight in about 1 s,
+  and leaves. In ambient modes it reappears near the arena edge after `returnSec`.
+- MEGA SHARK: -1 health, a flash, a short shake; defeated at 0 (big flip, giant splash).
+- Return a `SharkTag`.
+
+**Brains.** Steering with look-ahead obstacle avoidance against `world.obstacles` and the arena edge (reuse
+the probe helpers in `src/ai/steering.ts`; read-only import is fine). Sharks never beach on islands and never
+cross obstacle circles.
+- **Ambient modes** (battle/race/team/practice; count = `CONFIG.sharks.ambient[mode]`):
+  - Cruise lazy loops through open water at `cruiseSpeed`.
+  - Every ~`chaseEverySec` (randomized per shark), a shark may chase the nearest boat within 45 m at
+    `chaseSpeed` for up to `chaseSec`. Then it gives up and swims off.
+  - Never more than one chaser per boat.
+  - Practice (Balloon Pop): sharks never chase or bump; they just cruise and look cool.
+- **'sharks' mode:**
+  - `spawnWave(count, false)` brings sharks in from evenly spread points on the arena edge, all
+    targeting boats: each picks the nearest boat (spread out, at most 2 per boat), re-picks every 3 s, and
+    chases at `chaseSpeed * speedBySkill[skill]`, with small personality differences.
+  - `spawnWave(1, true)` brings the MEGA SHARK: slower (0.8x), relentless, bump reach + 3 m. Its bump calls
+    onHit once like any shark (`SharkBump.mega` = true); the core decides the bigger consequences.
+  - `waveLeft` counts wave sharks not yet tagged.
+- **targets** (`AimTarget[]`): live hittable sharks only (not diving, not off-screen, not returning).
+  - `id = SHARK_ID_BASE + index`.
+  - `position` = a hit-sphere center at the body (y about 0.3).
+  - `radius` 1.6 (MEGA 4.5).
+  - `velocity` = the current velocity.
+  - `name` "Shark" or "MEGA SHARK".
+  - Reuse the arrays and objects (no per-frame allocation).
+- **mapDots:** every visible shark.
+- **dispose():** frees everything.
+
+## BoneBoat (`src/entities/**`): hull 3
+
+A boat built from a giant **shark skeleton**, bone-white with slightly warm ivory shading.
+- **Body:**
+  - a skull at the bow: snout, big empty eye sockets glowing in the player color, an open jaw with a row of
+    pointy teeth, top and bottom;
+  - a spine along the centerline;
+  - 5–6 curved rib pairs forming the hull sides (thin, with gaps you can see water through; a floor plate
+    inside so it reads as a boat);
+  - a bony dorsal fin behind the cockpit;
+  - a bony forked tail fin at the stern;
+  - a hint of pectoral-fin bones near the waterline.
+- **Fittings:** the captain seat, captain (with hat) and blaster sit on the spine/floor like the other hulls.
+  The flag mast goes on the tail.
+- **Paint patterns:** on BoneBoat they tint the rib ends/teeth tips and the eye glow, so the player color and
+  pattern still read.
+- **Fit:** same size, waterline, collision radius and hit radius as the other hulls. It must look great in
+  the Garage turntable AND from the chase camera.
+- **Aim assist:** `update()`/`tryFire()` get optional `aimTargets` (sharks). Lock rule: the nearest BOAT
+  (other team) in the cone wins; if none, the nearest aim target in the cone. `aimTargetId` can then be a
+  shark id (>= SHARK_ID_BASE). The turret tracks it, and `tryFire` leads it with its velocity like a boat.
+
+## Boats vs. Sharks rules (`src/game/**`, mode `'sharks'`)
+
+- **Teams and spawns:** humans + `setup.bots` helper boats (0..3, default `CONFIG.sharks.defaultHelpers`)
+  are all team 0. No enemy boats. Spawn on the battle ring.
+- **Waves:** `CONFIG.sharks.waves` = 5 waves, then the MEGA SHARK round.
+  - Before each wave: `hud.announce('WAVE n', {sub: 'Here come the sharks!'})` + `sfx.waveStart()`.
+  - MEGA round: `announce('MEGA SHARK!')` + `sfx.megaRoar()`.
+  - The next wave starts `waveBreakSec` after the last wave shark leaves.
+- **Life rings:** the team starts with `CONFIG.sharks.lifeRings`. Every non-blocked shark bump pops one
+  (MEGA bump pops 2).
+  - Feed: "Splash! A shark bumped Sam" (playful).
+  - Each bump: `sfx.sharkBump()`, `fx.splash`, and a rumble for a human.
+- **Scoring:** each dart tag on a shark = 1 point to the shooter (MEGA hits = 1 each, the final MEGA hit +5).
+  - Feed: "Sam scared off a shark!"
+  - Each tag: `sfx.sharkDive()`.
+- **End:** WIN when the MEGA SHARK is defeated: title "You beat the sharks!", `sfx.victory()`, confetti.
+  LOSE when the rings hit 0: title "The sharks win this time!", `sfx.defeat()`. Results rows show each
+  boat's shark tags; stats include sharkTags, sharkBumps, megaDefeated, hull.
+- **HUD:** `HudState.sharks` filled every frame (`wave`, `waves`, `sharksLeft`, `rings`, `maxRings`, `mega`,
+  `betweenWaves`). `timeLeft` is null; `raceTime` counts up.
+
+## Sharks in every game (`src/game/**`)
+
+- **Setup:** every match creates the sharks system after the world (`createSharks(scene, world, mode, fx,
+  setup.botDifficulty)`). Each step, call `sharks.update` after the boats move and before darts. Shark bumps:
+  `sfx.sharkBump()`, `fx.splash`, a feed line ("A shark bumped Salty Sal!"), stats.sharkBumps, rumble. No
+  points lost outside 'sharks' mode.
+- **Darts:** pass `sharks.targets` to `darts.update` as targets. In Balloon Pop, concatenate with
+  `balloons.targets` in one reused array.
+- **Routing hits:** `targetHits` with id >= SHARK_ID_BASE go to `sharks.hit(id, ownerId, dir)`; others go to
+  balloons. A shark tag outside 'sharks' mode scores nothing but plays `sfx.sharkDive()` with a feed line
+  "Sam scared off a shark!", and counts stats.sharkTags.
+- **Aim:** pass `sharks.targets` as `aimTargets` to `boat.update`/`tryFire`, and as `ctx.sharks` to
+  controllers. The reticle's `lockedTarget` shows the AimTarget's name when `aimTargetId >= SHARK_ID_BASE`.
+- **Map:** `HudState.map.sharks` = `sharks.mapDots`.
+- **Setup and test params:** `sanitizeSetup` accepts 'sharks' (bots = helpers 0..3, clamp). `?quick=sharks`
+  works.
+- **Bot looks:** bot hulls are chosen from 0..3 (BoneBoat included).
+
+## Bots (`src/ai/**`)
+
+- **'sharks' mode:** bots are helpers.
+  - Each bot targets the shark closest to any human (protect the players), else the nearest shark.
+  - It circles at a safe range (15–25 m), fires when the shark is in its nose cone, and boosts away from a
+    shark about to bump it.
+  - The MEGA SHARK gets focus fire from everyone.
+- **Other modes:** if a shark is chasing a bot (within 20 m behind or closing), the bot may turn and dart
+  it (normal difficulty and up). Otherwise bots ignore sharks.
+- **Steering:** steer around sharks like moving obstacles only when very close.
+
+## Menu (`src/ui/menu.ts`, `garage.ts`, `trophies.ts`, `styles.css`, `dom.ts`)
+
+- **Mode card:** a 5th card, **Boats vs. Sharks** 🦈 ("Team up! Scare off 5 waves of sharks, then the MEGA
+  SHARK!"). Options: Players 1/2; Helper boats 0–3 (default 2); Shark speed = the existing bot-skill buttons,
+  relabeled "Shark speed: Slow / Normal / Fast" for this mode. No battle length.
+- **Garage:** the Boat picker adds **BoneBoat** (hull 3) with a bone/skull icon.
+- **Trophies:** 4 new.
+  - "Shark Tamer" (tag 10 sharks in one game)
+  - "Shark Snack" (get bumped by a shark: a funny one)
+  - "Mega Hero" (beat the MEGA SHARK)
+  - "Bone Captain" (play a game in the BoneBoat)
+
+## HUD, FX & Audio (`src/ui/hud.ts`, `hud.css`, `minimap.ts`, `src/fx/**`, `src/audio/**`)
+
+- **Boats vs. Sharks banner** (top center, replacing the timer): "Wave 2/5" (or "MEGA SHARK!"), sharks left
+  with a little fin icon, and the team's life rings as a row of red-and-white ring icons (popped rings
+  greyed out).
+- **MEGA health bar:** under the banner, a wide chunky bar while the MEGA SHARK is out.
+- **Between waves:** a gentle "Get ready…" countdown text.
+- **Touch layout:** the banner must not collide with the touch layout's top-left/right stacks (see the v3
+  rules).
+- **Mini-map:** sharks are small dark-grey fin triangles pointing along their heading; MEGA is bigger and
+  purple.
+- **FX:** `fx.bubbles(position)`: a column of rising bubbles that pop at the surface over ~1 s (pooled).
+- **Audio** (synthesized like the rest, friendly not scary):
+  - `sharkBump` = cartoon chomp (two quick clacks) + thud;
+  - `sharkDive` = splash + bubbly blorp;
+  - `waveStart` = ship's bell ding-ding;
+  - `megaRoar` = big silly cartoon roar (wobbly low growl, sliding down, then a goofy squeak);
+  - `defeat` = friendly wah-wah trombone.
+  - The two-note "duun-dun, duun-dun" shark theme sting plays on `waveStart` (optional, short).

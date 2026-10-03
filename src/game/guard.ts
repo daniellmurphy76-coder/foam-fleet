@@ -11,13 +11,13 @@ import { foam, reportError } from './debug';
 type AnyFn = (this: unknown, ...args: unknown[]) => unknown;
 
 /**
- * The methods v2 added to each service. If a module has not caught up yet, guard() hands out a
- * do-nothing stand-in for them (and logs it once) instead of letting `service.method is not a function`
- * knock a whole simulation step over.
+ * The methods v2 to v4 added to each service (v4: the shark sounds and `bubbles`). If a module has not
+ * caught up yet, guard() hands out a do-nothing stand-in for them (and logs it once) instead of letting
+ * `service.method is not a function` knock a whole simulation step over.
  */
 export const V2_METHODS = {
-  sfx: ['pop', 'honk', 'rescue', 'trophy'],
-  fx: ['pop', 'notes'],
+  sfx: ['pop', 'honk', 'rescue', 'trophy', 'sharkBump', 'sharkDive', 'waveStart', 'megaRoar', 'defeat'],
+  fx: ['pop', 'notes', 'bubbles'],
   hud: ['hint'],
   input: ['schemeOf', 'layoutTouch'],
 } as const;

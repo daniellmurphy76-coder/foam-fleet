@@ -1,7 +1,7 @@
 # Foam Fleet
 
-Toy speedboats with foam-dart blasters, racing, battling and popping balloons around a tropical lagoon.
-1 or 2 players on one computer (split screen), plus computer boats.
+Toy speedboats with foam-dart blasters, racing, battling, popping balloons and scaring off goofy cartoon sharks
+around a tropical lagoon. 1 or 2 players on one computer (split screen), plus computer boats.
 
 ## Start the game
 
@@ -48,6 +48,19 @@ the touch layout, and touching the screen brings it back.
   A floating diamond over each boat shows its team.
 - **Balloon Pop**: no computer boats. Pop all 30 balloons as fast as you can by shooting them or just driving
   through them. Gold balloons are worth 3 points. With two players, the most points wins.
+- **Boats vs. Sharks**: everybody is on one team (you, a friend, and 0 to 3 helper boats) against the sharks.
+  Five waves of sharks swim in from the edge of the lagoon (3, 5, 7, 9 and 11 sharks), then the big purple
+  **MEGA SHARK** arrives wearing a captain's hat. Every dart that tags a shark scares it off and scores a point
+  for the shooter. The MEGA SHARK takes 12 darts, and the dart that finishes it is worth 5 extra points. Every
+  shark bump pops one of the team's 12 life rings (a MEGA SHARK bump pops 2, and a Shield soaks a bump up).
+  Scare off the MEGA SHARK to win. Lose every ring and the sharks win this time. The setup screen has
+  **Helper boats** (0 to 3) and **Shark speed** (Slow, Normal, Fast). There is no clock; the timer counts up.
+
+**Sharks in every game.** Friendly cartoon sharks cruise the lagoon in every mode (3 in Dart Battle and Team Up,
+2 in Buoy Race and Balloon Pop). Now and then one gets curious and chases a boat, and a bump makes the boat
+wobble (nobody loses points outside Boats vs. Sharks). Dart one to send it on a comic flip and dive; it comes
+back after a while. In Balloon Pop the sharks never chase or bump, they just swim around. The blaster's aim
+assist locks onto a shark when no boat is in the way, and the reticle names it ("Shark" or "MEGA SHARK").
 
 Grab the floating **?** crates for power-ups: **Triple Shot**, **Rapid Fire**, **Shield**, **Turbo**.
 
@@ -60,12 +73,16 @@ for the full-speed, do-it-yourself handling.
 
 ## Boat Garage, Trophy Shelf and mini-map
 
-- **Boat Garage** (on each player's card in setup): pick a boat (Zippy, Tuggy or Twin), paint (solid, stripes,
-  flames, dots, shark teeth), a hat, a flag, a horn (try "Test horn") and a color, with a live 3D preview.
-- **Trophy Shelf** (title screen): 12 trophies per player name, like First Splat, Teamwork and Pop Star.
-  Trophies you have not won yet show as grey silhouettes with how to earn them.
+- **Boat Garage** (on each player's card in setup): pick a boat (Zippy, Tuggy, Twin or the **BoneBoat**, a boat
+  built from a friendly shark skeleton), paint (solid, stripes, flames, dots, shark teeth), a hat, a flag, a
+  horn (try "Test horn") and a color, with a live 3D preview. On the BoneBoat the paint colors the rib ends,
+  the teeth tips and the glowing eyes.
+- **Trophy Shelf** (title screen): 16 trophies per player name, like First Splat, Teamwork and Pop Star.
+  Trophies you have not won yet show as grey silhouettes with how to earn them. The four shark trophies are
+  **Shark Tamer** (tag 10 sharks in one game), **Shark Snack** (get bumped by a shark), **Mega Hero** (beat the
+  MEGA SHARK in Boats vs. Sharks) and **Bone Captain** (play a game in the BoneBoat).
 - **Mini-map**: a round radar in the corner of each player's view. Your boat is the big arrow, and the way you
-  are facing is up.
+  are facing is up. Sharks show as small dark-grey fins (the MEGA SHARK is bigger and purple).
 
 ## Controls
 
@@ -93,24 +110,28 @@ for the full-speed, do-it-yourself handling.
 
 - **`src/config.ts`** has every number that matters, written in plain English: boat speed, dart
   speed, how many darts a blaster holds, how long a battle lasts, how gentle Easy Driving is, how many
-  balloons there are, how wobbly the bots' aim is, team names and colors, boat colors, and bot names. Change
-  one, save, and the game reloads by itself.
-- **`DESIGN.md`** is the full plan for how the game works, module by module (v1, then the v2 upgrades).
+  balloons there are, how wobbly the bots' aim is, team names and colors, boat colors, and bot names. The
+  `sharks` section sets how many sharks swim in each game, how fast, how often they chase, the size of each
+  wave, the MEGA SHARK's health and the team's life rings. Change one, save, and the game reloads by itself.
+- **`DESIGN.md`** is the full plan for how the game works, module by module (v1, the v2 upgrades, then v4:
+  Sharks!).
 
 | Folder | What lives there |
 |---|---|
 | `src/world/` | Water, sky, islands, the giant duck, race gates, power-up crates, balloons, rescue and team spawn spots |
-| `src/entities/` | The boats: how they look (hulls, paint, hats, flags), drive, bob on waves, and shoot |
-| `src/combat/`, `src/fx/` | Darts in flight, darts stuck to boats, splashes, balloon pops, honk notes |
-| `src/ai/` | How computer boats think |
+| `src/entities/` | The boats: how they look (hulls, paint, hats, flags, the BoneBoat), drive, bob on waves, and shoot |
+| `src/sharks/` | The sharks: how they look, swim, chase, bump, flip and dive, and the Boats vs. Sharks attack waves |
+| `src/combat/`, `src/fx/` | Darts in flight, darts stuck to boats, splashes, balloon pops, shark-dive bubbles, honk notes |
+| `src/ai/` | How computer boats think (and how helper boats fight sharks) |
 | `src/input/` | Keyboard, gamepad and touch (the on-screen stick and buttons), and the Easy Driving helper |
 | `src/ui/`, `src/audio/` | Menus, Boat Garage, Trophy Shelf, scoreboard, mini-map, sounds, music |
-| `src/game/` | The game loop, battle / race / team / balloon rules, cameras, split screen, rescue, trophies |
+| `src/game/` | The game loop, battle / race / team / balloon / shark rules, cameras, split screen, rescue, trophies |
 
 ## Testing shortcuts
 
-- `?quick=battle&humans=2&bots=3` skips the menu. `quick` can be `battle`, `race`, `team` or `practice`
-  (Balloon Pop). Also `difficulty=easy|normal|hard`, `duration=SECONDS`, `laps=N`.
+- `?quick=battle&humans=2&bots=3` skips the menu. `quick` can be `battle`, `race`, `team`, `practice`
+  (Balloon Pop) or `sharks` (Boats vs. Sharks, where `bots` is the number of helper boats, 0 to 3, and
+  `difficulty` is the shark speed). Also `difficulty=easy|normal|hard`, `duration=SECONDS`, `laps=N`.
 - `&easy=0` or `&easy=1` turns Easy Driving off or on for every player (it defaults to on).
 - `&nopause=1` stops the game pausing when the window loses focus. `&autopilot=1` lets the computer drive
   your boat, and `&timescale=4` fast-forwards.
@@ -120,6 +141,6 @@ for the full-speed, do-it-yourself handling.
   `?quick=battle&humans=2&touch=1`.
 - `?mute=1` makes that page silent. The Sound button and the **M** key do nothing there, and nothing is saved,
   so the family's own Sound setting is never changed. Use it on every test page.
-- In the browser console, `__foam.snapshot()` shows the game state (boats, teams, balloons left, what each
-  human has done so far), `__foam.timeScale = 4` fast-forwards, `__foam.autopilot = true` lets the computer
+- In the browser console, `__foam.snapshot()` shows the game state (boats, teams, balloons left, the sharks and
+  the Boats vs. Sharks wave and life rings, what each human has done so far), `__foam.timeScale = 4` fast-forwards, `__foam.autopilot = true` lets the computer
   drive your boat, and `__foam.start({ mode: 'team', bots: 3 })` starts a match.

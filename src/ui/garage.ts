@@ -20,12 +20,27 @@ interface Opt<T> {
   icon: string;
   /** How the summary line says it ("Pirate hat"); the label if left out. */
   say?: string;
+  /** A little static SVG drawn above the label instead of the emoji. */
+  art?: string;
 }
 
+// A friendly cartoon skull for the BoneBoat button: bone-white, big dark eye sockets with a glow in the boat's color (--boat).
+const BONE_ART = `<svg viewBox="0 0 28 28" aria-hidden="true">
+  <path d="M14 2.5 C7.5 2.5 3.5 7 3.5 12.5 C3.5 16 5 18.4 7.5 19.8 V24 Q7.5 25.5 9 25.5 H19 Q20.5 25.5 20.5 24 V19.8 C23 18.4 24.5 16 24.5 12.5 C24.5 7 20.5 2.5 14 2.5 Z" fill="#fffaf0" stroke="#06173d" stroke-width="2" stroke-linejoin="round"/>
+  <ellipse cx="9.8" cy="12.5" rx="3.2" ry="3.6" fill="#06173d"/>
+  <ellipse cx="18.2" cy="12.5" rx="3.2" ry="3.6" fill="#06173d"/>
+  <ellipse class="eye" cx="9.8" cy="12.8" rx="1.5" ry="1.8"/>
+  <ellipse class="eye" cx="18.2" cy="12.8" rx="1.5" ry="1.8"/>
+  <path d="M14 16 L12.5 18.8 H15.5 Z" fill="#06173d"/>
+  <path d="M10.7 21.6 V25.2 M14 21.6 V25.4 M17.3 21.6 V25.2" stroke="#06173d" stroke-width="1.5" stroke-linecap="round"/>
+</svg>`;
+
+/** The BoneBoat is hull 3 (see `BoatLook.hull` in types.ts). */
 const HULLS: readonly Opt<number>[] = [
   { id: 0, label: 'Zippy', icon: '🚤' },
   { id: 1, label: 'Tuggy', icon: '🚢' },
   { id: 2, label: 'Twin', icon: '⛵' },
+  { id: 3, label: 'BoneBoat', icon: '🦴', art: BONE_ART },
 ];
 const PATTERNS: readonly Opt<PatternId>[] = [
   { id: 'solid', label: 'Solid', icon: '' },
@@ -80,7 +95,7 @@ export function sanitizeLook(raw: unknown, base: BoatLook): BoatLook {
 }
 
 function items<T>(opts: readonly Opt<T>[]): SegItem<T>[] {
-  return opts.map((o) => ({ value: o.id, label: o.label, icon: o.icon }));
+  return opts.map((o) => ({ value: o.id, label: o.label, icon: o.art ? svgNode(o.art) : o.icon }));
 }
 
 /** "Zippy · Flames · Pirate hat · Duck horn": only the interesting parts, for the player card and the garage. */
@@ -454,7 +469,7 @@ export function createGarage(sfx: Sfx): Garage {
     seg.row.style.setProperty('--n', String(n));
     seg.row.classList.toggle('ff-seg--roomy', roomy);
   };
-  across(hullSeg, 3, true);
+  across(hullSeg, 4, true);
   across(paintSeg, 5);
   across(hatSeg, 6);
   across(flagSeg, 6);

@@ -14,7 +14,7 @@ import { CONFIG } from '../config';
 import type {
   Boat, BoatControls, BoatInit, Balloons, BalloonPop, Checkpoint, Controller, DartSystem, DartTarget,
   DartUpdateResult, Effects, Hud, InputManager, MatchSetup, Menu, MenuInput, ModeId, Obstacle, PickupEvent,
-  Pickups, PowerUpKind, Sfx, SpawnPoint, World, WorldQuery, ActivePowerUp, DartSpawn,
+  Pickups, PowerUpKind, Sfx, Sharks, SharkBump, SpawnPoint, World, WorldQuery, ActivePowerUp, DartSpawn, AimTarget,
 } from '../types';
 
 const noop = (): void => {};
@@ -39,6 +39,7 @@ export function quietSfx(): Sfx {
     unlock: noop, fire: noop, hit: noop, shieldBlock: noop, splash: noop, bump: noop, pickup: noop,
     boost: noop, checkpoint: noop, lap: noop, countdown: noop, go: noop, victory: noop,
     pop: noop, honk: noop, rescue: noop, trophy: noop,
+    sharkBump: noop, sharkDive: noop, waveStart: noop, megaRoar: noop, defeat: noop,
     uiMove: noop, uiSelect: noop, setEngines: noop, setMusic: noop,
     setMuted: (m: boolean) => { muted = m; },
     get muted() { return muted; },
@@ -47,8 +48,8 @@ export function quietSfx(): Sfx {
 
 export function quietFx(): Effects {
   return {
-    splash: noop, hitBurst: noop, sparkle: noop, pop: noop, notes: noop, wake: noop, update: noop, clear: noop,
-    dispose: noop,
+    splash: noop, hitBurst: noop, sparkle: noop, bubbles: noop, pop: noop, notes: noop, wake: noop, update: noop,
+    clear: noop, dispose: noop,
   };
 }
 
@@ -251,6 +252,25 @@ export function fallbackPickups(): Pickups {
 const NO_DART_RESULT: DartUpdateResult = { hits: [], targetHits: [], waterSplashes: [] };
 export function fallbackDarts(): DartSystem {
   return { spawn: noop, update: () => NO_DART_RESULT, activeCount: 0, clear: noop, dispose: noop };
+}
+
+// ───────────────────────────── sharks ─────────────────────────────
+
+const NO_AIM: readonly AimTarget[] = [];
+const NO_SHARK_BUMPS: SharkBump[] = [];
+
+/** An empty lagoon: no sharks to see, aim at or be bumped by. (Boats vs. Sharks then plays through its waves with nothing in them.) */
+export function fallbackSharks(): Sharks {
+  return {
+    targets: NO_AIM,
+    waveLeft: 0,
+    mega: null,
+    update: () => NO_SHARK_BUMPS,
+    hit: () => null,
+    spawnWave: noop,
+    mapDots: [],
+    dispose: noop,
+  };
 }
 
 // ───────────────────────────── balloons ─────────────────────────────

@@ -1,10 +1,11 @@
 /**
- * The small interface every game mode (Dart Battle, Buoy Race, Team Up, Balloon Pop) implements.
+ * The small interface every game mode (Dart Battle, Buoy Race, Team Up, Balloon Pop, Boats vs. Sharks) implements.
  * The Match calls these hooks; the mode decides what counts as scoring and winning.
  */
 import type * as THREE from 'three';
 import type {
-  Balloons, BalloonPop, Boat, Checkpoint, Hud, MatchResult, MatchSetup, ModeId, RaceHudInfo, Sfx, TeamScore, World,
+  Balloons, BalloonPop, Boat, Checkpoint, Hud, MatchResult, MatchSetup, ModeId, RaceHudInfo, Sfx, SharkBump, SharkHud,
+  Sharks, SharkTag, TeamScore, World,
 } from '../../types';
 
 /** What a mode needs to know about the match it lives in. */
@@ -17,6 +18,8 @@ export interface ModeHost {
   readonly sfx: Sfx;
   /** Balloon Pop's balloons; null in every other mode. */
   readonly balloons: Balloons | null;
+  /** Every shark in the lagoon (Boats vs. Sharks sends its waves in through this). */
+  readonly sharks: Sharks;
   /** Which human viewport a boat belongs to (0 or 1), or -1 for a computer boat. */
   slotOf(boatId: number): number;
 }
@@ -35,6 +38,8 @@ export interface ModeOutcome {
   finished: boolean;
   /** Race / Balloon Pop: seconds it took, else null. */
   finishTime: number | null;
+  /** Boats vs. Sharks: the team beat the MEGA SHARK. Every other mode leaves it out (= false). */
+  megaDefeated?: boolean;
 }
 
 /** A mode's result; the Match adds the per-player stats and trophy awards on top. */
@@ -59,6 +64,10 @@ export interface GameMode {
   onTag(shooter: Boat, target: Boat): void;
   /** Balloon Pop: a balloon popped (by a dart or by ramming). */
   onBalloon(pop: BalloonPop): void;
+  /** A shark bumped a boat (rules on). Boats vs. Sharks pops life rings for it; every other mode ignores it. */
+  onSharkBump(bump: SharkBump): void;
+  /** A dart tagged a shark (rules on). Boats vs. Sharks scores it; every other mode ignores it. */
+  onSharkTag(shooter: Boat, tag: SharkTag): void;
 
   /** Race: which gates this boat should aim for. Battle: both null. */
   gates(boatId: number, out: GateTargets): void;
@@ -79,6 +88,8 @@ export interface GameMode {
   teams(): TeamScore[] | null;
   /** Balloon Pop: balloons left. null otherwise. */
   balloonCount(): { remaining: number; total: number } | null;
+  /** Boats vs. Sharks: wave, sharks left, life rings, MEGA health. null otherwise. */
+  sharkHud(): SharkHud | null;
 
   /** Only meaningful once `over`. */
   outcome(boatId: number): ModeOutcome;

@@ -5,6 +5,7 @@
 export { createWorld } from '../world/world';
 export { createPickups } from '../world/pickups';
 export { createBalloons } from '../world/balloons';
+export { createSharks } from '../sharks/sharks';
 export { createBoat, resolveBoatCollisions } from '../entities/boat';
 export { createDartSystem } from '../combat/darts';
 export { createEffects } from '../fx/effects';

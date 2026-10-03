@@ -18,7 +18,7 @@ import { button, clamp, cssColor, el, guardActivationKeys, installUnlock, ordina
 import { createMinimap } from './minimap';
 import type { Minimap } from './minimap';
 
-/** In-match overlay: per-player panels, mini-map, timer, team banner, feed, pause and results screens. */
+/** In-match overlay: per-player panels, mini-map, timer, team banner, Boats vs. Sharks banner, feed, pause and results screens. */
 
 /** Event-feed lines on screen at once (newest on top, right under the timer). */
 const FEED_MAX = 3;
@@ -41,6 +41,10 @@ const MAP_TOUCH_MIN_PX = 96;
 const HINT_DEFAULT_MS = 4200;
 /** The class the input module puts on <html> while on-screen touch controls are in use. */
 const TOUCH_CLASS = 'ff-touch';
+/** Boats vs. Sharks: the MEGA health bar is drawn as chunky blocks, one per point of health, up to this many. */
+const MEGA_SEGS_MAX = 24;
+/** Boats vs. Sharks: most life rings the banner draws (the game gives 12). */
+const RINGS_MAX = 24;
 
 // ───────────── little pieces of art (all our own static markup) ─────────────
 
@@ -105,6 +109,20 @@ const BALLOON_SVG = `<svg class="ff-bl-icon" viewBox="0 0 34 44" aria-hidden="tr
 const BOAT_MINI_SVG = `<svg viewBox="0 0 48 32" aria-hidden="true">
   <path d="M3 18 H45 Q42 29 31 29 H14 Q6 29 3 18 Z" fill="#ffffff" stroke="#06173d" stroke-width="3" stroke-linejoin="round"/>
   <path d="M17 18 L21 8 H31 L35 18 Z" fill="#bfeaff" stroke="#06173d" stroke-width="3" stroke-linejoin="round"/>
+</svg>`;
+
+/** A slate-blue shark fin cutting the water: the "sharks left" icon in the Boats vs. Sharks banner. */
+const FIN_SVG = `<svg class="ff-shark-fin" viewBox="0 0 34 28" aria-hidden="true">
+  <path d="M4 23 C11 21 15 12 17 2 C21 11 28 18 31 23 Z" fill="#7f93b2" stroke="#06173d" stroke-width="2.6" stroke-linejoin="round"/>
+  <path d="M1.5 25.5 Q6 22.5 10 25.5 T18.5 25.5 T27 25.5 T32.5 25.5" fill="none" stroke="#7fd4ff" stroke-width="2.4" stroke-linecap="round"/>
+</svg>`;
+
+/** A life ring: a white donut with four red bands. The colors come from CSS (--ra, --rb, --ro) so a popped ring can go grey. */
+const RING_SVG = `<svg class="ff-ring" viewBox="0 0 32 32" aria-hidden="true">
+  <circle class="ro" cx="16" cy="16" r="14.4" fill="none" stroke-width="2.2"/>
+  <circle class="ro" cx="16" cy="16" r="5.6" fill="none" stroke-width="2.2"/>
+  <circle class="rb" cx="16" cy="16" r="10" fill="none" stroke-width="8"/>
+  <circle class="ra" cx="16" cy="16" r="10" fill="none" stroke-width="8" stroke-dasharray="7.854 7.854" stroke-dashoffset="3.927"/>
 </svg>`;
 
 interface PowerInfo {
@@ -239,6 +257,7 @@ const SCORE_LABEL: Record<ModeId, string> = {
   race: 'SCORE',
   team: 'MY SCORE',
   practice: 'POINTS',
+  sharks: 'SHARK POINTS',
 };
 
 /**
@@ -691,13 +710,46 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
   let cBlRemaining = NaN;
   let cBlQ = NaN;
 
+  // Boats vs. Sharks banner: it takes the timer's place. Row one is the wave and the sharks left (or "Get ready…"
+  // between waves), row two is the team's life rings. The MEGA SHARK's health bar hangs right under it.
+  const sharkEl = el('div', 'ff-shark');
+  sharkEl.hidden = true;
+  const sharkWave = el('span', 'ff-shark-wave', '');
+  const sharkNum = el('span', 'ff-shark-num', '0');
+  const sharkLeft = el('span', 'ff-shark-left');
+  sharkLeft.append(svgNode(FIN_SVG), sharkNum, el('span', 'ff-shark-lbl', 'left'));
+  const sharkReady = el('span', 'ff-shark-ready', 'Get ready…');
+  const sharkTop = el('div', 'ff-shark-top');
+  sharkTop.append(sharkWave, sharkLeft, sharkReady);
+  const ringsEl = el('div', 'ff-rings');
+  sharkEl.append(sharkTop, ringsEl);
+  const ringIcons: SVGSVGElement[] = [];
+  const megaEl = el('div', 'ff-mega');
+  megaEl.hidden = true;
+  const megaSegsEl = el('div', 'ff-mega-segs');
+  megaEl.append(megaSegsEl, el('span', 'ff-mega-name ff-ol', 'MEGA SHARK'));
+  const megaSegs: HTMLElement[] = [];
+  let cShOn: boolean | null = null;
+  let cShMegaRound: boolean | null = null;
+  let cShBreak: boolean | null = null;
+  let cShWave = NaN;
+  let cShWaves = NaN;
+  let cShLeft = NaN;
+  let cShRings = NaN;
+  let cShMaxRings = NaN;
+  let cShReady = NaN;
+  let shBreakStart = 0; // performance.now() when the current break between waves began
+  let cMegaOn: boolean | null = null;
+  let cMegaMax = NaN;
+  let cMegaFilled = NaN;
+
   // feed + global announcer
   const feedEl = el('div', 'ff-feed');
   let feedMax = FEED_MAX;
   let cLiveRace: boolean | null = null;
   let cFeedU = NaN;
   const globalAnn = createAnnouncer('ff-ann--global');
-  live.append(timerEl, teamPills[0].root, teamPills[1].root, balloonsEl, sbEl, feedEl, globalAnn.root);
+  live.append(timerEl, teamPills[0].root, teamPills[1].root, balloonsEl, sharkEl, megaEl, sbEl, feedEl, globalAnn.root);
   root.append(live);
 
   // With touch controls the mini-map hangs under the scoreboard, so the CSS needs the scoreboard's height.
@@ -845,6 +897,18 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
     cBlOn = null;
     cBlRemaining = NaN;
     cBlQ = NaN;
+    // Boats vs. Sharks banner: forget what it showed, so the next match redraws it from scratch
+    cShOn = null;
+    cShMegaRound = null;
+    cShBreak = null;
+    cShWave = cShWaves = cShLeft = cShRings = cShMaxRings = cShReady = NaN;
+    cMegaOn = null;
+    cMegaMax = cMegaFilled = NaN;
+    sharkEl.hidden = true;
+    megaEl.hidden = true;
+    sharkEl.classList.remove('is-mega', 'is-break', 'hit');
+    megaEl.classList.remove('hit');
+    live.classList.remove('is-sharks');
   }
 
   function show(): void {
@@ -862,7 +926,9 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
     // 'battle' = counts down (Dart Battle, Team Up); 'race' = counts up (Buoy Race, Balloon Pop)
     let kind: 'battle' | 'race' | '' = '';
     let key = NaN;
-    if (s.timeLeft !== null) {
+    if (s.sharks) {
+      // Boats vs. Sharks: the banner (updateSharks) takes the clock's place
+    } else if (s.timeLeft !== null) {
       kind = 'battle';
       key = Math.max(0, Math.ceil(s.timeLeft));
     } else if (s.raceTime !== null) {
@@ -1005,6 +1071,146 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
     }
   }
 
+  /** Restart a one-shot CSS animation on `node` (the class is removed, a layout is forced, and it goes back on). */
+  function replay(node: Element, cls: string): void {
+    node.classList.remove(cls);
+    void (node as HTMLElement).offsetWidth;
+    node.classList.add(cls);
+  }
+
+  /** (Re)build the row of life-ring icons. */
+  function buildRings(max: number): void {
+    ringsEl.textContent = '';
+    ringIcons.length = 0;
+    const n = clamp(Math.round(max), 0, RINGS_MAX);
+    for (let i = 0; i < n; i++) {
+      const r = svgNode(RING_SVG);
+      ringsEl.append(r);
+      ringIcons.push(r);
+    }
+    cShRings = NaN; // force the popped/ready look to be redrawn
+  }
+
+  /** (Re)build the MEGA health bar's chunky blocks. */
+  function buildMegaSegs(n: number): void {
+    megaSegsEl.textContent = '';
+    megaSegs.length = 0;
+    for (let i = 0; i < n; i++) {
+      const seg = el('i');
+      megaSegsEl.append(seg);
+      megaSegs.push(seg);
+    }
+    cMegaFilled = NaN;
+  }
+
+  /**
+   * Boats vs. Sharks: the banner (wave, sharks left, life rings), the "Get ready…" break, and the MEGA health bar.
+   * Everything is written only when it changed; a lost ring or a MEGA hit also gets a little wobble.
+   */
+  function updateSharks(s: HudState, nowMs: number): void {
+    const sh = s.sharks ?? null; // (an older game core may not send it)
+    const on = sh !== null;
+    if (on !== cShOn) {
+      cShOn = on;
+      sharkEl.hidden = !on;
+      live.classList.toggle('is-sharks', on);
+      if (!on) cShMegaRound = null;
+    }
+    if (!sh) {
+      if (cMegaOn !== false) {
+        cMegaOn = false;
+        megaEl.hidden = true;
+      }
+      return;
+    }
+
+    // MEGA round: the wave number runs past the last wave (or the MEGA SHARK is out)
+    const megaRound = sh.wave > sh.waves || sh.mega !== null;
+    if (megaRound !== cShMegaRound) {
+      cShMegaRound = megaRound;
+      sharkEl.classList.toggle('is-mega', megaRound);
+      cShWave = NaN;
+    }
+    // break between waves: "Get ready…" with a gentle count (the MEGA SHARK being out is never a break)
+    const brk = sh.betweenWaves && sh.mega === null;
+    if (brk !== cShBreak) {
+      cShBreak = brk;
+      sharkEl.classList.toggle('is-break', brk);
+      shBreakStart = nowMs;
+      cShReady = NaN;
+    }
+    if (brk) {
+      const waited = (nowMs - shBreakStart) / 1000;
+      // the count only makes sense while the break is as long as the game says it is (it stays off after a pause)
+      const left = waited <= CONFIG.sharks.waveBreakSec + 0.5 ? Math.max(1, Math.ceil(CONFIG.sharks.waveBreakSec - waited)) : 0;
+      if (left !== cShReady) {
+        cShReady = left;
+        sharkReady.textContent = left > 0 ? 'Get ready… ' + left : 'Get ready…';
+      }
+    } else if (megaRound) {
+      if (cShWave !== -1) {
+        cShWave = -1; // -1 stands for "MEGA SHARK!" on screen
+        sharkWave.textContent = 'MEGA SHARK!';
+      }
+    } else {
+      const wave = clamp(Math.round(sh.wave), 1, Math.max(1, sh.waves));
+      if (wave !== cShWave || sh.waves !== cShWaves) {
+        cShWave = wave;
+        cShWaves = sh.waves;
+        sharkWave.textContent = 'WAVE ' + wave + '/' + sh.waves;
+      }
+    }
+
+    // sharks left (hidden by CSS during a break and in the MEGA round)
+    if (sh.sharksLeft !== cShLeft) {
+      const fewer = sh.sharksLeft < cShLeft;
+      cShLeft = sh.sharksLeft;
+      sharkNum.textContent = String(Math.max(0, sh.sharksLeft));
+      if (fewer) replay(sharkNum, 'pop');
+    }
+
+    // life rings: the ones at the end go flat first
+    if (sh.maxRings !== cShMaxRings) {
+      cShMaxRings = sh.maxRings;
+      buildRings(sh.maxRings);
+    }
+    const rings = clamp(Math.round(sh.rings), 0, ringIcons.length);
+    if (rings !== cShRings) {
+      const before = cShRings;
+      cShRings = rings;
+      for (let i = 0; i < ringIcons.length; i++) ringIcons[i].classList.toggle('is-popped', i >= rings);
+      if (rings < before) {
+        for (let i = rings; i < before && i < ringIcons.length; i++) replay(ringIcons[i], 'pop');
+        replay(sharkEl, 'hit');
+      }
+    }
+
+    // MEGA SHARK health: chunky blocks that go dark from the right
+    const mega = sh.mega;
+    const megaOn = mega !== null;
+    if (megaOn !== cMegaOn) {
+      cMegaOn = megaOn;
+      megaEl.hidden = !megaOn;
+      cMegaFilled = NaN;
+    }
+    if (mega) {
+      const max = Math.max(1, mega.maxHealth);
+      const segs = clamp(Math.round(max), 1, MEGA_SEGS_MAX);
+      if (segs !== cMegaMax) {
+        cMegaMax = segs;
+        buildMegaSegs(segs);
+      }
+      const health = clamp(mega.health, 0, max);
+      const filled = health > 0 ? clamp(Math.ceil((health / max) * segs), 1, segs) : 0;
+      if (filled !== cMegaFilled) {
+        const hurt = filled < cMegaFilled;
+        cMegaFilled = filled;
+        for (let i = 0; i < megaSegs.length; i++) megaSegs[i].classList.toggle('is-gone', i >= filled);
+        if (hurt) replay(megaEl, 'hit');
+      }
+    }
+  }
+
   function update(state: HudState): void {
     const nowMs = performance.now();
     const n = Math.min(state.viewports.length, state.players.length);
@@ -1050,6 +1256,7 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
     updateTimer(state);
     updateTeams(state);
     updateBalloons(state);
+    updateSharks(state, nowMs);
     updateScoreboard(state);
   }
 
@@ -1192,7 +1399,12 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
     resultsEl.hidden = false;
     resultsEl.classList.add('ff-nav');
     rematchBtn.focus({ preventScroll: true });
-    sfx.victory(); // rate-limited inside Sfx, so it is harmless if the game also calls it
+    // Boats vs. Sharks: if nobody beat the MEGA SHARK, the sharks won. The game plays the friendly "wah-wah" itself,
+    // so here there is no victory fanfare and no confetti (hud.css hides it under .is-lose).
+    const sharksWon =
+      result.mode === 'sharks' && (result.stats ?? []).length > 0 && !(result.stats ?? []).some((st) => st.megaDefeated);
+    resultsEl.classList.toggle('is-lose', sharksWon);
+    if (!sharksWon) sfx.victory(); // rate-limited inside Sfx, so it is harmless if the game also calls it
     if ((result.awards ?? []).length > 0) {
       // one fanfare as the first trophy card pops in (the cards' CSS delay is the same TROPHY_DELAY_MS)
       trophyTimer = window.setTimeout(() => {
@@ -1206,6 +1418,7 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
     window.clearTimeout(trophyTimer);
     trophyTimer = 0;
     resultsEl.hidden = true;
+    resultsEl.classList.remove('is-lose');
     resultsCb = null;
   }
 

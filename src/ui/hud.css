@@ -1,6 +1,7 @@
 /*
- * Foam Fleet HUD, v2 + v3 additions (loaded after styles.css, which still holds the v1 HUD):
+ * Foam Fleet HUD, v2 + v3 + v4 additions (loaded after styles.css, which still holds the v1 HUD):
  * mini-map, coaching hints, Easy Driving badge, Team Up banner, Balloon Pop counter,
+ * the Boats vs. Sharks banner (wave, life rings, MEGA health bar),
  * team markers, the results-screen extras (team banner, trophy celebration), iPad safe areas,
  * and the touch layout (everything under `html.ff-touch`, see the section near the end).
  * Same rules as before: --u scales one player's panel, --g scales the whole HUD.
@@ -282,6 +283,180 @@
   transform-origin: left center;
 }
 
+/* ───────────────────────── Boats vs. Sharks banner ───────────────────────── */
+
+/*
+ * Top center, in the clock's place (hud.ts hides the clock in this mode). Two rows: the wave and the sharks left,
+ * then the team's life rings. It is about as tall as the clock (~82g), so the split-screen name panels
+ * (which start 92g down) still clear it. The MEGA health bar hangs under it: it is taller, so under .is-sharks
+ * the things that sit below the banner step down a little (feed, split-screen panels; see the end of this section
+ * and the touch section).
+ */
+.ff-shark {
+  position: absolute;
+  left: 50%;
+  top: calc(10px * var(--g));
+  translate: -50% 0;
+  width: max-content; /* not squeezed to the half-screen that "left: 50%" leaves */
+  max-width: 94%;
+  padding: calc(2px * var(--g)) calc(20px * var(--g)) calc(7px * var(--g));
+  border: calc(4px * var(--g)) solid #fff;
+  border-radius: calc(30px * var(--g));
+  background: var(--ff-panel);
+  text-align: center;
+  line-height: 1;
+}
+.ff-shark.is-mega {
+  border-color: #cfaeff; /* a purple edge for the MEGA round (the label says it too) */
+}
+.ff-shark-top {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: calc(18px * var(--g));
+  min-height: calc(32px * var(--g)); /* the banner keeps its height when row one switches to "Get ready…" */
+  font-size: calc(26px * var(--g));
+  font-weight: 700;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.ff-shark.is-mega .ff-shark-wave {
+  color: #e2ccff;
+}
+.ff-shark-left {
+  display: flex;
+  align-items: center;
+  gap: 0.3em;
+}
+.ff-shark-fin {
+  flex: none;
+  width: 1.2em;
+  height: 1em;
+}
+.ff-shark-num {
+  display: inline-block; /* so the pop animation (a scale) can apply */
+  min-width: 1.1ch;
+  font-size: 1.25em;
+  line-height: 1;
+  text-align: center;
+}
+.ff-shark-num.pop {
+  animation: ff-pop 0.45s ease-out;
+}
+.ff-shark-lbl {
+  font-size: 0.8em;
+}
+.ff-shark-ready {
+  color: var(--ff-sun);
+  animation: ff-ready 1.6s ease-in-out infinite;
+}
+/* one row shows at a time: the wave and the sharks left, or "Get ready…" in the break; the MEGA round has no count */
+.ff-shark.is-break .ff-shark-wave,
+.ff-shark.is-break .ff-shark-left,
+.ff-shark.is-mega .ff-shark-left,
+.ff-shark:not(.is-break) .ff-shark-ready {
+  display: none;
+}
+.ff-shark.hit {
+  animation: ff-shark-hit 0.5s ease-out;
+}
+
+/* the team's life rings: a popped one goes flat and grey (smaller too, so it is not only a color change) */
+.ff-rings {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: calc(3px * var(--g));
+  margin-top: calc(2px * var(--g));
+}
+.ff-ring {
+  --ra: #e8352b;
+  --rb: #ffffff;
+  --ro: #06173d;
+  flex: none;
+  width: calc(22px * var(--g));
+  height: calc(22px * var(--g));
+}
+.ff-ring .ra {
+  stroke: var(--ra);
+}
+.ff-ring .rb {
+  stroke: var(--rb);
+}
+.ff-ring .ro {
+  stroke: var(--ro);
+}
+.ff-ring.is-popped {
+  --ra: #8d97aa;
+  --rb: #c3cad6;
+  --ro: #4c566a;
+  opacity: 0.5;
+  scale: 0.8;
+}
+.ff-ring.pop {
+  animation: ff-ring-pop 0.5s ease-out;
+}
+
+/* MEGA SHARK health: a wide, chunky bar of blocks that go dark from the right as the darts land */
+.ff-mega {
+  --ff-mega: #a465ff;
+  position: absolute;
+  left: 50%;
+  top: calc(86px * var(--g));
+  translate: -50% 0;
+  width: min(calc(380px * var(--g)), 62%);
+  height: calc(30px * var(--g));
+  padding: calc(3px * var(--g));
+  border: calc(3px * var(--g)) solid #fff;
+  border-radius: 999px;
+  background: var(--ff-panel);
+}
+.ff-mega-segs {
+  display: flex;
+  gap: calc(2px * var(--g));
+  width: 100%;
+  height: 100%;
+}
+.ff-mega-segs i {
+  flex: 1;
+  min-width: 0;
+  border-radius: calc(5px * var(--g));
+  background: var(--ff-mega);
+}
+.ff-mega-segs i.is-gone {
+  background: rgba(255, 255, 255, 0.16);
+}
+.ff-mega-name {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: calc(15px * var(--g));
+  font-weight: 700;
+  line-height: 1;
+  pointer-events: none;
+}
+.ff-mega.hit {
+  animation: ff-mega-hit 0.4s ease-out;
+}
+
+/* Under the banner the MEGA bar needs a little more room than the clock did (it ends ~116g down). */
+.ff-live.is-sharks .ff-feed {
+  top: calc(122px * var(--g));
+}
+.ff-live.is-sharks.is-split .ff-vp {
+  --tagtop: calc(122px * var(--g) + var(--ff-sat));
+}
+.ff-live.is-sharks.is-split .ff-feed {
+  top: calc(122px * var(--g) + 128px * var(--uf));
+}
+
+/* the results screen when the sharks win: no confetti (the title and the friendly "wah-wah" say it) */
+.ff-results.is-lose .ff-confetti {
+  display: none;
+}
+
 /* ───────────────────────── results: layout ───────────────────────── */
 
 /* Title and buttons stay put; the middle scrolls if the window is short (a trophy strip makes it taller). */
@@ -549,6 +724,20 @@ html.ff-touch .ff-live.is-split .ff-feed {
   top: calc(92px * var(--g) + 290px * var(--uf));
 }
 
+/*
+ * Boats vs. Sharks (see its banner above): the banner is wider than the clock, so it needs more room from the
+ * name stack at the top-left, and in 2 players everything under it starts a little lower (the MEGA bar ends ~116g down).
+ */
+html.ff-touch .ff-live.is-sharks:not(.is-split) .ff-vp .ff-tag {
+  max-width: calc(50% - var(--tagx) - 190px * var(--g));
+}
+html.ff-touch .ff-live.is-sharks.is-split .ff-vp:first-child .ff-map {
+  top: calc(var(--ff-sat) + 122px * var(--g));
+}
+html.ff-touch .ff-live.is-sharks.is-split .ff-feed {
+  top: calc(122px * var(--g) + 290px * var(--uf));
+}
+
 /* The results card's middle part scrolls with a finger (the card itself does not). */
 .ff-res-mid {
   touch-action: pan-y;
@@ -579,6 +768,26 @@ html.ff-touch .ff-live.is-split .ff-feed {
   from { opacity: 0; }
   to { opacity: 1; }
 }
+/* Boats vs. Sharks: a gentle breathing "Get ready…", the banner's wobble when a ring pops, a ring's pop, a MEGA hit */
+@keyframes ff-ready {
+  0%, 100% { opacity: 0.7; }
+  50% { opacity: 1; }
+}
+@keyframes ff-shark-hit {
+  0%, 100% { rotate: 0deg; }
+  18% { rotate: -2.5deg; }
+  42% { rotate: 2.2deg; }
+  66% { rotate: -1.2deg; }
+}
+@keyframes ff-ring-pop {
+  0% { scale: 1.7; opacity: 1; }
+  100% { scale: 0.8; opacity: 0.5; }
+}
+@keyframes ff-mega-hit {
+  0% { scale: 1; }
+  25% { scale: 1.06 1.2; }
+  100% { scale: 1; }
+}
 
 @media (prefers-reduced-motion: reduce) {
   .ff-hint.on {
@@ -586,7 +795,12 @@ html.ff-touch .ff-live.is-split .ff-feed {
   }
   .ff-bl-num.pop,
   .ff-team-score.pop span,
-  .ff-award-icon::before {
+  .ff-award-icon::before,
+  .ff-shark-num.pop,
+  .ff-shark-ready,
+  .ff-shark.hit,
+  .ff-ring.pop,
+  .ff-mega.hit {
     animation: none;
   }
   .ff-award {

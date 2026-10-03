@@ -7,30 +7,32 @@
  */
 import * as THREE from 'three';
 import { CONFIG } from '../config';
+import { SHARK_ID_BASE } from '../types';
 import type {
-  Balloons, BalloonPop, Boat, BoatControls, BoatInit, BumpEvent, Controller, ControllerContext, DartHit,
-  DartSystem, DartSpawn, DartTargetHit, DartUpdateResult, Effects, Hud, InputManager, MapBoat, MapState,
-  MatchResult, MatchSetup, ModeId, Obstacle, PickupEvent, Pickups, PlayerMatchStats, PowerUpKind, Sfx, SpawnPoint,
-  TrophyAward, World,
+  AimTarget, Balloons, BotDifficulty, BalloonPop, Boat, BoatControls, BoatInit, BumpEvent, Controller, ControllerContext, DartHit,
+  DartSystem, DartSpawn, DartTarget, DartTargetHit, DartUpdateResult, Effects, Hud, InputManager, MapBoat, MapState,
+  MatchResult, MatchSetup, ModeId, Obstacle, PickupEvent, Pickups, PlayerMatchStats, PowerUpKind, Sfx, SharkBump,
+  Sharks, SharkTag, SpawnPoint, TrophyAward, World,
 } from '../types';
 import { ChaseCamera } from './cameras';
 import { foam, reportError } from './debug';
 import {
-  ZERO_CONTROLS, fallbackBalloons, fallbackBoat, fallbackDarts, fallbackPickups, fallbackSpawns,
+  ZERO_CONTROLS, fallbackBalloons, fallbackBoat, fallbackDarts, fallbackPickups, fallbackSharks, fallbackSpawns,
   fallbackTeamSpawns, fallbackWorld, idleController, quietFx,
 } from './fallbacks';
 import { V2_METHODS, buildOrFallback, guard } from './guard';
 import {
   awardTrophies, createBalloons, createBoat, createBotController, createDartSystem, createEffects, createPickups,
-  createWorld, resolveBoatCollisions,
+  createSharks, createWorld, resolveBoatCollisions,
 } from './modules';
 import { BattleMode } from './modes/battle';
 import type { GameMode, GateTargets, ModeHost } from './modes/mode';
 import { PracticeMode } from './modes/practice';
 import { RaceMode } from './modes/race';
+import { SharksMode } from './modes/sharks';
 import { TeamMode } from './modes/team';
 import { HumanPlayer, type PlayerHost } from './players';
-import { botLook, sanitizeLook } from './setup';
+import { MAX_HELPERS, botLook, sanitizeLook } from './setup';
 import { clamp } from './util';
 
 /** The simulation always advances in slices of this many seconds. */
@@ -47,8 +49,14 @@ const NO_BOATS: readonly Boat[] = [];
 const NO_BUMPS: BumpEvent[] = [];
 const NO_PICKUPS: PickupEvent[] = [];
 const NO_DARTS: DartUpdateResult = { hits: [], targetHits: [], waterSplashes: [] };
+const NO_AIM: readonly AimTarget[] = [];
+const NO_SHARK_BUMPS: SharkBump[] = [];
+const NO_SHARK_DOTS: Sharks['mapDots'] = [];
 
 const GOLD = 0xffd23f;
+/** How long the victory confetti keeps popping after the MEGA SHARK is beaten, and the gap between bursts. */
+const CONFETTI_SEC = 6;
+const CONFETTI_GAP = 0.28;
 
 /** A random number with mean 0 and standard deviation 1, roughly bell-shaped (sum of three uniforms, range +-3). */
 function nearlyNormal(): number {
@@ -68,6 +76,7 @@ function makeMode(id: ModeId, host: ModeHost): GameMode {
     case 'race': return new RaceMode(host);
     case 'team': return new TeamMode(host);
     case 'practice': return new PracticeMode(host);
+    case 'sharks': return new SharksMode(host);
     default: return new BattleMode(host);
   }
 }
@@ -84,6 +93,8 @@ export class Match implements ModeHost, PlayerHost {
   readonly mode: GameMode;
   /** Balloon Pop's balloons; null in every other mode. */
   readonly balloons: Balloons | null;
+  /** Every shark in the lagoon: ambient cruisers in every mode, the attack waves in Boats vs. Sharks. */
+  readonly sharks: Sharks;
   /** Humans are boats 0..humanCount-1; computer boats follow. */
   readonly boats: Boat[] = [];
   /** One chase camera per human, same order as the boats. */
@@ -108,8 +119,19 @@ export class Match implements ModeHost, PlayerHost {
   private botFireGate = 0;
   /** Computer boats' aim error (radians, one standard deviation), from CONFIG.bots.aimErrorDeg. */
   private readonly botAimSigma: number;
+  /** Skill for computer boats (differs from setup.botDifficulty in Boats vs. Sharks). */
+  private readonly botSkill: BotDifficulty;
   private tagCount = 0;
   private disposed = false;
+  /** Balloon Pop's dart targets: the balloons plus the sharks, rebuilt into this one list every step. */
+  private readonly targetList: DartTarget[] = [];
+  /** Which way a dart was travelling when it tagged a shark (scratch). */
+  private readonly sharkDir = new THREE.Vector3();
+  /** Seconds of victory confetti still to go, the gap to the next burst, and the boat it pops over. */
+  private confetti = 0;
+  private confettiGap = 0;
+  private confettiBoat = 0;
+  private readonly confettiAt = new THREE.Vector3();
 
   /**
    * `attract` = the quiet demo lagoon behind the title screen: no humans, no rules,
@@ -120,7 +142,9 @@ export class Match implements ModeHost, PlayerHost {
     this.sfx = services.sfx;
     this.input = services.input;
     this.humanCount = attract ? 0 : setup.humans;
-    const errDeg = CONFIG.bots.aimErrorDeg[setup.botDifficulty] ?? CONFIG.bots.aimErrorDeg.normal;
+    // In Boats vs. Sharks the skill buttons set the SHARKS' speed; the helper boats are always sharp shooters.
+    this.botSkill = setup.mode === 'sharks' ? 'hard' : setup.botDifficulty;
+    const errDeg = CONFIG.bots.aimErrorDeg[this.botSkill] ?? CONFIG.bots.aimErrorDeg.normal;
     this.botAimSigma = (errDeg * Math.PI) / 180;
 
     const scene = this.scene;
@@ -134,6 +158,11 @@ export class Match implements ModeHost, PlayerHost {
     this.balloons = modeId === 'practice'
       ? buildOrFallback('createBalloons', () => createBalloons(scene, this.world), () => fallbackBalloons(scene, this.world))
       : null;
+    this.sharks = buildOrFallback(
+      'createSharks',
+      () => createSharks(scene, this.world, modeId, this.fx, setup.botDifficulty),
+      fallbackSharks,
+    );
 
     this.createBoats();
     this.mode = makeMode(modeId, this);
@@ -156,8 +185,10 @@ export class Match implements ModeHost, PlayerHost {
   private createBoats(): void {
     const { setup } = this;
     const humans = this.humanCount;
-    // Balloon Pop has no computer boats.
-    const bots = setup.mode === 'practice' ? 0 : clamp(Math.round(setup.bots), 0, Math.max(0, CONFIG.match.maxBoats - humans));
+    // Balloon Pop has no computer boats. Boats vs. Sharks has up to three helper boats (on the players' team).
+    const sharksMode = setup.mode === 'sharks';
+    const maxBots = Math.max(0, CONFIG.match.maxBoats - humans);
+    const bots = setup.mode === 'practice' ? 0 : clamp(Math.round(setup.bots), 0, sharksMode ? Math.min(MAX_HELPERS, maxBots) : maxBots);
     const total = humans + bots;
     // Team Up: team 0 = the humans plus enough helper bots to even the sides; team 1 = the other bots.
     // Boats are numbered humans, then helpers, then opponents, so each side is one run of ids.
@@ -175,7 +206,8 @@ export class Match implements ModeHost, PlayerHost {
       const isHuman = i < humans;
       const botIndex = i - humans;
       const player = setup.players[i];
-      const team = teamMode ? (i < sideA ? 0 : 1) : i;
+      // Boats vs. Sharks: everyone is on one team, so the helpers' darts pass through the humans.
+      const team = teamMode ? (i < sideA ? 0 : 1) : sharksMode ? 0 : i;
       const init: BoatInit = {
         id: i,
         name: isHuman ? player?.name || `Player ${i + 1}` : CONFIG.botNames[botIndex % CONFIG.botNames.length],
@@ -196,7 +228,7 @@ export class Match implements ModeHost, PlayerHost {
 
       const controller = isHuman
         ? buildOrFallback('humanController', () => this.input.humanController(i as 0 | 1, setup.humans), () => idleController('human'))
-        : buildOrFallback('createBotController', () => createBotController(setup.botDifficulty, i), () => idleController('bot'));
+        : buildOrFallback('createBotController', () => createBotController(this.botSkill, i), () => idleController('bot'));
       this.ctrls.push(controller);
       this.autopilots.push(null);
       this.firing.push(false);
@@ -209,6 +241,7 @@ export class Match implements ModeHost, PlayerHost {
         nextCheckpoint: null,
         followingCheckpoint: null,
         pickups: NO_POSITIONS,
+        sharks: NO_AIM,
       });
     }
     // Each boat gets a list of everyone EXCEPT itself (for aim assist), built once.
@@ -263,6 +296,13 @@ export class Match implements ModeHost, PlayerHost {
     } catch (e) {
       reportError('pickups.positions', e);
     }
+    // The sharks the blasters and the bots can see this step (re-read after the sharks have moved, below).
+    let sharkTargets: readonly AimTarget[] = NO_AIM;
+    try {
+      sharkTargets = this.sharks.targets;
+    } catch (e) {
+      reportError('sharks.targets', e);
+    }
 
     // 1. Controllers decide, boats move.
     for (let i = 0; i < n; i++) {
@@ -274,6 +314,7 @@ export class Match implements ModeHost, PlayerHost {
         const ctx = this.ctxs[i];
         ctx.t = t;
         ctx.pickups = crates;
+        ctx.sharks = sharkTargets;
         mode.gates(i, this.gates);
         ctx.nextCheckpoint = this.gates.next;
         ctx.followingCheckpoint = this.gates.following;
@@ -296,7 +337,7 @@ export class Match implements ModeHost, PlayerHost {
         }
       }
       try {
-        boat.update(c, dt, t, this.world, this.others[i]);
+        boat.update(c, dt, t, this.world, this.others[i], sharkTargets);
       } catch (e) {
         reportError(`boat[${i}].update`, e);
       }
@@ -312,11 +353,21 @@ export class Match implements ModeHost, PlayerHost {
     }
     for (let k = 0; k < bumps.length; k++) this.onBump(bumps[k]);
 
+    // 2b. Sharks swim, chase and bump (after the boats have moved, before the darts fly).
+    let sharkBumps: SharkBump[] = NO_SHARK_BUMPS;
+    try {
+      sharkBumps = this.sharks.update(t, dt, boats);
+      sharkTargets = this.sharks.targets;
+    } catch (e) {
+      reportError('sharks.update', e);
+    }
+    for (let k = 0; k < sharkBumps.length; k++) this.onSharkBump(sharkBumps[k], rulesOn);
+
     // 3. Anyone holding fire shoots (if their blaster is ready).
     for (let i = 0; i < n; i++) {
       if (!this.firing[i]) continue;
       try {
-        const spawns = boats[i].tryFire(t, this.others[i]);
+        const spawns = boats[i].tryFire(t, this.others[i], sharkTargets);
         if (spawns.length > 0) {
           // Players keep full aim assist; computer boats get a small random aim error.
           if (!boats[i].isHuman) this.wobbleBotAim(spawns);
@@ -328,14 +379,15 @@ export class Match implements ModeHost, PlayerHost {
       }
     }
 
-    // 4. Darts fly; apply what they hit (boats, and in Balloon Pop the balloons).
+    // 4. Darts fly; apply what they hit (boats, sharks, and in Balloon Pop the balloons).
     let flight = NO_DARTS;
     try {
-      flight = this.darts.update(dt, t, boats, this.world, mode.stunSeconds, this.balloons?.targets);
+      flight = this.darts.update(dt, t, boats, this.world, mode.stunSeconds, this.dartTargets(sharkTargets));
     } catch (e) {
       reportError('darts.update', e);
     }
     this.onHits(flight.hits, rulesOn);
+    this.onSharkHits(flight.targetHits, rulesOn);
     if (this.balloons) this.updateBalloons(flight.targetHits, t, dt, rulesOn);
     let splashSounds = 0;
     for (let k = 0; k < flight.waterSplashes.length && splashSounds < 2; k++) {
@@ -364,7 +416,8 @@ export class Match implements ModeHost, PlayerHost {
       }
     }
 
-    // 7. Visuals: wakes, particles, water and sky.
+    // 7. Visuals: victory confetti, wakes, particles, water and sky.
+    if (this.confetti > 0) this.sprinkleConfetti(dt);
     for (let i = 0; i < n; i++) this.fx.wake(boats[i]);
     this.fx.update(dt, t, this.world);
     try {
@@ -538,6 +591,123 @@ export class Match implements ModeHost, PlayerHost {
     }
   }
 
+  // ───────────────────────────── sharks ─────────────────────────────
+
+  /** What a dart can hit besides boats: the sharks, plus the balloons in Balloon Pop (one reused list). */
+  private dartTargets(sharkTargets: readonly AimTarget[]): readonly DartTarget[] {
+    const balloons = this.balloons;
+    if (!balloons) return sharkTargets;
+    const list = this.targetList;
+    list.length = 0;
+    const b = balloons.targets;
+    for (let k = 0; k < b.length; k++) list.push(b[k]);
+    for (let k = 0; k < sharkTargets.length; k++) list.push(sharkTargets[k]);
+    return list;
+  }
+
+  /** The reticle label for a locked target: a boat's name, or "Shark" / "MEGA SHARK". */
+  targetName(id: number): string | null {
+    if (id < SHARK_ID_BASE) return this.boats[id]?.name ?? null;
+    const list = this.sharks.targets;
+    for (let k = 0; k < list.length; k++) {
+      if (list[k].id === id) return list[k].name;
+    }
+    return null;
+  }
+
+  /** A shark bumped a boat. The Sharks module already wobbled the boat; here are the sounds, the splash and the rules. */
+  private onSharkBump(b: SharkBump, rulesOn: boolean): void {
+    if (!rulesOn) return;
+    const boat = this.boats[b.boatId];
+    if (!boat) return;
+    const slot = this.slotOf(boat.id);
+    const audible = slot >= 0 || this.nearHuman(b.point.x, b.point.z, 45);
+    if (audible) this.sfx.sharkBump();
+    this.fx.splash(b.point, b.mega ? 2.4 : 1.3);
+    if (b.blocked) {
+      // A shield soaked it up: boing, and nobody loses anything.
+      if (audible) this.sfx.shieldBlock();
+      if (slot >= 0) this.cams[slot].shake(0.2);
+      this.hud.feed(`${boat.name}'s shield bounced a shark!`, boat.color);
+      return;
+    }
+    if (slot >= 0) {
+      this.cams[slot].shake(b.mega ? 0.8 : 0.5);
+      this.rumble(slot, b.mega ? 1 : 0.7, b.mega ? 360 : 220);
+      this.players[slot].sharkBumps++;
+    }
+    this.mode.onSharkBump(b);
+    const who = b.mega ? 'The MEGA SHARK' : 'A shark';
+    this.hud.feed(this.mode.id === 'sharks' ? `Splash! ${who} bumped ${boat.name}!` : `${who} bumped ${boat.name}!`, boat.color);
+  }
+
+  /** Darts that hit a shark (ids from SHARK_ID_BASE up) go to the Sharks module; the rest are balloons. */
+  private onSharkHits(hits: readonly DartTargetHit[], rulesOn: boolean): void {
+    for (let k = 0; k < hits.length; k++) {
+      const h = hits[k];
+      if (h.targetId < SHARK_ID_BASE) continue;
+      // The dart's direction: from the shooter to where it landed.
+      const shooter = this.boats[h.ownerId];
+      const dir = this.sharkDir.set(0, 0, 1);
+      if (shooter) {
+        dir.copy(h.point).sub(shooter.position);
+        if (dir.lengthSq() < 1e-6) dir.set(Math.sin(shooter.heading), 0, Math.cos(shooter.heading));
+      }
+      dir.normalize();
+      let tag: SharkTag | null = null;
+      try {
+        tag = this.sharks.hit(h.targetId, h.ownerId, dir);
+      } catch (e) {
+        reportError('sharks.hit', e);
+      }
+      if (tag) this.onSharkTag(tag, rulesOn);
+    }
+  }
+
+  /**
+   * A dart scared a shark off (or bonked the MEGA SHARK). Sounds and kick always; points and stats only with the
+   * rules on, and only Boats vs. Sharks turns a tag into score (the mode decides: elsewhere it is just for fun).
+   */
+  private onSharkTag(tag: SharkTag, rulesOn: boolean): void {
+    const shooter = this.boats[tag.boatId];
+    const slot = shooter ? this.slotOf(shooter.id) : -1;
+    const finalBlow = tag.mega && tag.defeated;
+    if (slot >= 0 || this.nearHuman(tag.point.x, tag.point.z, 60)) {
+      // A normal shark (and the MEGA SHARK's last hit) dives away; the MEGA SHARK shrugs off the others with a bonk.
+      if (!tag.mega || finalBlow) this.sfx.sharkDive();
+      else this.sfx.hit();
+    }
+    if (slot >= 0) {
+      this.cams[slot].kick(0.3);
+      this.rumble(slot, 0.35, 100);
+    }
+    if (!rulesOn || !shooter) return;
+    if (slot >= 0 && !tag.mega) this.players[slot].sharkTags++;
+    this.mode.onSharkTag(shooter, tag);
+    if (finalBlow) {
+      this.hud.feed(`${shooter.name} beat the MEGA SHARK!`, shooter.color);
+      this.confetti = CONFETTI_SEC;
+    } else if (!tag.mega) {
+      this.hud.feed(`${shooter.name} scared off a shark!`, shooter.color);
+    }
+  }
+
+  /** Victory confetti: colorful bursts popping over the boats, one every CONFETTI_GAP seconds. */
+  private sprinkleConfetti(dt: number): void {
+    this.confetti -= dt;
+    this.confettiGap -= dt;
+    if (this.confettiGap > 0 || this.boats.length === 0) return;
+    this.confettiGap = CONFETTI_GAP;
+    const boat = this.boats[this.confettiBoat++ % this.boats.length];
+    const at = this.confettiAt.set(
+      boat.position.x + (Math.random() - 0.5) * 8,
+      boat.position.y + 3 + Math.random() * 3,
+      boat.position.z + (Math.random() - 0.5) * 8,
+    );
+    this.fx.hitBurst(at, CONFIG.colors[Math.floor(Math.random() * CONFIG.colors.length)]);
+    if (this.confettiBoat % 2 === 0) this.fx.sparkle(at, GOLD);
+  }
+
   // ───────────────────────────── balloons ─────────────────────────────
 
   /** Balloon Pop: pop what the darts hit, then whatever a boat drove through. Nothing pops outside the rules. */
@@ -547,6 +717,7 @@ export class Match implements ModeHost, PlayerHost {
     try {
       if (rulesOn) {
         for (let k = 0; k < dartHits.length; k++) {
+          if (dartHits[k].targetId >= SHARK_ID_BASE) continue; // a shark: handled in onSharkHits
           const pop = balloons.pop(dartHits[k].targetId, dartHits[k].ownerId);
           if (pop) this.onBalloonPop(pop);
         }
@@ -620,6 +791,10 @@ export class Match implements ModeHost, PlayerHost {
         rescues: p.rescues,
         finishTime: outcome.finishTime,
         easyDriving: boat.easyDriving,
+        sharkTags: p.sharkTags,
+        sharkBumps: p.sharkBumps,
+        megaDefeated: outcome.megaDefeated === true,
+        hull: sanitizeLook(this.setup.players[i]?.look, i).hull,
       });
     }
     return stats;
@@ -649,12 +824,19 @@ export class Match implements ModeHost, PlayerHost {
     } catch (e) {
       reportError('pickups.positions', e);
     }
+    let sharkDots: Sharks['mapDots'] = NO_SHARK_DOTS;
+    try {
+      sharkDots = this.sharks.mapDots;
+    } catch (e) {
+      reportError('sharks.mapDots', e);
+    }
     return {
       arenaRadius: this.world.arenaRadius,
       obstacles: this.obstacles,
       boats,
       pickups,
       balloons,
+      sharks: sharkDots,
       gates: this.mode.gateList,
     };
   }
@@ -676,6 +858,7 @@ export class Match implements ModeHost, PlayerHost {
     safely('darts', () => { this.darts.clear(); this.darts.dispose(); });
     safely('pickups', () => this.pickups.dispose());
     safely('balloons', () => this.balloons?.dispose());
+    safely('sharks', () => this.sharks.dispose());
     for (const boat of this.boats) safely('boat', () => boat.dispose());
     safely('fx', () => this.fx.dispose());
     safely('world', () => this.world.dispose());

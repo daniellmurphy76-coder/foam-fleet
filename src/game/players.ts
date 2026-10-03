@@ -96,6 +96,10 @@ export class HumanPlayer {
   pickups = 0;
   honks = 0;
   rescues = 0;
+  /** Sharks scared off with darts (any mode; the MEGA SHARK's hits don't count, only normal sharks). */
+  sharkTags = 0;
+  /** Times a shark bumped this player's boat (a shield-blocked bump doesn't count). */
+  sharkBumps = 0;
 
   private rescueHeld = false;
   private honkHeld = false;

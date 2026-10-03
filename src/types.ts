@@ -21,9 +21,13 @@ import type * as THREE from 'three';
  * race     = laps through gates.
  * team     = Team Up: humans (+ helper bots) vs. a bot team, tag for team points.
  * practice = Balloon Pop: no bots; pop balloons by darting or ramming them.
+ * sharks   = Boats vs. Sharks: humans + helper bots (one team) fight off waves of sharks, then the MEGA SHARK.
  * World and pickups treat every mode except 'race' like 'battle' unless stated otherwise.
  */
-export type ModeId = 'battle' | 'race' | 'team' | 'practice';
+export type ModeId = 'battle' | 'race' | 'team' | 'practice' | 'sharks';
+
+/** Shark ids (as dart/aim targets) start here, so they never clash with balloon ids (0..n). */
+export const SHARK_ID_BASE = 10000;
 export type BotDifficulty = 'easy' | 'normal' | 'hard';
 export type PowerUpKind = 'triple' | 'rapid' | 'shield' | 'turbo';
 
@@ -35,7 +39,7 @@ export type FlagId = 'none' | 'star' | 'heart' | 'skull' | 'lightning' | 'smile'
 export type HornId = 'beep' | 'duck' | 'foghorn' | 'clown';
 
 export interface BoatLook {
-  /** Hull variant: 0 sleek speedboat, 1 chunky tug, 2 catamaran. */
+  /** Hull variant: 0 sleek speedboat, 1 chunky tug, 2 catamaran, 3 BoneBoat (a shark skeleton). */
   hull: number;
   pattern: PatternId;
   hat: HatId;
@@ -72,6 +76,8 @@ export interface ControllerContext {
   followingCheckpoint: Checkpoint | null;
   /** Positions of power-up crates currently floating (may be empty). */
   pickups: readonly THREE.Vector3[];
+  /** Live sharks (every mode; the enemies in Boats vs. Sharks). May be empty. */
+  sharks: readonly AimTarget[];
 }
 
 export interface Controller {
@@ -210,6 +216,53 @@ export interface Balloons {
   pop(targetId: number, boatId: number): BalloonPop | null;
   dispose(): void;
 }
+/** Something the blaster can lock onto that is not a boat (a shark). */
+export interface AimTarget extends DartTarget {
+  readonly velocity: THREE.Vector3;
+  /** Shown in the reticle when locked, e.g. "Shark" or "MEGA SHARK". */
+  readonly name: string;
+}
+
+export interface SharkBump {
+  sharkId: number;
+  boatId: number;
+  point: THREE.Vector3;
+  /** true if the boat's shield absorbed it. */
+  blocked: boolean;
+  mega: boolean;
+}
+
+export interface SharkTag {
+  sharkId: number;
+  boatId: number;
+  point: THREE.Vector3;
+  mega: boolean;
+  /** A normal shark always leaves when tagged; the MEGA SHARK only when its health runs out. */
+  defeated: boolean;
+}
+
+/** Every shark in the lagoon: ambient cruisers in every mode, the attack waves in Boats vs. Sharks. */
+export interface Sharks {
+  /** Sharks that can be hit or locked right now (ids >= SHARK_ID_BASE). Pass to darts/aim/bots. */
+  readonly targets: readonly AimTarget[];
+  /** Wave sharks still in the lagoon (Boats vs. Sharks); 0 otherwise. */
+  readonly waveLeft: number;
+  /** The MEGA SHARK's health while it is out, else null. */
+  readonly mega: { health: number; maxHealth: number } | null;
+  /**
+   * Swim, chase, bump. A bump calls boat.onHit(direction, CONFIG.sharks.bumpStun) itself (a shield blocks
+   * it) and is returned so the game can play sounds, score, etc. Returns bumps this frame.
+   */
+  update(t: number, dt: number, boats: readonly Boat[]): SharkBump[];
+  /** A dart hit shark `sharkId` travelling along `direction`. Returns null if it was not hittable. */
+  hit(sharkId: number, boatId: number, direction: THREE.Vector3): SharkTag | null;
+  /** Boats vs. Sharks: send in a wave of `count` sharks from the arena edge, or the MEGA SHARK. */
+  spawnWave(count: number, mega: boolean): void;
+  /** Everything the minimap needs. */
+  readonly mapDots: readonly { x: number; z: number; heading: number; mega: boolean }[];
+  dispose(): void;
+}
+
 
 // ───────────────────────────── Boats ─────────────────────────────
 
@@ -270,12 +323,20 @@ export interface Boat {
   readonly aimTargetId: number | null;
 
   /** Physics, bobbing, timers, aim-assist target selection, visual animation. */
-  update(controls: BoatControls, dt: number, t: number, world: WorldQuery, others: readonly Boat[]): void;
+  update(
+    controls: BoatControls,
+    dt: number,
+    t: number,
+    world: WorldQuery,
+    others: readonly Boat[],
+    /** Non-boat things the blaster may lock onto (sharks). Boats in the cone win over these. */
+    aimTargets?: readonly AimTarget[],
+  ): void;
   /**
    * Fire if the blaster allows it (cooldown, ammo). Returns darts to spawn:
    * [] if not ready, 1 normally, 3 with 'triple'. Aims at aimTargetId when locked.
    */
-  tryFire(t: number, others: readonly Boat[]): DartSpawn[];
+  tryFire(t: number, others: readonly Boat[], aimTargets?: readonly AimTarget[]): DartSpawn[];
   /** Center of the dart-hit sphere, written into `out` and returned. */
   hitCenter(out: THREE.Vector3): THREE.Vector3;
   /**
@@ -365,6 +426,8 @@ export interface Effects {
   splash(position: THREE.Vector3, size: number): void;
   hitBurst(position: THREE.Vector3, color: number): void;
   sparkle(position: THREE.Vector3, color: number): void;
+  /** A diving shark: bubbles rising and popping at the surface. */
+  bubbles(position: THREE.Vector3): void;
   /** Balloon pop: rubbery shreds and confetti in the balloon color. */
   pop(position: THREE.Vector3, color: number): void;
   /** Honk: a few cartoon music notes float up from the boat. */
@@ -398,6 +461,16 @@ export interface Sfx {
   rescue(): void;
   /** Little fanfare when a trophy is earned. */
   trophy(): void;
+  /** A shark bumps a boat: cartoon "chomp" + thud. */
+  sharkBump(): void;
+  /** A darted shark dives away: splash + bubbly gloop. */
+  sharkDive(): void;
+  /** A new shark wave arrives: ship's bell / horn. */
+  waveStart(): void;
+  /** The MEGA SHARK appears: big silly roar. */
+  megaRoar(): void;
+  /** The sharks won: friendly "wah-wah". */
+  defeat(): void;
   uiMove(): void;
   uiSelect(): void;
   /** Continuous engine hum per human boat; levels 0..1. Pass [] to silence. */
@@ -491,8 +564,23 @@ export interface MapState {
   pickups: readonly THREE.Vector3[];
   /** Balloon Pop: balloons still floating (gold = worth 3). Empty otherwise. */
   balloons: readonly { x: number; z: number; gold: boolean }[];
+  /** Sharks (every mode). */
+  sharks: readonly { x: number; z: number; heading: number; mega: boolean }[];
   /** Race gates in order (empty in other modes). */
   gates: readonly Checkpoint[];
+}
+
+export interface SharkHud {
+  /** 1-based; waves + 1 means the MEGA SHARK round. */
+  wave: number;
+  waves: number;
+  sharksLeft: number;
+  /** Team life rings left; a shark bump pops one, 0 = the sharks win. */
+  rings: number;
+  maxRings: number;
+  mega: { health: number; maxHealth: number } | null;
+  /** True during the short break between waves. */
+  betweenWaves: boolean;
 }
 
 export interface HudState {
@@ -510,6 +598,8 @@ export interface HudState {
   teams: TeamScore[] | null;
   /** Balloon Pop: how many balloons are left. null otherwise. */
   balloons: { remaining: number; total: number } | null;
+  /** Boats vs. Sharks progress, else null. */
+  sharks: SharkHud | null;
   map: MapState;
 }
 
@@ -543,6 +633,14 @@ export interface PlayerMatchStats {
   /** Race / Balloon Pop: seconds to finish, else null. */
   finishTime: number | null;
   easyDriving: boolean;
+  /** Sharks tagged with darts (any mode). */
+  sharkTags: number;
+  /** Times a shark bumped this player's boat (any mode). */
+  sharkBumps: number;
+  /** Boats vs. Sharks: the team beat the MEGA SHARK. */
+  megaDefeated: boolean;
+  /** The hull this player used (3 = BoneBoat). */
+  hull: number;
 }
 
 export interface TrophyDef {
@@ -600,7 +698,10 @@ export interface PlayerSetup {
 export interface MatchSetup {
   mode: ModeId;
   humans: 1 | 2;
-  /** Computer boats. Team Up: total bots, split between the two teams. Balloon Pop: always 0. */
+  /**
+   * Computer boats. Team Up: total bots, split between the two teams. Balloon Pop: always 0.
+   * Boats vs. Sharks: helper boats on the players' team (0..3).
+   */
   bots: number;
   botDifficulty: BotDifficulty;
   /** Length === humans. */

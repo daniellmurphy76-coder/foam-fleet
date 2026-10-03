@@ -119,6 +119,34 @@ export const CONFIG = {
     goldEvery: 5,
   },
 
+  sharks: {
+    /** How many sharks cruise around in each game (Boats vs. Sharks brings its own). */
+    ambient: { battle: 3, race: 2, team: 3, practice: 2 },
+    /** Swimming speed (meters per second) when cruising, and when chasing a boat. */
+    cruiseSpeed: 5,
+    chaseSpeed: 12,
+    /** About how often (seconds) a cruising shark gets curious and chases a boat. */
+    chaseEverySec: 18,
+    /** Longest chase (seconds) before a shark gives up. */
+    chaseSec: 6,
+    /** How long a bumped boat wobbles (seconds). */
+    bumpStun: 0.5,
+    /** Seconds before a shark that got darted comes back. */
+    returnSec: 10,
+    /** Boats vs. Sharks: how many sharks in each wave. After the last wave comes the MEGA SHARK. */
+    waves: [3, 5, 7, 9, 11],
+    /** Darts it takes to beat the MEGA SHARK. */
+    megaHealth: 12,
+    /** Life rings your team starts with. Each shark bump pops one. */
+    lifeRings: 12,
+    /** Seconds of rest between waves. */
+    waveBreakSec: 4,
+    /** Shark speed for each bot skill setting. */
+    speedBySkill: { easy: 0.8, normal: 1, hard: 1.15 },
+    /** Helper boats on your team in Boats vs. Sharks. */
+    defaultHelpers: 2,
+  },
+
   bots: {
     /**
      * How wobbly the computer boats' aim is, in degrees. Bigger = they miss more.

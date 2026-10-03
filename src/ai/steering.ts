@@ -8,10 +8,24 @@
  * is closest to where we wanted to go but still has room. Open water means we go exactly
  * where we wanted; an island in the way means we curve around it.
  */
-import type { Boat, WorldQuery } from '../types';
+import type { AimTarget, Boat, WorldQuery } from '../types';
 
 export const DEG = Math.PI / 180;
 const TWO_PI = Math.PI * 2;
+
+/** A shark with a hit radius bigger than this is the MEGA SHARK (normal sharks are 1.6, the MEGA is 4.5). */
+export const MEGA_SHARK_RADIUS = 3;
+/** A shark bumps when its nose is within this many meters of a boat's edge (the MEGA SHARK: this + 3). */
+export const SHARK_BUMP_REACH = 1.2;
+export const MEGA_BUMP_EXTRA = 3;
+
+/**
+ * Center-to-center distance at which a shark of this size can bump a boat of radius `boatRadius`
+ * (the shark's nose sticks out about one hit radius from its center).
+ */
+export function sharkBumpGap(boatRadius: number, shark: AimTarget): number {
+  return boatRadius + SHARK_BUMP_REACH + shark.radius + (shark.radius > MEGA_SHARK_RADIUS ? MEGA_BUMP_EXTRA : 0);
+}
 
 export function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -161,6 +175,9 @@ const SOFT_PAD = 1.8;
 const EDGE_MARGIN = 5;
 /** Moving boats are only worth worrying about this far ahead. */
 const BOAT_REACH = 20;
+/** Sharks are only steered around when VERY close: this far ahead (the MEGA SHARK is bigger, so a bit farther). */
+const SHARK_REACH = 8;
+const MEGA_SHARK_REACH = 14;
 
 // How the scoring weighs things. Bigger number = that factor matters more.
 const SCORE_TURN_AWAY = 0.3; // per PI radians away from the wanted heading
@@ -212,14 +229,23 @@ export class Avoider {
   /**
    * Choose a heading near `desired` that does not run into anything within `look` meters.
    * `ignore` is a boat to treat as thin air (the one we are deliberately chasing).
+   * `sharks` (optional) are steered around like moving obstacles, but only when very close.
    */
-  pick(self: Boat, boats: readonly Boat[], ignore: Boat | null, world: WorldQuery, desired: number, look: number): void {
+  pick(
+    self: Boat,
+    boats: readonly Boat[],
+    ignore: Boat | null,
+    world: WorldQuery,
+    desired: number,
+    look: number,
+    sharks?: readonly AimTarget[],
+  ): void {
     this.px = self.position.x;
     this.pz = self.position.z;
     this.look = look;
     const edge = world.arenaRadius - EDGE_MARGIN;
     this.edgeSq = edge * edge;
-    this.gather(self, boats, ignore, world, look);
+    this.gather(self, boats, ignore, world, look, sharks);
 
     // ---- What is in the way while we turn? (rays around the nose) ----
     let noseStatic = 1;
@@ -286,7 +312,14 @@ export class Avoider {
   }
 
   /** Collect everything near enough to matter into the scratch arrays. */
-  private gather(self: Boat, boats: readonly Boat[], ignore: Boat | null, world: WorldQuery, look: number): void {
+  private gather(
+    self: Boat,
+    boats: readonly Boat[],
+    ignore: Boat | null,
+    world: WorldQuery,
+    look: number,
+    sharks?: readonly AimTarget[],
+  ): void {
     const px = this.px;
     const pz = this.pz;
     const selfR = self.radius;
@@ -329,6 +362,28 @@ export class Avoider {
       this.reach[n] = boatReach;
       this.isBoat[n] = 1;
       n++;
+    }
+    // Sharks move like boats (so they count as "not solid"), but the zone around one is the whole bump reach.
+    if (sharks) {
+      for (let i = 0; i < sharks.length && n < MAX_ENTRIES; i++) {
+        const s = sharks[i];
+        const dx = s.position.x - px;
+        const dz = s.position.z - pz;
+        const hard = sharkBumpGap(selfR, s);
+        const soft = hard + SOFT_PAD;
+        const reach = Math.min(look, s.radius > MEGA_SHARK_RADIUS ? MEGA_SHARK_REACH : SHARK_REACH);
+        const d2 = dx * dx + dz * dz;
+        const cull = reach + soft;
+        if (d2 > cull * cull) continue;
+        this.relX[n] = dx;
+        this.relZ[n] = dz;
+        this.distSq[n] = d2;
+        this.hardSq[n] = hard * hard;
+        this.softSq[n] = soft * soft;
+        this.reach[n] = reach;
+        this.isBoat[n] = 1;
+        n++;
+      }
     }
     this.count = n;
   }

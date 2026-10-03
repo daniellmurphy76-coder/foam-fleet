@@ -39,6 +39,7 @@ const LEAD: readonly number[] = [
 
 const mtof = (midi: number): number => 440 * Math.pow(2, (midi - 69) / 12);
 const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v);
+const rand = (a: number, b: number): number => a + Math.random() * (b - a);
 
 interface Graph {
   ctx: AudioContext;
@@ -85,6 +86,29 @@ interface ToneOpts {
 
 /** The shortest gap between two honks of the same horn (the long foghorn can't be spammed). */
 const HORN_GAP: Record<HornId, number> = { beep: 0.12, duck: 0.2, foghorn: 0.5, clown: 0.25 };
+
+/** A richer note than `tone()`: a filter that can "wah", a pitch wobble and a volume rattle (growls, trombones). */
+interface VoiceOpts {
+  type: OscillatorType;
+  f0: number;
+  /** Glide to this pitch over the note. */
+  f1?: number;
+  dur: number;
+  vol: number;
+  attack?: number;
+  /** 0..1: share of the note held at full volume before it fades (default 0.7). */
+  hold?: number;
+  /** Low-pass cutoff. With `lp1` it opens up to lp1 about 40% into the note, then closes again: "wah". */
+  lp0: number;
+  lp1?: number;
+  /** Pitch wobble: rate (Hz) and depth (Hz either side). */
+  vibHz?: number;
+  vibDepth?: number;
+  /** Volume rattle: rate (Hz) and depth (0..1). */
+  tremHz?: number;
+  tremDepth?: number;
+  when?: number;
+}
 
 interface NoiseOpts {
   dur: number;
@@ -186,6 +210,79 @@ export function createSfx(): Sfx {
       osc.disconnect();
       if (filter) filter.disconnect();
       amp.disconnect();
+    };
+  }
+
+  function voice(a: Graph, o: VoiceOpts): void {
+    const ctx = a.ctx;
+    const t0 = o.when ?? ctx.currentTime + 0.005;
+    const t1 = t0 + o.dur;
+    const osc = ctx.createOscillator();
+    osc.type = o.type;
+    osc.frequency.setValueAtTime(o.f0, t0);
+    if (o.f1 !== undefined && o.f1 !== o.f0) {
+      osc.frequency.exponentialRampToValueAtTime(Math.max(1, o.f1), t1);
+    }
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.Q.value = 2; // a little resonance makes the wah talk
+    filter.frequency.setValueAtTime(o.lp0, t0);
+    if (o.lp1 !== undefined) {
+      filter.frequency.linearRampToValueAtTime(o.lp1, t0 + o.dur * 0.4);
+      filter.frequency.linearRampToValueAtTime(o.lp0, t1);
+    }
+    const amp = ctx.createGain();
+    const attack = o.attack ?? 0.02;
+    const peak = Math.max(0.0002, o.vol);
+    amp.gain.setValueAtTime(0.0001, t0);
+    amp.gain.linearRampToValueAtTime(peak, t0 + attack);
+    amp.gain.setValueAtTime(peak, t0 + Math.max(attack, o.dur * clamp(o.hold ?? 0.7, 0, 0.95)));
+    amp.gain.exponentialRampToValueAtTime(0.0001, t1);
+    osc.connect(filter);
+    filter.connect(amp);
+
+    const extras: AudioNode[] = []; // everything we must disconnect afterwards
+    const lfos: OscillatorNode[] = [];
+    if (o.vibHz && o.vibDepth) {
+      const lfo = ctx.createOscillator();
+      lfo.frequency.value = o.vibHz;
+      const depth = ctx.createGain();
+      depth.gain.value = o.vibDepth;
+      lfo.connect(depth);
+      depth.connect(osc.frequency);
+      lfos.push(lfo);
+      extras.push(lfo, depth);
+    }
+    let out: AudioNode = amp;
+    if (o.tremHz && o.tremDepth) {
+      // volume = (1 - depth) + depth * lfo, so it wobbles between 1 - 2*depth and 1 and is never negative
+      const trem = ctx.createGain();
+      trem.gain.value = 1 - o.tremDepth;
+      const lfo = ctx.createOscillator();
+      lfo.frequency.value = o.tremHz;
+      const depth = ctx.createGain();
+      depth.gain.value = o.tremDepth;
+      lfo.connect(depth);
+      depth.connect(trem.gain);
+      amp.connect(trem);
+      out = trem;
+      lfos.push(lfo);
+      extras.push(lfo, depth, trem);
+    }
+    out.connect(a.sfx);
+    for (const l of lfos) {
+      l.start(t0);
+      l.stop(t1 + 0.05);
+    }
+    osc.start(t0);
+    osc.stop(t1 + 0.05);
+    voices++;
+    osc.onended = () => {
+      voices--;
+      osc.disconnect();
+      filter.disconnect();
+      amp.disconnect();
+      for (const n of extras) n.disconnect();
     };
   }
 
@@ -451,6 +548,88 @@ export function createSfx(): Sfx {
     bell(a, 2093, end + 0.05, 0.9, 0.12);
     bell(a, 3136, end + 0.16, 0.7, 0.1);
     bell(a, 2637, end + 0.27, 0.8, 0.1);
+  }
+
+  // ───────────── sharks (friendly, never scary) ─────────────
+
+  // Shark bump: a thud from the big snout, then two quick cartoon clacks of teeth, "clack-clack!".
+  function makeSharkBump(a: Graph): void {
+    const t = a.ctx.currentTime + 0.005;
+    const r = rand(0.93, 1.07);
+    tone(a, { f0: 150, f1: 46, dur: 0.26, vol: 0.5, attack: 0.002, when: t });
+    noise(a, { dur: 0.09, vol: 0.22, type: 'lowpass', f0: 800, f1: 180, when: t });
+    for (let i = 0; i < 2; i++) {
+      const when = t + 0.05 + i * 0.12;
+      const k = i === 0 ? 1 : 0.86; // the second clack is a little lower
+      noise(a, { dur: 0.04, vol: 0.34, type: 'bandpass', f0: 3200 * r * k, f1: 1400, q: 1.6, attack: 0.001, when });
+      tone(a, { type: 'square', f0: 680 * r * k, f1: 300, dur: 0.06, vol: 0.12, attack: 0.001, lowpass: 2200, when });
+      tone(a, { type: 'triangle', f0: 260 * r * k, f1: 120, dur: 0.08, vol: 0.28, attack: 0.001, when });
+    }
+  }
+
+  // Shark dive: a big splash, then "bloop, bloop, bloop" bubbles that wander down, ending in a sinking "gloop".
+  function makeSharkDive(a: Graph): void {
+    const t = a.ctx.currentTime + 0.005;
+    noise(a, { dur: 0.32, vol: 0.28, type: 'bandpass', f0: 1900, f1: 450, q: 0.8, attack: 0.01, when: t });
+    noise(a, { dur: 0.45, vol: 0.2, type: 'lowpass', f0: 1000, f1: 220, attack: 0.02, when: t });
+    const starts = [0.14, 0.26, 0.37, 0.49];
+    for (let i = 0; i < starts.length; i++) {
+      const base = 560 * Math.pow(0.82, i) * rand(0.92, 1.08);
+      tone(a, { f0: base, f1: base * 2.1, dur: 0.09 + i * 0.01, vol: 0.2, attack: 0.008, when: t + starts[i] });
+      tone(a, { type: 'triangle', f0: base * 2, f1: base * 4.2, dur: 0.06, vol: 0.05, attack: 0.008, when: t + starts[i] });
+    }
+    tone(a, { f0: 430, f1: 130, dur: 0.3, vol: 0.28, attack: 0.01, hold: 0.4, when: t + 0.6 });
+  }
+
+  // A ship's bell: a clear strike with a glassy overtone, and a low body tone underneath it.
+  function shipBell(a: Graph, when: number, f: number, vol: number): void {
+    tone(a, { f0: f, dur: 1.1, vol, attack: 0.002, when });
+    tone(a, { f0: f * 2.76, dur: 0.6, vol: vol * 0.3, attack: 0.002, when });
+    tone(a, { f0: f * 0.5, dur: 0.8, vol: vol * 0.4, attack: 0.002, when });
+  }
+
+  // Wave start: "ding-ding!" on the ship's bell, then a short, goofy "duun-dun, duun-dun" shark sting.
+  function makeWaveStart(a: Graph): void {
+    const t = a.ctx.currentTime + 0.01;
+    shipBell(a, t, 880, 0.26);
+    shipBell(a, t + 0.26, 880, 0.26);
+    const sting: Array<[number, number, number]> = [
+      // frequency, start, length (E and F, a half step apart: the classic two-note creep)
+      [164.8, 0.4, 0.26],
+      [174.6, 0.68, 0.2],
+      [164.8, 0.98, 0.26],
+      [174.6, 1.26, 0.3],
+    ];
+    for (const [f, start, len] of sting) {
+      tone(a, { type: 'sawtooth', f0: f, dur: len, vol: 0.16, attack: 0.02, lowpass: 800, hold: 0.6, when: t + start });
+      tone(a, { type: 'triangle', f0: f, dur: len, vol: 0.2, attack: 0.02, hold: 0.6, when: t + start });
+    }
+  }
+
+  // MEGA roar: a big wobbly growl that slides down, then a goofy two-part squeak, "eek-eek!".
+  function makeMegaRoar(a: Graph): void {
+    const t = a.ctx.currentTime + 0.01;
+    voice(a, { type: 'sawtooth', f0: 150, f1: 58, dur: 1.2, vol: 0.34, attack: 0.1, hold: 0.55, lp0: 700, vibHz: 13, vibDepth: 20, tremHz: 32, tremDepth: 0.4, when: t });
+    voice(a, { type: 'square', f0: 225, f1: 87, dur: 1.15, vol: 0.1, attack: 0.1, hold: 0.55, lp0: 600, vibHz: 11, vibDepth: 24, when: t });
+    noise(a, { dur: 1.0, vol: 0.14, type: 'bandpass', f0: 500, f1: 140, q: 0.9, attack: 0.1, when: t });
+    tone(a, { f0: 1000, f1: 2200, dur: 0.13, vol: 0.24, attack: 0.008, hold: 0.6, when: t + 1.18 });
+    tone(a, { f0: 1900, f1: 1100, dur: 0.12, vol: 0.2, attack: 0.008, hold: 0.5, when: t + 1.34 });
+  }
+
+  // The sharks won: a friendly sad trombone, "wah, wah, wah, waaaah" (the last note droops, with a wobble).
+  function makeDefeat(a: Graph): void {
+    const t = a.ctx.currentTime + 0.01;
+    const wah: Array<[number, number, number]> = [
+      [311.1, 0, 0.3],
+      [293.7, 0.36, 0.3],
+      [277.2, 0.72, 0.3],
+    ];
+    for (const [f, start, len] of wah) {
+      voice(a, { type: 'sawtooth', f0: f, dur: len, vol: 0.2, attack: 0.04, hold: 0.7, lp0: 500, lp1: 1500, when: t + start });
+      voice(a, { type: 'triangle', f0: f, dur: len, vol: 0.14, attack: 0.04, hold: 0.7, lp0: 1200, when: t + start });
+    }
+    voice(a, { type: 'sawtooth', f0: 261.6, f1: 207.7, dur: 1.1, vol: 0.2, attack: 0.05, hold: 0.7, lp0: 450, lp1: 1700, vibHz: 5.5, vibDepth: 5, when: t + 1.08 });
+    voice(a, { type: 'triangle', f0: 261.6, f1: 207.7, dur: 1.1, vol: 0.14, attack: 0.05, hold: 0.7, lp0: 1200, vibHz: 5.5, vibDepth: 5, when: t + 1.08 });
   }
 
   function makeUiMove(a: Graph): void {
@@ -817,6 +996,11 @@ export function createSfx(): Sfx {
     },
     rescue: () => play('rescue', 0.5, makeRescue),
     trophy: () => play('trophy', 0.6, makeTrophy),
+    sharkBump: () => play('sharkBump', 0.15, makeSharkBump),
+    sharkDive: () => play('sharkDive', 0.12, makeSharkDive),
+    waveStart: () => play('waveStart', 1.0, makeWaveStart),
+    megaRoar: () => play('megaRoar', 1.5, makeMegaRoar),
+    defeat: () => play('defeat', 2.0, makeDefeat), // the game core and the results screen may both ask: the second is dropped
     uiMove: () => play('uiMove', 0.03, makeUiMove),
     uiSelect: () => play('uiSelect', 0.06, makeUiSelect),
     setEngines,

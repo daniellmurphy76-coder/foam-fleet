@@ -6,12 +6,15 @@ import type {
 import { clamp } from './util';
 
 const DIFFICULTIES: readonly BotDifficulty[] = ['easy', 'normal', 'hard'];
-const MODES: readonly ModeId[] = ['battle', 'race', 'team', 'practice'];
+const MODES: readonly ModeId[] = ['battle', 'race', 'team', 'practice', 'sharks'];
 const PATTERNS: readonly PatternId[] = ['solid', 'stripes', 'flames', 'dots', 'shark'];
 const HATS: readonly HatId[] = ['captain', 'pirate', 'crown', 'cowboy', 'propeller', 'none'];
 const FLAGS: readonly FlagId[] = ['none', 'star', 'heart', 'skull', 'lightning', 'smile'];
 const HORNS: readonly HornId[] = ['beep', 'duck', 'foghorn', 'clown'];
-const HULLS = 3;
+/** Hull 3 is the BoneBoat (a shark skeleton). */
+const HULLS = 4;
+/** Boats vs. Sharks: the most helper boats on the players' team. */
+export const MAX_HELPERS = 3;
 
 /** The look a player gets until they visit the Garage (player 2 starts with the chunky tug, like v1). */
 export function defaultLook(slot = 0): BoatLook {
@@ -35,7 +38,7 @@ export function sanitizeLook(look: Partial<BoatLook> | null | undefined, slot: n
   };
 }
 
-/** Computer boats get a look of their own, the same every time for the same boat id. */
+/** Computer boats get a look of their own (any of the four hulls, BoneBoat included), the same every time for the same boat id. */
 export function botLook(id: number): BoatLook {
   let h = Math.imul(id + 1, 0x9e3779b1) >>> 0;
   const next = (n: number): number => {
@@ -65,7 +68,7 @@ export function defaultSetup(mode: ModeId = 'battle'): MatchSetup {
   return sanitizeSetup({
     mode,
     humans: 1,
-    bots: CONFIG.match.defaultBots,
+    bots: mode === 'sharks' ? CONFIG.sharks.defaultHelpers : CONFIG.match.defaultBots,
     botDifficulty: 'normal',
     players: [],
     durationSec: CONFIG.battle.durationSec,
@@ -76,7 +79,8 @@ export function defaultSetup(mode: ModeId = 'battle'): MatchSetup {
 /**
  * Make any setup safe to play: counts in range, one player entry per human (with a look and an
  * Easy Driving switch, even from an old save), names trimmed, bots capped so humans + bots <= maxBoats,
- * no bots in Balloon Pop, and at least one bot in Team Up (so there is another team to play against).
+ * no bots in Balloon Pop, at least one bot in Team Up (so there is another team to play against), and
+ * 0 to 3 helper boats in Boats vs. Sharks.
  */
 export function sanitizeSetup(s: MatchSetup): MatchSetup {
   const mode: ModeId = MODES.includes(s.mode) ? s.mode : 'battle';
@@ -85,6 +89,7 @@ export function sanitizeSetup(s: MatchSetup): MatchSetup {
   let bots = clamp(Math.round(Number(s.bots) || 0), 0, maxBots);
   if (mode === 'practice') bots = 0;
   else if (mode === 'team') bots = clamp(bots, 1, Math.max(1, maxBots));
+  else if (mode === 'sharks') bots = clamp(bots, 0, Math.min(MAX_HELPERS, maxBots));
   const players: PlayerSetup[] = [];
   for (let i = 0; i < humans; i++) {
     const p = s.players?.[i] as Partial<PlayerSetup> | undefined;
@@ -115,7 +120,7 @@ export function sanitizeSetup(s: MatchSetup): MatchSetup {
 }
 
 /**
- * Read ?quick=battle|race|team|practice&humans=&bots=&difficulty=&duration=&laps=&easy=0|1 .
+ * Read ?quick=battle|race|team|practice|sharks&humans=&bots=&difficulty=&duration=&laps=&easy=0|1 .
  * Returns null if `quick` is absent. `easy` turns Easy Driving on or off for every human (default on).
  */
 export function setupFromQuery(q: URLSearchParams): MatchSetup | null {

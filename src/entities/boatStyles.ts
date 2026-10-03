@@ -1,6 +1,9 @@
 /**
- * Foam Fleet: the three hull shapes, plus a few "where is the hull wall / deck?" helpers that
+ * Foam Fleet: the four hull shapes, plus a few "where is the hull wall / deck?" helpers that
  * the paint patterns use to stick decals on in the right place.
+ *
+ * Hulls 0-2 are toy plastic ('mono' and 'cat'). Hull 3 is the BoneBoat ('bone'): a shark skeleton, built
+ * in boneBoat.ts. It has no painted walls, so the decal helpers below never run for it.
  *
  * Local axes: +Z = bow (front), +Y = up, +X = the boat's LEFT. Waterline is y = 0.
  */
@@ -8,7 +11,7 @@ import * as THREE from 'three';
 import { smoothstep } from './boatGeo';
 
 export interface StyleSpec {
-  kind: 'mono' | 'cat';
+  kind: 'mono' | 'cat' | 'bone';
   zStern: number;
   zBow: number;
   deckY: number;
@@ -29,6 +32,8 @@ export interface StyleSpec {
   /** The flag mast stands here on the deck (x is negative: the boat's right side, out of the captain's way). */
   mastX: number;
   mastZ: number;
+  /** The blaster sits this much higher than the deck (the BoneBoat's skull is taller than a plastic bow). Default 0. */
+  turretLift?: number;
 }
 
 export const STYLES: readonly StyleSpec[] = [
@@ -53,12 +58,23 @@ export const STYLES: readonly StyleSpec[] = [
     hw: (u) => 0.36 * (u < 0.12 ? 0.8 + (0.2 * u) / 0.12 : 1) * (1 - 0.9 * Math.pow(Math.max(0, (u - 0.55) / 0.45), 1.5)),
     bulge: 0.1, hullX: 0.92, mastX: -0.95, mastZ: -1.5,
   },
+  // 3: BoneBoat. A shark skeleton: ribs for hull walls, a spine for a keel, a skull at the bow, a forked tail.
+  // deckY is the top of the floor plate. The skull is taller than a plastic bow, so the blaster stands on a short
+  // pedestal (turretLift) and its barrel clears the cranium. The flag mast stands on the tail's stern bone.
+  // hw is a rough outline only (the decal helpers are never used on this hull); the real rib widths are in boneBoat.ts.
+  {
+    kind: 'bone', zStern: -2.6, zBow: 2.5, deckY: 0.42, turretZ: 0.5, seatZ: -0.58, windZ: 0.1,
+    windW: 0, motorZ: -2.3, rimUp: 0, stack: false, turretLift: 0.12,
+    hw: (u) => 0.95 * Math.sin(Math.PI * Math.min(1, 0.1 + 0.85 * u)),
+    bulge: 0, hullX: 0, mastX: -0.5, mastZ: -1.85,
+  },
 ];
 
 /** Hull number from a BoatLook (any number is fine: it wraps, junk falls back to the speedboat). */
 export function styleFor(hull: number): StyleSpec {
   const n = Number.isFinite(hull) ? Math.trunc(hull) : 0;
-  return STYLES[((n % 3) + 3) % 3];
+  const k = STYLES.length;
+  return STYLES[((n % k) + k) % k];
 }
 
 /** Outline of a hull seen from above: x = sideways, y = forward (z). `inset` shrinks it. */

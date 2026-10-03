@@ -21,8 +21,9 @@
  */
 import * as THREE from 'three';
 import { CONFIG } from '../config';
+import { SHARK_ID_BASE } from '../types';
 import type {
-  ActivePowerUp, Boat, BoatControls, BoatInit, BumpEvent, DartSpawn, PowerUpKind, SpawnPoint, WorldQuery,
+  ActivePowerUp, AimTarget, Boat, BoatControls, BoatInit, BumpEvent, DartSpawn, PowerUpKind, SpawnPoint, WorldQuery,
 } from '../types';
 import { buildBoatRig, FLAG_YAW, MARKER_HEIGHT, SHIELD_SIZE, type BoatRig } from './boatModel';
 
@@ -117,7 +118,8 @@ function angleDiff(a: number, b: number): number {
 const _n = new THREE.Vector3();
 const _origin = new THREE.Vector3();
 const _dir = new THREE.Vector3();
-const _tc = new THREE.Vector3();
+const _tc = new THREE.Vector3(); // the locked target's center...
+const _tv = new THREE.Vector3(); // ...and its velocity (see lockedTarget)
 const _aim = new THREE.Vector3();
 const _approx = new THREE.Vector3();
 
@@ -261,7 +263,9 @@ class FoamBoat implements Boat {
 
   // ───────────────────────────── per-frame update ─────────────────────────────
 
-  update(c: BoatControls, dt: number, t: number, world: WorldQuery, others: readonly Boat[]): void {
+  update(
+    c: BoatControls, dt: number, t: number, world: WorldQuery, others: readonly Boat[], aimTargets?: readonly AimTarget[],
+  ): void {
     if (!(dt > 0) || this.disposed) return; // paused (dt = 0) or garbage: stand still
     if (dt > MAX_FRAME_DT) dt = MAX_FRAME_DT;
 
@@ -276,8 +280,8 @@ class FoamBoat implements Boat {
     for (let i = 0; i < steps; i++) this.stepPhysics(h, world);
 
     this.sampleWaves(dt, t, world);
-    this.pickAimTarget(others);
-    this.animate(dt, t, others);
+    this.pickAimTarget(others, aimTargets);
+    this.animate(dt, t, others, aimTargets);
   }
 
   /** Countdowns: stun, flash, power-ups, boost meter, reloading. */
@@ -600,8 +604,12 @@ class FoamBoat implements Boat {
     this.rollTarget = waveRoll + (-this.yawRate / this.turnBase) * (0.1 + 0.26 * spd);
   }
 
-  /** Aim assist: pick the nearest boat roughly in front of us. Generous at close range. Teammates are never targets. */
-  private pickAimTarget(others: readonly Boat[]): void {
+  /**
+   * Aim assist. Lock rule: the nearest BOAT (other team) roughly in front of us wins. Only if there is none, the nearest
+   * aim target (a shark) in the cone is locked instead, so `aimTargetId` can be a shark id (>= SHARK_ID_BASE).
+   * Generous at close range. Teammates are never targets.
+   */
+  private pickAimTarget(others: readonly Boat[], aimTargets?: readonly AimTarget[]): void {
     const range = CONFIG.blaster.aimAssistRange;
     const cone = (CONFIG.blaster.aimAssistDeg * Math.PI) / 180;
     let bestId: number | null = null;
@@ -624,25 +632,69 @@ class FoamBoat implements Boat {
         bestId = o.id;
       }
     }
+    if (bestId === null && aimTargets) {
+      // No boat to lock: the nearest shark in the cone (same rules, same stickiness).
+      for (let i = 0; i < aimTargets.length; i++) {
+        const a = aimTargets[i];
+        if (!a.alive) continue;
+        const dx = a.position.x - this.position.x;
+        const dz = a.position.z - this.position.z;
+        const d = Math.hypot(dx, dz);
+        if (d > range || d < 0.01) continue;
+        const current = a.id === this._aimTargetId;
+        const limit = cone * (current ? 1.25 : 1) + Math.asin(Math.min(1, a.radius / d)); // the MEGA SHARK is huge up close
+        const off = Math.abs(angleDiff(Math.atan2(dx, dz), this.heading));
+        if (off > limit) continue;
+        const score = current ? d * 0.8 : d;
+        if (score < best) {
+          best = score;
+          bestId = a.id;
+        }
+      }
+    }
     this._aimTargetId = bestId;
   }
 
   /**
+   * Find the thing we are locked onto (a boat, or a shark if the id is >= SHARK_ID_BASE) and write its center into _tc
+   * and its velocity into _tv. False if the lock is empty or the target is gone (a shark that dived since last frame).
+   */
+  private lockedTarget(others: readonly Boat[], aimTargets?: readonly AimTarget[]): boolean {
+    const id = this._aimTargetId;
+    if (id === null) return false;
+    if (id >= SHARK_ID_BASE) {
+      if (!aimTargets) return false;
+      for (let i = 0; i < aimTargets.length; i++) {
+        const a = aimTargets[i];
+        if (a.id !== id || !a.alive) continue;
+        _tc.copy(a.position);
+        _tv.copy(a.velocity);
+        return true;
+      }
+      return false;
+    }
+    const b = findBoat(others, id);
+    if (!b) return false;
+    b.hitCenter(_tc);
+    _tv.copy(b.velocity);
+    return true;
+  }
+
+  /**
    * Work out which way a dart should fly (a unit vector written into `out`).
-   * Locked on: lead the target (aim where it WILL be) and aim a bit high so gravity drops the dart onto it.
+   * Locked on (see lockedTarget): lead the target (aim where it WILL be) and aim a bit high so gravity drops the dart onto it.
    * Not locked: straight ahead with a small upward angle.
    */
-  private solveAim(origin: THREE.Vector3, out: THREE.Vector3, target: Boat | null): void {
+  private solveAim(origin: THREE.Vector3, out: THREE.Vector3, locked: boolean): void {
     this.refreshAxes();
-    if (!target) {
+    if (!locked) {
       const ce = Math.cos(AIM_UP);
       out.set(this.sinH * ce, Math.sin(AIM_UP), this.cosH * ce);
       return;
     }
     const g = CONFIG.blaster.dartGravity;
     const speed = CONFIG.blaster.dartSpeed + Math.max(0, this.speed);
-    target.hitCenter(_tc);
-    const tv = target.velocity;
+    const tv = _tv;
     let tof = _tc.distanceTo(origin) / speed; // time of flight, refined a few times
     for (let i = 0; i < 3; i++) {
       _aim.set(_tc.x + tv.x * tof, _tc.y + 0.5 * g * tof * tof, _tc.z + tv.z * tof);
@@ -658,7 +710,7 @@ class FoamBoat implements Boat {
   }
 
   /** Springs, turret, captain, flame, shield: everything that is just for looks. */
-  private animate(dt: number, t: number, others: readonly Boat[]): void {
+  private animate(dt: number, t: number, others: readonly Boat[], aimTargets?: readonly AimTarget[]): void {
     const rig = this.rig;
     const maxSpeed = this.topSpeed;
 
@@ -691,15 +743,13 @@ class FoamBoat implements Boat {
     // Turret: swing toward the aim target (clamped), match the dart's elevation.
     let yawT = 0;
     let pitchT = AIM_UP;
-    if (this._aimTargetId !== null) {
-      const target = findBoat(others, this._aimTargetId);
-      if (target) {
-        this.refreshAxes();
-        _approx.set(this.position.x + this.sinH * 1.4, this.position.y + 1.2, this.position.z + this.cosH * 1.4);
-        this.solveAim(_approx, _dir, target);
-        yawT = clamp(angleDiff(Math.atan2(_dir.x, _dir.z), this.heading), -TURRET_MAX_YAW, TURRET_MAX_YAW);
-        pitchT = Math.atan2(_dir.y, Math.hypot(_dir.x, _dir.z));
-      }
+    if (this.lockedTarget(others, aimTargets)) {
+      // a boat or a shark: the turret tracks either one the same way
+      this.refreshAxes();
+      _approx.set(this.position.x + this.sinH * 1.4, this.position.y + 1.2, this.position.z + this.cosH * 1.4);
+      this.solveAim(_approx, _dir, true);
+      yawT = clamp(angleDiff(Math.atan2(_dir.x, _dir.z), this.heading), -TURRET_MAX_YAW, TURRET_MAX_YAW);
+      pitchT = Math.atan2(_dir.y, Math.hypot(_dir.x, _dir.z));
     }
     const kTurret = 1 - Math.exp(-dt * 14);
     this.turretYawA += (yawT - this.turretYawA) * kTurret;
@@ -733,6 +783,7 @@ class FoamBoat implements Boat {
       rig.flag.rotation.z = Math.sin(t * 8.3 + this.id * 1.7) * 0.06 * (0.3 + spd);
     }
     if (rig.propeller) rig.propeller.rotation.y += dt * (9 + 26 * spd);
+    if (rig.eyeHalo) rig.eyeHalo.opacity = 0.4 + 0.14 * Math.sin(t * 3.2 + this.id * 1.3); // the BoneBoat's eyes glow slowly in and out
     if (rig.marker) {
       rig.marker.position.y = MARKER_HEIGHT + Math.sin(t * 3 + this.id) * 0.1;
       rig.marker.rotation.y = t * 1.8;
@@ -787,7 +838,7 @@ class FoamBoat implements Boat {
 
   // ───────────────────────────── blaster ─────────────────────────────
 
-  tryFire(t: number, others: readonly Boat[]): DartSpawn[] {
+  tryFire(t: number, others: readonly Boat[], aimTargets?: readonly AimTarget[]): DartSpawn[] {
     if (this.disposed || t < this.nextFireT) return NO_SHOTS;
     const kind = this._powerUp ? this._powerUp.kind : null;
     const rapid = kind === 'rapid';
@@ -808,8 +859,8 @@ class FoamBoat implements Boat {
     // Where the dart starts: the very tip of the barrel, in world space.
     this.rig.muzzle.getWorldPosition(_origin);
 
-    const target = this._aimTargetId !== null ? findBoat(others, this._aimTargetId) : null;
-    this.solveAim(_origin, _dir, target);
+    // Aim at the locked boat or shark (leading it with its velocity); if it has just gone, shoot straight ahead.
+    this.solveAim(_origin, _dir, this.lockedTarget(others, aimTargets));
     const speed = CONFIG.blaster.dartSpeed + Math.max(0, this.speed);
 
     const spawns: DartSpawn[] = [this.makeSpawn(_dir.x, _dir.y, _dir.z, speed)];
