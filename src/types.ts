@@ -99,7 +99,17 @@ export interface InputManager {
   /** Edge-triggered system buttons for this frame (all keyboards + all gamepads). */
   readonly menu: MenuInput;
   /** What a human slot is driving with right now (for on-screen hints). */
-  schemeOf(slot: 0 | 1, humans: 1 | 2): 'keysA' | 'keysB' | 'gamepad';
+  schemeOf(slot: 0 | 1, humans: 1 | 2): 'keysA' | 'keysB' | 'gamepad' | 'touch';
+  /**
+   * True while on-screen touch controls are in use (a touch device, or `?touch=1`, and the last input
+   * was a touch rather than a key or gamepad). While true, `<html>` has the class `ff-touch`.
+   */
+  readonly touchActive: boolean;
+  /**
+   * Place the touch controls: one control zone per human viewport (same order as the HUD's viewports),
+   * and whether they show at all (true only during countdown and play; false in menus, pause, results).
+   */
+  layoutTouch(viewports: readonly Viewport[], humans: 1 | 2, visible: boolean): void;
   gamepadCount(): number;
   /** Best-effort gamepad rumble for a human slot; no-op without a gamepad. */
   rumble(slot: 0 | 1, humans: 1 | 2, strength: number, ms: number): void;

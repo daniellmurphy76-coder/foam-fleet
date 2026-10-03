@@ -19,6 +19,26 @@ Play it at **https://daniellmurphy76-coder.github.io/foam-fleet/**
 Every push to `main` builds the game and publishes it to GitHub Pages
 (`.github/workflows/deploy.yml`). Open the Pages address in Safari or Chrome; no install needed.
 
+### On the iPad
+
+1. Open the link above in **Safari**, with the iPad held sideways (landscape). Held upright, the game asks
+   you to turn it.
+2. For a full-screen game with no browser bars: tap **Share**, then **Add to Home Screen**, then **Add**.
+   Open **Foam Fleet** from the Home Screen like any app.
+3. Fingers only, no keyboard needed. The on-screen controls appear as soon as you touch the screen:
+   - **Left thumb: steer.** Put a thumb anywhere on the left half and drag. Up goes, down brakes, left and right
+     steer. The stick appears under your thumb.
+   - **Right thumb: FIRE and BOOST.** The big orange button fires (hold it to keep firing) and the yellow one is
+     a boost. The small **HONK** and **RESCUE** buttons sit just above them.
+   - **II** (top left) pauses. Pause, results and every menu are plain taps.
+   - Two players share the iPad: Player 1 on the left, Player 2 on the right, each with their own stick and
+     buttons. Everything works with several fingers at once.
+4. Sound starts after your first tap (Safari insists on that). The **Sound** button on the title screen turns
+   it off.
+
+A keyboard or Bluetooth gamepad still works exactly as on a computer. Pressing a key or a gamepad button hides
+the touch layout, and touching the screen brings it back.
+
 ## Modes
 
 - **Dart Battle**: tag other boats with foam darts. Every hit is a point. Most points when the clock runs out wins.
@@ -64,6 +84,10 @@ for the full-speed, do-it-yourself handling.
 - **Rescue** lifts your boat to the nearest open water (3 second wait between uses). Your race progress,
   darts and power-ups are kept.
 - With Easy Driving on, hold **W** (or RT, or the up arrow) to go faster than the cruise speed, and **S** to brake.
+- **Touch** (iPad): see "On the iPad" above.
+- Hearing the music or engines twice? The Sound button only silences the page you click in, so another tab or
+  window with the game open is still playing. Close the extra one (a tab with a speaker icon is the one making
+  noise).
 
 ## Make it yours
 
@@ -79,7 +103,7 @@ for the full-speed, do-it-yourself handling.
 | `src/entities/` | The boats: how they look (hulls, paint, hats, flags), drive, bob on waves, and shoot |
 | `src/combat/`, `src/fx/` | Darts in flight, darts stuck to boats, splashes, balloon pops, honk notes |
 | `src/ai/` | How computer boats think |
-| `src/input/` | Keyboard and gamepad, and the Easy Driving helper |
+| `src/input/` | Keyboard, gamepad and touch (the on-screen stick and buttons), and the Easy Driving helper |
 | `src/ui/`, `src/audio/` | Menus, Boat Garage, Trophy Shelf, scoreboard, mini-map, sounds, music |
 | `src/game/` | The game loop, battle / race / team / balloon rules, cameras, split screen, rescue, trophies |
 
@@ -91,6 +115,11 @@ for the full-speed, do-it-yourself handling.
 - `&nopause=1` stops the game pausing when the window loses focus. `&autopilot=1` lets the computer drive
   your boat, and `&timescale=4` fast-forwards.
 - `?fps=1` shows the frame rate.
+- `?touch=1` turns the on-screen touch controls on for any device (a mouse click then acts like a finger),
+  so you can try the iPad layout on a computer. Add it to the address with the others, for example
+  `?quick=battle&humans=2&touch=1`.
+- `?mute=1` makes that page silent. The Sound button and the **M** key do nothing there, and nothing is saved,
+  so the family's own Sound setting is never changed. Use it on every test page.
 - In the browser console, `__foam.snapshot()` shows the game state (boats, teams, balloons left, what each
   human has done so far), `__foam.timeScale = 4` fast-forwards, `__foam.autopilot = true` lets the computer
   drive your boat, and `__foam.start({ mode: 'team', bots: 3 })` starts a match.

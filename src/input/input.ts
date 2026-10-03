@@ -1,26 +1,31 @@
 /**
- * Foam Fleet: keyboard + gamepad input for up to two players.
+ * Foam Fleet: keyboard + gamepad + touch input for up to two players.
  *
  * How it fits together (read top to bottom):
  *   1. KEYBOARD   - key events set "held" flags. Two layouts: A (WASD) and B (arrows).
  *   2. GAMEPADS   - every frame `poll()` reads the pads and turns them into plain numbers.
- *   3. SLOTS      - `humanController(slot, humans)` decides which keyboard layout and
- *                   which pad belong to which player, fresh every frame (so you can plug
+ *   3. TOUCH      - touch.ts draws the on-screen stick and buttons and tracks the fingers. Here it
+ *                   is just one more device: pressing a key or pad button switches it off, the
+ *                   next finger switches it back on.
+ *   4. SLOTS      - `humanController(slot, humans)` decides which keyboard layout, which pad and
+ *                   which touch zone belong to which player, fresh every frame (so you can plug
  *                   in a pad in the middle of a match).
- *   4. MENU       - one-frame "button went down" flags for the menus and pause screen.
- *   5. ASSIST     - for Easy Driving boats the human controller also runs assist.ts
+ *   5. MENU       - one-frame "button went down" flags for the menus and pause screen.
+ *   6. ASSIST     - for Easy Driving boats the human controller also runs assist.ts
  *                   (auto-cruise and bumper rails) on top of what the player pressed.
  *
  * Buttons:  layout A = W/S/A/D, Space fire, Left Shift boost, R rescue, Q honk.
  *           layout B = arrows, Enter fire, Right Shift boost, / rescue, ' (quote) honk.
  *           pad      = stick/RT/LT drive, A or RB fire, B or LB boost, Y rescue, X honk.
+ *           touch    = floating stick drives, FIRE / BOOST / HONK / RESCUE buttons, II pauses.
  * Rescue and honk are plain "held" flags; the game core acts on the moment they go down.
  *
  * Steering convention (from types.ts): steer +1 = turn RIGHT. Right on a stick, D, or the
  * Right Arrow is therefore +1.
  */
-import type { BoatControls, Controller, ControllerContext, InputManager, MenuInput } from '../types';
+import type { BoatControls, Controller, ControllerContext, InputManager, MenuInput, Viewport } from '../types';
 import { EasyAssist } from './assist';
+import { createTouch } from './touch';
 
 // ───────────────────────────── Tunables ─────────────────────────────
 
@@ -248,6 +253,9 @@ export function createInput(target: Window): InputManager {
   const nav = target.navigator;
   const clock = target.performance;
 
+  // ---- touch (an inert object on devices without a touch screen) ----
+  const touch = createTouch(target);
+
   // ---- keyboard state ----
   const held = new Uint8Array(KEY_TABLE.length); // 1 while a key is down
   const tapped = new Uint8Array(KEY_TABLE.length); // >0 for a few polls after a quick tap
@@ -297,6 +305,7 @@ export function createInput(target: Window): InputManager {
     pendingMenu |= e.repeat ? bits & M_DIRECTIONS : bits;
 
     if (typing) return;
+    touch.deactivate(); // a key press means hands are on the keyboard now, not on the glass
     held[i] = 1;
     if (!e.repeat) tapped[i] = TAP_LIFE_POLLS;
     const group = KEY_TABLE[i][2];
@@ -375,7 +384,10 @@ export function createInput(target: Window): InputManager {
     snap.boost = padButton(gp, PAD_B) || padButton(gp, PAD_LB);
     snap.rescue = padButton(gp, PAD_Y);
     snap.honk = padButton(gp, PAD_X);
-    if (padTouched(gp, rawX, rawY)) padActiveAt[n] = now;
+    if (padTouched(gp, rawX, rawY)) {
+      padActiveAt[n] = now;
+      touch.deactivate();
+    }
 
     // --- menus: A/B/Start/Back fire once per press ---
     let bits = 0;
@@ -546,6 +558,15 @@ export function createInput(target: Window): InputManager {
           rescue = rescue || p.rescue;
           honk = honk || p.honk;
         }
+        // Touch: each slot owns its own zone, so a lone player (slot 0) just gets the one zone.
+        // The stick's throttle goes through unchanged; Easy Driving's assist turns "no throttle" into cruise.
+        const tv = touch.sample(slot);
+        steer = biggest(steer, tv.steer);
+        throttle = biggest(throttle, tv.throttle);
+        fire = fire || tv.fire;
+        boost = boost || tv.boost;
+        rescue = rescue || tv.rescue;
+        honk = honk || tv.honk;
 
         steer = clamp(steer, -1, 1);
         throttle = clamp(throttle, -1, 1);
@@ -608,9 +629,19 @@ export function createInput(target: Window): InputManager {
   return {
     menu,
 
+    get touchActive(): boolean {
+      return touch.active;
+    },
+
+    layoutTouch(viewports: readonly Viewport[], humans: 1 | 2, visible: boolean): void {
+      if (disposed) return;
+      touch.layout(viewports, humans, visible);
+    },
+
     poll(): void {
       if (disposed) return;
-      const bits = pendingMenu | readPads(clock.now());
+      // The on-screen Pause button counts as a pause press, like Escape or Start.
+      const bits = pendingMenu | readPads(clock.now()) | (touch.poll() ? M_PAUSE : 0);
       pendingMenu = 0;
       menu.up = (bits & M_UP) !== 0;
       menu.down = (bits & M_DOWN) !== 0;
@@ -636,7 +667,9 @@ export function createInput(target: Window): InputManager {
       return c;
     },
 
-    schemeOf(slot: 0 | 1, humans: 1 | 2): 'keysA' | 'keysB' | 'gamepad' {
+    schemeOf(slot: 0 | 1, humans: 1 | 2): 'keysA' | 'keysB' | 'gamepad' | 'touch' {
+      // While fingers are what is in use, every player has a touch zone on screen.
+      if (touch.active) return 'touch';
       // Whichever device this player touched most recently, out of the ones they own right now.
       resolveSlot(slot, humans, padCount, schemeAsg);
       let bestAt = -1;
@@ -698,6 +731,7 @@ export function createInput(target: Window): InputManager {
       target.removeEventListener('blur', onBlur);
 
       doc.removeEventListener('visibilitychange', onVisibility);
+      touch.dispose();
       clearKeys();
       pendingMenu = 0;
       padCount = 0;

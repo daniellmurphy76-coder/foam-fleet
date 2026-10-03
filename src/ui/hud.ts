@@ -34,7 +34,13 @@ const TROPHY_STAGGER_MS = 300;
 const MAP_SHARE = 0.22;
 const MAP_MAX_PX = 180;
 const MAP_MIN_PX = 110;
+/** Under touch controls the radar is smaller (and sits top-right, see hud.css): min(18% of the height, 140 px). */
+const MAP_TOUCH_SHARE = 0.18;
+const MAP_TOUCH_MAX_PX = 140;
+const MAP_TOUCH_MIN_PX = 96;
 const HINT_DEFAULT_MS = 4200;
+/** The class the input module puts on <html> while on-screen touch controls are in use. */
+const TOUCH_CLASS = 'ff-touch';
 
 // ───────────── little pieces of art (all our own static markup) ─────────────
 
@@ -199,14 +205,30 @@ function panelScale(v: Viewport): number {
   return clamp(Math.min(v.width / 800, v.height / 600), 0.55, 1.5);
 }
 
+/** Mini-map diameter in CSS px for a viewport this tall. */
+function mapDiameter(height: number, touch: boolean): number {
+  const d = touch
+    ? clamp(height * MAP_TOUCH_SHARE, MAP_TOUCH_MIN_PX, MAP_TOUCH_MAX_PX)
+    : clamp(height * MAP_SHARE, MAP_MIN_PX, MAP_MAX_PX);
+  return Math.round(d);
+}
+
+/** Run `onSize` whenever `target` changes size (no polling). Without ResizeObserver the CSS defaults stay. */
+function watchSize(target: HTMLElement, onSize: () => void): void {
+  if (typeof ResizeObserver !== 'function') return;
+  new ResizeObserver(onSize).observe(target);
+}
+
 // ───────────── one player's panel (fills one viewport) ─────────────
 
 interface Panel {
   root: HTMLElement;
   setRect(v: Viewport): void;
   apply(p: PlayerHud, state: HudState, nowMs: number): void;
-  /** Coaching line near the bottom of this player's view. */
-  showHint(text: string, ms: number): void;
+  /** Coaching line (bottom of this player's view; just above the middle with touch controls). */
+  showHint(text: string, ms: number, delayMs: number): void;
+  /** Touch controls on or off: the mini-map changes size. */
+  setTouch(on: boolean): void;
   reset(): void;
   announcer: Announcer;
 }
@@ -302,6 +324,11 @@ function createPanel(): Panel {
 
   // what is currently on screen (NaN / sentinel values force the first write)
   let cx = NaN, cy = NaN, cw = NaN, ch = NaN;
+  let cAtL: boolean | null = null; // does this panel touch the left / right edge of the screen? (safe-area margins)
+  let cAtR: boolean | null = null;
+  let cMapPx = NaN;
+  let cTagH = NaN;
+  let touch = false;
   let cMode: ModeId | '' = '';
   let cEasy: boolean | null = null;
   let cName: string | null = null;
@@ -333,8 +360,19 @@ function createPanel(): Panel {
     cAmmo = NaN; // force the filled/spent look to be redrawn
   }
 
+  /** The mini-map is a circle sized from the viewport; the hint strip needs to know where it starts. */
+  function applyMapSize(): void {
+    if (Number.isNaN(ch)) return; // no rectangle yet
+    const d = mapDiameter(ch, touch);
+    if (d === cMapPx) return;
+    cMapPx = d;
+    root.style.setProperty('--mapd', d + 'px');
+    map.resize(d);
+  }
+
   function setRect(v: Viewport): void {
-    if (v.x !== cx) { root.style.left = v.x + 'px'; cx = v.x; }
+    let moved = false;
+    if (v.x !== cx) { root.style.left = v.x + 'px'; cx = v.x; moved = true; }
     if (v.y !== cy) { root.style.top = v.y + 'px'; cy = v.y; }
     if (v.width !== cw || v.height !== ch) {
       cw = v.width;
@@ -343,16 +381,35 @@ function createPanel(): Panel {
       root.style.height = v.height + 'px';
       // --u scales every size in this panel: smaller viewport (split screen) = smaller HUD
       root.style.setProperty('--u', panelScale(v).toFixed(3));
-      // the mini-map is a circle sized from the viewport; the hint strip needs to know where it starts
-      const d = Math.round(Math.max(MAP_MIN_PX, Math.min(v.height * MAP_SHARE, MAP_MAX_PX)));
-      root.style.setProperty('--mapd', d + 'px');
-      map.resize(d);
+      applyMapSize();
+      moved = true;
+    }
+    if (moved) {
+      // Only a panel at the edge of the screen keeps clear of the iPad's rounded corners (hud.css: .at-l / .at-r).
+      const atL = v.x <= 1;
+      const atR = v.x + v.width >= window.innerWidth - 1;
+      if (atL !== cAtL) { cAtL = atL; root.classList.toggle('at-l', atL); }
+      if (atR !== cAtR) { cAtR = atR; root.classList.toggle('at-r', atR); }
     }
   }
 
-  function showHint(text: string, ms: number): void {
+  function setTouch(on: boolean): void {
+    touch = on;
+    applyMapSize();
+  }
+
+  // hud.css hangs the stats cluster under the name/score stack with touch controls, so it needs that stack's height
+  watchSize(tag, () => {
+    const h = tag.offsetHeight;
+    if (h === cTagH) return;
+    cTagH = h;
+    root.style.setProperty('--tagh', h + 'px');
+  });
+
+  function showHint(text: string, ms: number, delayMs: number): void {
     hintEl.textContent = text;
     hintEl.style.setProperty('--ms', ms + 'ms');
+    hintEl.style.setProperty('--hd', delayMs + 'ms');
     // Restart the CSS animation (same trick as the announcer).
     hintEl.classList.remove('on');
     void hintEl.offsetWidth;
@@ -537,7 +594,7 @@ function createPanel(): Panel {
     announcer.clear();
   }
 
-  return { root, setRect, apply, showHint, reset, announcer };
+  return { root, setRect, apply, showHint, setTouch, reset, announcer };
 }
 
 // ───────────── the HUD ─────────────
@@ -642,6 +699,21 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
   const globalAnn = createAnnouncer('ff-ann--global');
   live.append(timerEl, teamPills[0].root, teamPills[1].root, balloonsEl, sbEl, feedEl, globalAnn.root);
   root.append(live);
+
+  // With touch controls the mini-map hangs under the scoreboard, so the CSS needs the scoreboard's height.
+  let cSbH = NaN;
+  watchSize(sbEl, () => {
+    const h = Math.ceil(sbEl.offsetHeight);
+    if (h === cSbH) return;
+    cSbH = h;
+    live.style.setProperty('--sbh', h + 'px');
+  });
+
+  // Touch controls on? (the input module toggles the class on <html>; checked once a frame, written only on change)
+  const htmlEl = document.documentElement;
+  let cTouch = false;
+  /** When the latest announcement finishes: a hint appearing at the same moment ("GO!") waits its turn. */
+  let annEnd = 0;
 
   function rescale(): void {
     const g = clamp(Math.min(window.innerWidth / 1200, window.innerHeight / 675), 0.7, 1.5);
@@ -936,8 +1008,14 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
   function update(state: HudState): void {
     const nowMs = performance.now();
     const n = Math.min(state.viewports.length, state.players.length);
+    const touch = htmlEl.classList.contains(TOUCH_CLASS);
+    if (touch !== cTouch) {
+      cTouch = touch;
+      for (const p of panels) p.setTouch(touch);
+    }
     while (panels.length < n) {
       const p = createPanel();
+      p.setTouch(cTouch);
       panelsEl.append(p.root);
       panels.push(p);
     }
@@ -980,11 +1058,13 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
     const v = opts?.viewport;
     const target = v !== undefined && v >= 0 && v < panels.length ? panels[v].announcer : globalAnn;
     target.show(text, opts?.sub, ms);
+    annEnd = Math.max(annEnd, performance.now() + ms);
   }
 
   function hint(text: string, viewport: number, ms = HINT_DEFAULT_MS): void {
     if (viewport < 0 || viewport >= panels.length) return; // that player's panel doesn't exist (yet)
-    panels[viewport].showHint(text, ms);
+    // (only the touch layout uses the delay: there the hint sits right where the big announcements are drawn)
+    panels[viewport].showHint(text, ms, Math.max(0, Math.round(annEnd - performance.now())));
   }
 
   function feed(text: string, color?: number): void {

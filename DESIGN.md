@@ -421,3 +421,145 @@ Gamepad boost is now B or LB only (X became honk). In a 1-player game every sche
 
 The HUD builder must not edit `styles.css` or `dom.ts` (the Menu builder owns them); put new HUD styles in
 `hud.css`. Only the Game core edits `src/game/**`, including fallbacks and debug.
+
+---
+
+# v3: iPad — touch controls + iPad polish
+
+The game is live on GitHub Pages and the son plays on a 2026 iPad (Safari, landscape, ~1180x820 or
+1366x1024 CSS px, devicePixelRatio 2). He needs to play with fingers only. A Bluetooth gamepad and the
+keyboard must keep working exactly as before. Contract change in `src/types.ts`: `InputManager` gains
+`touchActive`, `layoutTouch(viewports, humans, visible)`, and `schemeOf` can return `'touch'`.
+
+## Shared rules
+
+- **When touch is on.** Touch controls are "available" on a touch device (`navigator.maxTouchPoints > 0`
+  and `matchMedia('(any-pointer: coarse)')`) or with `?touch=1` (forces them on any device for testing).
+  `touchActive` becomes true on the first `pointerdown` with `pointerType === 'touch'` (or immediately with
+  `?touch=1`). It becomes false when a game key or gamepad button is pressed, and true again on the next
+  touch.
+- **CSS hook.** While `touchActive`, `<html>` has the class `ff-touch`. Other modules adapt their layout with
+  `html.ff-touch ...` CSS rules.
+- **Visibility.** Touch controls show only during countdown and play (`layoutTouch(..., visible)` from the
+  core). Hidden in menus, pause and results, which are tapped like normal buttons.
+- **Safe areas.** Respect `env(safe-area-inset-*)` everywhere near screen edges.
+- **Ergonomics.**
+  - Thumb zones are the bottom-left and bottom-right corners of each player's control zone, about the bottom
+    55% of the height.
+  - HUD elements must not sit in those zones while `ff-touch` is on.
+  - Minimum tap target 48 px; FIRE about 104 px.
+
+## Touch controls (`src/input/**`, new `src/input/touch.ts`)
+
+- **Overlay.** A DOM overlay owned by the input module: one root `div.ff-touchui` appended to `#app`,
+  `z-index` above `#hud`, `pointer-events: none` except on its controls. Use Pointer Events with
+  `setPointerCapture`, multi-touch (several fingers at once), and `touch-action: none` on control surfaces.
+  No per-frame allocation.
+- **One zone per human viewport** (the rects from `layoutTouch`).
+  - 1 player: the zone is the whole screen.
+  - 2 players: the left half is Player 1 and the right half is Player 2.
+- **Floating joystick** in each zone's OUTER half: P1 / 1-player = left side of the zone, P2 = right side.
+  - A finger landing anywhere in that area spawns the stick base under it (radius ~64 px) with a knob that
+    follows the finger (clamped to the base radius).
+  - On release it fades to a faint resting hint at its default position.
+  - Output: `steer = x` (dead zone 0.12, rescaled, gentle curve) and `throttle = -y` (up = go, down =
+    brake/reverse).
+  - With Easy Driving the stick's up/down still works: the human-controller assist already turns
+    "no throttle" into cruise, so pass the stick's throttle through unchanged.
+- **Buttons** in each zone's INNER bottom corner (toward the screen middle in 2-player):
+  - big round **FIRE** (orange, hold = keep firing);
+  - **BOOST** (hold);
+  - small **HONK** and **RESCUE** (each a tap pulse lasting one controller update, like keyboard taps).
+  - Labels with simple icons. Pressed state = darker + scale 0.92.
+- **Pause** button (48 px, "II") pinned top-left of the whole screen (safe area), only while visible. A tap
+  sets the `menu.pause` edge.
+- **Merging.** Touch merges into the slot's controls exactly like an extra scheme (largest magnitude wins for
+  axes; OR for buttons).
+  - `schemeOf` returns `'touch'` for a slot while touch is active.
+  - 1 player: touch feeds slot 0.
+- **Robustness.** Any lost pointer (pointercancel, lostpointercapture, blur, visibility hidden,
+  `layoutTouch(..., false)`) releases its control so nothing gets stuck.
+
+## HUD & Audio (`src/ui/hud.ts`, `src/ui/hud.css`, `src/ui/minimap.ts`, `src/audio/**`)
+
+- **Layout under `html.ff-touch`:**
+  - Move each viewport's bottom-left cluster (Easy badge, power-up badge, ammo, boost) up to sit under the
+    name/score panel (top-left of the viewport).
+  - Move the mini-map from bottom-right to the top-right of the viewport, below the global scoreboard in
+    1-player. In 2-player the global scoreboard is top-right of the whole screen, so P2's map goes below it
+    and P1's map sits top-right of P1's viewport. Shrink it to min(18% of viewport height, 140 px) if needed.
+  - Nudge Player 1's name panel right by 60 px so it clears the Pause button.
+  - Keep hints and the feed out of the thumb zones: hints go just above the vertical middle.
+  - Nothing in the HUD may overlap the bottom 55% corners of a viewport.
+- **Audio on iOS.** Make `unlock()` reliable: call `ctx.resume()` inside the gesture. Also listen once,
+  document-wide, for `touchend`, `pointerup`, `click` and `keydown` (capture phase) to unlock. Re-resume when
+  the context reports `interrupted` or `suspended` after the app returns from the background
+  (`visibilitychange`).
+
+## Menu (`src/ui/menu.ts`, `garage.ts`, `trophies.ts`, `styles.css`, `dom.ts`)
+
+- **Controls card.** On a touch device the title-screen card shows a "Touch" card ("Left thumb: steer.
+  Right thumb: FIRE and BOOST. II = pause") first, plus the keyboard/gamepad cards (a gamepad can still
+  be paired).
+- **Scrolling.** Screens that can overflow scroll with a finger: `touch-action: pan-y` and
+  `-webkit-overflow-scrolling: touch` on them. The page itself never scrolls or bounces.
+- **Taps.** All tap targets are at least 48 px. Use `touch-action: manipulation` on buttons, so there is no
+  double-tap zoom or 300 ms delay.
+- **Text fields.** Name inputs use font-size of at least 16 px (smaller makes iOS zoom in). Add
+  `autocapitalize="words"`, `autocorrect="off"` and `enterkeyhint="done"`. Text inside inputs stays
+  selectable even though the page disables selection.
+- **Garage.** Drag (finger or mouse) on the 3D preview spins the boat; let go and it resumes its slow spin.
+
+## Game core (`src/main.ts`, `src/game/**`)
+
+- **When to call `input.layoutTouch(viewports, humans, visible)`:** on every state change and resize, with
+  visible = (state is countdown or playing). Same viewports as the HUD.
+- **Hints** for the `'touch'` scheme: "Drag the stick to steer. Tap FIRE to shoot!"; stuck hint "Stuck?
+  Tap RESCUE!"; no-shots hint "Tap FIRE to shoot!"; parked hint "Push the stick up to go!".
+- **Pause.** Pause when `document.visibilityState === 'hidden'` (the iPad app switcher), as for window
+  blur today.
+- **Audio.** Call `sfx.unlock()` on the first `pointerup`/`touchend` anywhere (in addition to the audio
+  module's own listener).
+- Keep `fallbacks.ts` in step with the new InputManager members.
+- **Silent test mode:** `?mute=1` mutes all game sound for that page load only. Call `sfx.setMuted(true)`
+  at boot and make the in-game mute toggle a no-op while the flag is set, but do NOT persist it. This exists
+  because the orchestrator's hidden test browser plays sound on the family's speakers.
+
+## Shell (`index.html`, `public/**`, `scripts/**`)
+
+- **Viewport meta:** `width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no,
+  viewport-fit=cover`.
+- **Page CSS** (in index.html):
+  - `html, body { overscroll-behavior: none; -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; touch-action: none; }`
+  - `input, textarea { -webkit-user-select: text; user-select: text; }`
+  - The canvas also gets `touch-action: none`. Menus override touch-action locally for scrolling.
+- **No pinch zoom:** a tiny inline script calls `preventDefault` on `gesturestart`/`gesturechange`, and on
+  `dblclick`.
+- **Rotate screen:** a static `#rotate` overlay shown only by
+  `@media (orientation: portrait) and (any-pointer: coarse)`. Full screen, the page background color, a big
+  rotating-iPad emoji or SVG and the text "Turn your iPad sideways to play!" in Fredoka. Above everything.
+- **Home screen:**
+  - `public/manifest.webmanifest`: name "Foam Fleet", short_name "Foam Fleet", `display: "fullscreen"`,
+    `orientation: "landscape"`, `start_url: "./"`, `scope: "./"`, background/theme colors from the game's sky
+    and water, and icons 192 and 512 (+ 512 maskable).
+  - Link it, and add `apple-touch-icon` 180x180, `apple-mobile-web-app-capable` /
+    `mobile-web-app-capable` = yes, `apple-mobile-web-app-status-bar-style` = black-translucent,
+    `apple-mobile-web-app-title`, and `theme-color`.
+  - All paths relative (the site lives under `/foam-fleet/`).
+- **Icons:** `scripts/make_icons.py` (Python 3 + Pillow, already installed; no new npm dependencies) draws
+  the icon procedurally with 4x supersampling into `public/icons/`.
+  - Sizes: icon-180.png, icon-192.png, icon-512.png and icon-512-maskable.png (content inside the central
+    80% safe zone).
+  - Design, matching `public/favicon.svg`: turquoise water circle, a red toy speedboat with a white cabin and
+    an orange/blue foam blaster, white wave line. Bright and readable at 60 px.
+  - Commit the PNGs (CI does not run the script).
+
+## Verification the orchestrator will run
+
+- `?touch=1` at 1180x820 and 1366x1024, 1 and 2 players:
+  - controls and HUD placement don't collide;
+  - synthetic multi-touch PointerEvents drive steer/throttle/fire/boost/honk/rescue/pause;
+  - releasing every finger zeroes the controls.
+- Portrait shows the rotate overlay.
+- Keyboard and gamepad still work; `touchActive` flips back on a key press.

@@ -9,7 +9,8 @@
  *
  * Extra helpers: start(setup?), menu(), pause(), resume().
  * URL params that start a match with no menu: ?quick=battle|race|team|practice&humans=1|2&bots=N&difficulty=easy|normal|hard
- * (also &easy=0|1 for Easy Driving, &duration=SECONDS, &laps=N, &autopilot=1, &timescale=N, &nopause=1, &fps=1).
+ * (also &easy=0|1 for Easy Driving, &duration=SECONDS, &laps=N, &autopilot=1, &timescale=N, &nopause=1, &fps=1,
+ * &mute=1 for a silent page load that is never saved).
  */
 import type { MatchSetup, ModeId } from '../types';
 
@@ -70,6 +71,10 @@ export interface FoamSnapshot {
   humans: FoamHumanSnapshot[];
   /** Modules whose real implementation threw at creation and were replaced by a stand-in. */
   fallbacks: string[];
+  /** On-screen touch controls in use right now (input.touchActive). */
+  touchActive: boolean;
+  /** Is the sound muted right now (sfx.muted)? */
+  muted: boolean;
   /** Renderer stats, handy for spotting leaks (these should not climb across rematches). */
   render: { calls: number; triangles: number; geometries: number; textures: number } | null;
 }
@@ -99,7 +104,7 @@ function emptySnapshot(): FoamSnapshot {
   return {
     state: foam.state, t: 0, fps: 0, mode: null, boats: [], darts: 0, hits: 0,
     errors: foam.errors.slice(), timeLeft: null, raceTime: null, balloons: null, teams: null, humans: [],
-    fallbacks: foam.fallbacks.slice(), render: null,
+    fallbacks: foam.fallbacks.slice(), touchActive: false, muted: false, render: null,
   };
 }
 

@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import type { Boat, BoatControls, BoatLook, FlagId, HatId, HornId, PatternId, Sfx, WorldQuery } from '../types';
 import { createBoat } from '../entities/boat';
-import { button, cssColor, el, field, makeSeg, makeSwatches, svgNode } from './dom';
+import { button, clamp, cssColor, el, field, makeSeg, makeSwatches, svgNode } from './dom';
 import type { SegItem } from './dom';
 import { CONFIG } from '../config';
 
@@ -147,6 +147,9 @@ const CALM: WorldQuery = {
 const STAGE_TARGET = new THREE.Vector3(0, 1.2, 0);
 const STAGE_DIR = new THREE.Vector3(0.5, 0.36, 0.78).normalize();
 const SPIN = 0.6; // radians per second
+const DRAG = 0.009; // radians of spin per pixel dragged (a swipe across the picture is about half a turn)
+const MAX_FLING = 9; // radians per second: the fastest a let-go boat is allowed to keep turning
+const FLING_END = 2; // how quickly a flung boat settles back to its slow spin (per second)
 
 /** Throws if the browser cannot make a WebGL context; the caller shows a friendly fallback. */
 function createPreview(host: HTMLElement, onLost: () => void): Preview {
@@ -193,8 +196,10 @@ function createPreview(host: HTMLElement, onLost: () => void): Preview {
   scene.add(pivot);
 
   const reduced = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const baseSpin = reduced ? SPIN * 0.2 : SPIN;
   let boat: Boat | null = null;
   let spin = 0.5;
+  let spinVel = baseSpin; // radians per second: the slow turntable speed, or a little more after a fling
   let t = 0;
   let hop = 0;
   let last = performance.now();
@@ -202,6 +207,9 @@ function createPreview(host: HTMLElement, onLost: () => void): Preview {
   let lost = false;
   let width = 0;
   let height = 0;
+  let dragId: number | null = null; // the pointer that is turning the boat right now
+  let dragX = 0;
+  let dragT = 0;
 
   function fit(): void {
     const w = host.clientWidth;
@@ -231,7 +239,11 @@ function createPreview(host: HTMLElement, onLost: () => void): Preview {
       return;
     }
     t += dt;
-    spin += dt * (reduced ? SPIN * 0.2 : SPIN);
+    if (dragId === null) {
+      // Let go: ease back to the slow spin (a fling carries on for a moment first).
+      spinVel += (baseSpin - spinVel) * (1 - Math.exp(-dt * FLING_END));
+      spin += dt * spinVel;
+    }
     pivot.rotation.y = spin;
     hop = Math.max(0, hop - dt * 3.2);
     pivot.scale.setScalar(1 + 0.07 * Math.sin(hop * Math.PI));
@@ -246,6 +258,45 @@ function createPreview(host: HTMLElement, onLost: () => void): Preview {
     onLost();
   };
   canvas.addEventListener('webglcontextlost', onContextLost);
+
+  // Drag (finger or mouse) to spin the boat by hand; let go and it settles back to its slow spin.
+  // The canvas has `touch-action: none` (styles.css) so a finger here turns the boat instead of scrolling the page.
+  function onDown(e: PointerEvent): void {
+    if (dragId !== null || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    dragId = e.pointerId;
+    dragX = e.clientX;
+    dragT = performance.now();
+    spinVel = 0;
+    try {
+      canvas.setPointerCapture(e.pointerId);
+    } catch {
+      /* fine: the drag still works while the pointer stays over the picture */
+    }
+    canvas.classList.add('is-dragging');
+    e.preventDefault();
+  }
+  function onMove(e: PointerEvent): void {
+    if (e.pointerId !== dragId) return;
+    const now = performance.now();
+    const dx = e.clientX - dragX;
+    const ms = Math.max(1, now - dragT);
+    dragX = e.clientX;
+    dragT = now;
+    spin += dx * DRAG;
+    spinVel = clamp(spinVel * 0.5 + ((dx * DRAG * 1000) / ms) * 0.5, -MAX_FLING, MAX_FLING); // smoothed fling speed
+  }
+  function onEnd(e: PointerEvent): void {
+    if (e.pointerId !== dragId) return; // also stops pointerup + lostpointercapture both ending the same drag
+    dragId = null;
+    canvas.classList.remove('is-dragging');
+    // Held still before letting go (or less motion wanted): no fling, just the slow spin.
+    if (reduced || performance.now() - dragT > 90) spinVel = baseSpin;
+  }
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onEnd);
+  canvas.addEventListener('pointercancel', onEnd);
+  canvas.addEventListener('lostpointercapture', onEnd);
 
   function dropBoat(): void {
     if (!boat) return;
@@ -294,6 +345,11 @@ function createPreview(host: HTMLElement, onLost: () => void): Preview {
       foamGeo.dispose();
       foamMat.dispose();
       canvas.removeEventListener('webglcontextlost', onContextLost); // we are the ones losing it
+      canvas.removeEventListener('pointerdown', onDown);
+      canvas.removeEventListener('pointermove', onMove);
+      canvas.removeEventListener('pointerup', onEnd);
+      canvas.removeEventListener('pointercancel', onEnd);
+      canvas.removeEventListener('lostpointercapture', onEnd);
       renderer.dispose();
       renderer.forceContextLoss(); // hand the WebGL context back right away
       canvas.remove();
@@ -354,8 +410,15 @@ export function createGarage(sfx: Sfx): Garage {
   const summary = el('div', 'ff-gsummary');
   summary.setAttribute('aria-live', 'polite');
   stageHost.setAttribute('aria-hidden', 'true'); // the summary line says what the picture shows
+  const spinHint = el('div', 'ff-help ff-ghint', 'Drag the boat to spin it!');
   const left = el('div', 'ff-gleft');
-  left.append(stage, nameTag, summary);
+  left.append(stage, nameTag, summary, spinHint);
+
+  /** Show the "no 3D preview" note instead of the picture (and its drag-to-spin hint). */
+  function setFallback(show: boolean): void {
+    fallback.hidden = !show;
+    spinHint.hidden = show;
+  }
 
   // right: the pickers
   function change(patch: Partial<BoatLook>): void {
@@ -452,7 +515,7 @@ export function createGarage(sfx: Sfx): Garage {
   /** Build the 3D boat for the current choices. */
   function rebuild(): void {
     if (!preview) return;
-    fallback.hidden = preview.setBoat(look, color);
+    setFallback(!preview.setBoat(look, color));
   }
 
   function open(h: GarageHost, done: () => void): void {
@@ -464,13 +527,11 @@ export function createGarage(sfx: Sfx): Garage {
     nameTag.textContent = h.title;
     refresh();
     try {
-      preview = createPreview(stageHost, () => {
-        fallback.hidden = false;
-      });
+      preview = createPreview(stageHost, () => setFallback(true));
       rebuild();
     } catch {
       preview = null;
-      fallback.hidden = false; // no WebGL: the pickers still work
+      setFallback(true); // no WebGL: the pickers still work
     }
   }
 

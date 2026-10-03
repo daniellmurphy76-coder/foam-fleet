@@ -72,6 +72,8 @@ class FoamApp {
   private acc = 0;
   private countdownT = 0;
   private countdownShown = -1;
+  /** What a pause interrupted (the 3-2-1 or the match), so Resume carries on from the same place. */
+  private pausedFrom: 'countdown' | 'playing' = 'playing';
   private readonly engineLevels: number[] = [];
 
   private fps = 0;
@@ -104,6 +106,8 @@ class FoamApp {
     this.renderer = renderer;
 
     // Services. Each is wrapped so a throwing module is logged instead of freezing the loop.
+    // (?mute=1 is handled inside audio/sfx.ts: that page load is silent, the sound buttons and the M key do
+    // nothing, and nothing is saved. The core only has to hand the same Sfx to everyone.)
     this.sfx = guard('sfx', buildOrFallback('createSfx', () => createSfx(), quietSfx), {}, V2_METHODS.sfx);
     this.input = guard(
       'input',
@@ -144,19 +148,23 @@ class FoamApp {
   start(): void {
     this.layout();
     window.addEventListener('resize', () => this.layout());
-    window.addEventListener('blur', () => {
-      // Alt-tabbing away pauses a live match.
-      if (this.state === 'playing' && !this.noPause && !foam.autopilot) this.pause();
+    // Alt-tabbing away pauses a live match. The iPad app switcher hides the page without a blur, so
+    // a page that turns hidden pauses it too.
+    window.addEventListener('blur', () => this.pauseIfAway());
+    document.addEventListener('visibilitychange', () => {
+      this.lastTime = performance.now();
+      if (document.visibilityState === 'hidden') this.pauseIfAway();
     });
-    document.addEventListener('visibilitychange', () => { this.lastTime = performance.now(); });
 
-    // Browsers only allow sound after a click or key press.
+    // Browsers only allow sound after a click or key press. iOS only counts the END of a touch
+    // (pointerup / touchend), so listen for those as well as the start.
     const unlock = (): void => {
       this.sfx.unlock();
       this.sfx.setMusic(true);
     };
-    window.addEventListener('pointerdown', unlock, { once: true });
-    window.addEventListener('keydown', unlock, { once: true });
+    for (const type of ['pointerdown', 'pointerup', 'touchend', 'keydown']) {
+      window.addEventListener(type, unlock, { once: true, capture: true, passive: true });
+    }
     this.sfx.setMusic(true);
 
     this.hookDebug();
@@ -178,6 +186,24 @@ class FoamApp {
   private setState(next: AppState): void {
     this.state = next;
     foam.state = next;
+    this.syncTouch();
+  }
+
+  /** Leaving the page pauses a live match. (?nopause=1 and autopilot are test hooks that opt out.) */
+  private pauseIfAway(): void {
+    if (this.state === 'playing' && !this.noPause && !foam.autopilot) this.pause();
+  }
+
+  /**
+   * Tell the touch controls where the human viewports are and whether to show: only during the countdown
+   * and play. Runs on every state change and every resize. startMatch/enterMenu change state before they
+   * rebuild the viewports, so a call that still sees the old viewport count waits for layout() to repeat it.
+   */
+  private syncTouch(): void {
+    const m = this.match;
+    const humans: 1 | 2 = m && this.state !== 'menu' && m.humanCount === 2 ? 2 : 1;
+    if (this.viewports.length !== humans) return;
+    this.input.layoutTouch(this.viewports, humans, this.state === 'countdown' || this.state === 'playing');
   }
 
   /** Back to the title screen (with the demo lagoon behind it). */
@@ -234,8 +260,10 @@ class FoamApp {
     this.hud.show();
   }
 
+  /** (The touch Pause button is on screen during the countdown too, so a tap there has to work.) */
   private pause(): void {
-    if (this.state !== 'playing') return;
+    if (this.state !== 'playing' && this.state !== 'countdown') return;
+    this.pausedFrom = this.state;
     this.setState('paused');
     this.sfx.setEngines([]);
     this.hud.showPause(() => this.resume(), () => this.enterMenu());
@@ -244,7 +272,7 @@ class FoamApp {
   private resume(): void {
     if (this.state !== 'paused') return;
     this.hud.hidePause();
-    this.setState('playing');
+    this.setState(this.pausedFrom);
     this.acc = 0;
     this.lastTime = performance.now();
   }
@@ -323,8 +351,11 @@ class FoamApp {
       case 'results':
         this.hud.handleMenuInput(mi);
         break;
+      case 'countdown':
+        if (mi.pause) this.pause();
+        break;
       default:
-        break; // countdown: ignore
+        break;
     }
   }
 
@@ -573,6 +604,7 @@ class FoamApp {
       }
     }
     this.orbit.setAspect(w / h);
+    this.syncTouch();
   }
 
   private trackFps(raw: number): void {
@@ -644,6 +676,8 @@ class FoamApp {
       teams: null,
       humans: [],
       fallbacks: foam.fallbacks.slice(),
+      touchActive: this.input.touchActive === true,
+      muted: this.sfx.muted === true,
       render: {
         calls: info.render.calls,
         triangles: info.render.triangles,

@@ -11,10 +11,12 @@ import {
   installUnlock,
   makeSeg,
   makeSwatches,
+  silentTestMode,
   stepFocus,
   storeGet,
   storeSet,
   svgNode,
+  touchAvailable,
 } from './dom';
 import { createGarage, defaultLook, describeLook, sanitizeLook } from './garage';
 import { TROPHIES, loadShelf, loadShelfColors } from './trophies';
@@ -217,6 +219,8 @@ type Screen = 'title' | 'setup' | 'garage' | 'shelf';
 export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
   root.classList.add('ff-ui');
   installUnlock(sfx);
+  const touchDevice = touchAvailable(); // an iPad (or ?touch=1): show the Touch card, hide the keyboard focus ring
+  const silent = silentTestMode(); // ?mute=1: the sound button is switched off so a test page stays quiet
 
   let visible = false;
   let started = false; // stops a double-click from starting the match twice
@@ -300,6 +304,17 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     return card;
   }
   const controls = el('div', 'ff-controls');
+  if (touchDevice) {
+    // Fingers first on an iPad; the keyboard and gamepad cards stay (a gamepad can still be paired).
+    controls.classList.add('ff-controls--touch');
+    const touchCard = keysCard('Touch', [
+      { keys: ['Left thumb'], text: 'Steer' },
+      { keys: ['Right thumb'], text: 'FIRE and BOOST' },
+      { keys: ['II'], text: 'Pause' },
+    ]);
+    touchCard.classList.add('ff-keys--touch');
+    controls.append(touchCard);
+  }
   controls.append(
     keysCard('Player 1 keys', [
       { keys: ['W', 'A', 'S', 'D'], text: 'Drive' },
@@ -444,6 +459,10 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     input.maxLength = NAME_MAX;
     input.autocomplete = 'off';
     input.spellcheck = false;
+    // iPad keyboard: capital letters for names, no auto-correct, and a "done" key that closes it.
+    input.setAttribute('autocapitalize', 'words');
+    input.setAttribute('autocorrect', 'off');
+    input.setAttribute('enterkeyhint', 'done');
     input.placeholder = `Player ${i + 1}`;
     input.setAttribute('data-nav', '');
     input.setAttribute('aria-label', `Player ${i + 1} name`);
@@ -586,7 +605,9 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     soundText.textContent = m ? 'Sound: Off' : 'Sound: On';
     soundIcon.classList.toggle('is-off', m);
   }
+  soundBtn.disabled = silent;
   soundBtn.addEventListener('click', () => {
+    if (silent) return; // silent test mode: the game stays muted for this page load
     sfx.setMuted(!sfx.muted);
     refreshSound();
     if (!sfx.muted) sfx.uiSelect();
@@ -817,7 +838,8 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     changed();
     menuEl.hidden = false;
     visible = true;
-    menuEl.classList.add('ff-nav');
+    // Keyboard and gamepad users get the focus ring right away; on an iPad it waits for a key or button press.
+    menuEl.classList.toggle('ff-nav', !touchDevice);
     refreshSound();
     showScreen('title');
   }

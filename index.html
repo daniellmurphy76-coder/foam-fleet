@@ -2,23 +2,104 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
     <title>Foam Fleet</title>
+    <meta name="theme-color" content="#18a0c8" />
     <link rel="icon" href="/favicon.svg" />
+    <!-- Home screen (iPad "Add to Home Screen" / Android install): full screen, no browser bars. -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/icons/icon-180.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Foam Fleet" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@400;600;700&display=swap" rel="stylesheet" />
     <style>
-      html, body { margin: 0; height: 100%; overflow: hidden; background: #0b2a3a; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #0b2a3a;
+        overscroll-behavior: none;
+        -webkit-user-select: none;
+        user-select: none;
+        -webkit-touch-callout: none;
+        -webkit-tap-highlight-color: transparent;
+        touch-action: none; /* menus that scroll set pan-y on themselves */
+      }
+      input, textarea { -webkit-user-select: text; user-select: text; }
       #app { position: fixed; inset: 0; }
-      #app canvas { display: block; width: 100%; height: 100%; }
+      #app canvas { display: block; width: 100%; height: 100%; touch-action: none; }
       #hud, #menu { position: absolute; inset: 0; pointer-events: none; }
+
+      /* "Turn your iPad sideways": covers everything while a touch device is held upright. */
+      #rotate {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 2147483647;
+        box-sizing: border-box;
+        padding: max(24px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right))
+          max(24px, env(safe-area-inset-bottom)) max(24px, env(safe-area-inset-left));
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 28px;
+        background: #0b2a3a;
+        color: #fff;
+        font-family: 'Fredoka', 'Arial Rounded MT Bold', system-ui, sans-serif;
+        font-weight: 700;
+        text-align: center;
+      }
+      #rotate p { margin: 0; font-size: clamp(26px, 6vw, 44px); line-height: 1.2; }
+      #rotate svg { width: min(46vw, 260px); height: auto; animation: ff-turn 3s ease-in-out infinite; }
+      @keyframes ff-turn {
+        0%, 15% { transform: rotate(0deg); }
+        55%, 90% { transform: rotate(-90deg); }
+        100% { transform: rotate(0deg); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #rotate svg { animation: none; transform: rotate(-90deg); }
+      }
+      @media (orientation: portrait) and (any-pointer: coarse) {
+        #rotate { display: flex; }
+      }
+      /* ?touch=1 (testing) forces touch controls on any device, so let it show the overlay too. */
+      @media (orientation: portrait) {
+        html.ff-touch-forced #rotate { display: flex; }
+      }
     </style>
+    <script>
+      // Safari on iPad ignores user-scalable=no: block pinch zoom and double-tap zoom ourselves.
+      ['gesturestart', 'gesturechange', 'dblclick'].forEach(function (type) {
+        document.addEventListener(type, function (e) { e.preventDefault(); }, { passive: false });
+      });
+      try {
+        if (new URLSearchParams(location.search).get('touch') === '1') {
+          document.documentElement.classList.add('ff-touch-forced');
+        }
+      } catch (e) { /* no URLSearchParams: the overlay just follows the media query */ }
+    </script>
   </head>
   <body>
     <div id="app">
       <div id="hud"></div>
       <div id="menu"></div>
+    </div>
+    <div id="rotate" role="alert">
+      <!-- A little iPad (the game's boat on its screen) that turns from upright to sideways. -->
+      <svg viewBox="0 0 120 120" aria-hidden="true">
+        <rect x="26" y="8" width="68" height="104" rx="11" fill="#eef7fb" />
+        <rect x="32" y="15" width="56" height="90" rx="5" fill="#18a0c8" />
+        <path d="M40 66h40l-6 9H46z" fill="#ff4533" />
+        <rect x="55" y="55" width="11" height="11" rx="2" fill="#fff" />
+        <rect x="63" y="58" width="15" height="5" rx="2.5" fill="#ffa21f" />
+        <path d="M34 81c5 3.5 9 3.5 13 0s9-3.5 13 0 9 3.5 13 0 8-2.5 13 0" stroke="#fff" stroke-width="3" fill="none" stroke-linecap="round" />
+        <circle cx="60" cy="109" r="1.8" fill="#0b2a3a" opacity="0.5" />
+      </svg>
+      <p>Turn your iPad sideways to play!</p>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

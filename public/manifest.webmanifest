@@ -1,0 +1,16 @@
+{
+  "name": "Foam Fleet",
+  "short_name": "Foam Fleet",
+  "description": "Toy speedboats with foam-dart blasters. Race, battle and pop balloons around a sunny lagoon.",
+  "display": "fullscreen",
+  "orientation": "landscape",
+  "start_url": "./",
+  "scope": "./",
+  "background_color": "#0b2a3a",
+  "theme_color": "#18a0c8",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

@@ -7,7 +7,12 @@ import type { HornId, Sfx } from '../types';
  *  - `tone()` plays one pitched beep (an oscillator with a volume envelope).
  *  - `noise()` plays a burst of filtered static (splashes, whooshes, thwips).
  *  - Each sound below (fire, hit, ...) is just a few of those stacked together.
- *  - Everything is a quiet no-op until `unlock()` has run (browsers need a click first).
+ *  - Everything is a quiet no-op until `unlock()` has run (browsers need a click or a tap first).
+ *
+ * One game page = one AudioContext = one master gain, and mute turns that gain to zero, so "Sound: Off"
+ * silences every sound this page can make. A sound that survives it is another copy of the game running
+ * somewhere else (another tab, or a test browser). Two things below keep copies in step: the mute choice is
+ * shared between tabs of the same browser, and a page opened with `?mute=1` is silent and never saves anything.
  */
 
 const MUTE_KEY = 'foamfleet.muted';
@@ -109,11 +114,30 @@ function writeMuted(m: boolean): void {
   }
 }
 
+/** `?mute=1`: the silent test mode. Quiet for this page load only; the sound buttons cannot undo it. */
+function readForcedMute(): boolean {
+  try {
+    return new URLSearchParams(window.location.search).get('mute') === '1';
+  } catch {
+    return false;
+  }
+}
+
+/** Safari also reports 'interrupted' (a call, Siri, switching apps), which the DOM typings leave out. */
+function stateOf(ctx: AudioContext): string {
+  return ctx.state as string;
+}
+
+/** Any of these counts as "the player touched the game" for browsers that keep sound locked until then. */
+const GESTURE_EVENTS = ['touchend', 'pointerup', 'click', 'keydown'];
+
 export function createSfx(): Sfx {
   let g: Graph | null = null;
-  let muted = readMuted();
+  const forcedMute = readForcedMute();
+  let muted = forcedMute || readMuted();
   let musicOn = true;
   let voices = 0;
+  let lifecycleWatched = false;
 
   // music scheduler state
   let musicTimer = 0;
@@ -557,17 +581,60 @@ export function createSfx(): Sfx {
 
   // ───────────── public API ─────────────
 
-  function unlock(): void {
+  /**
+   * Wake the audio context if it is asleep. Safari only allows this inside a tap or key press, so the
+   * gesture handlers call it directly (no awaiting first). A refused resume is fine: the next tap tries again.
+   */
+  function resumeNow(): void {
+    const a = g;
+    if (!a) return;
     try {
-      if (g) {
-        if (g.ctx.state !== 'running') void g.ctx.resume().catch(() => undefined);
-        return;
+      const s = stateOf(a.ctx);
+      if (s === 'running' || s === 'closed') return;
+      void a.ctx.resume().catch(() => undefined);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** Go quiet when the page is hidden, and wake up when it comes back (iPad app switcher, locked screen). */
+  function onVisibility(): void {
+    const a = g;
+    if (!a) return;
+    try {
+      if (document.hidden) {
+        if (stateOf(a.ctx) === 'running') void a.ctx.suspend().catch(() => undefined);
+      } else {
+        resumeNow();
       }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function watchLifecycle(ctx: AudioContext): void {
+    if (lifecycleWatched) return;
+    lifecycleWatched = true;
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('pageshow', onVisibility); // coming back from the back/forward cache
+    // iOS drops the context to 'interrupted' or 'suspended' on its own; try to wake it right away.
+    ctx.addEventListener('statechange', () => {
+      if (!document.hidden) resumeNow();
+    });
+  }
+
+  function unlock(): void {
+    if (g) {
+      resumeNow();
+      return;
+    }
+    let ctx: AudioContext | null = null;
+    try {
       const Ctor =
         window.AudioContext ??
         (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
       if (!Ctor) return;
-      const ctx = new Ctor();
+      ctx = new Ctor();
 
       const master = ctx.createGain();
       master.gain.value = muted ? 0 : MASTER_VOLUME;
@@ -593,18 +660,47 @@ export function createSfx(): Sfx {
       for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
 
       g = { ctx, master, sfx, music, engineBus, noise: noiseBuf };
-      void ctx.resume().catch(() => undefined);
+    } catch {
+      // Audio is optional; the game carries on silently. Close the half-built context so a retry on the
+      // next tap never leaves two of them alive (two contexts would mean doubled sound that mute can't reach).
+      g = null;
+      if (ctx) void ctx.close().catch(() => undefined);
+      return;
+    }
+    try {
+      resumeNow(); // we are inside the tap or key press that called us: this is the moment iOS allows it
+      // Older iOS opens the speakers only once something has actually played inside a gesture: one silent sample.
+      const prime = ctx.createBufferSource();
+      prime.buffer = ctx.createBuffer(1, 1, 22050);
+      prime.connect(ctx.destination);
+      prime.start(0);
       applyMusic();
+      watchLifecycle(ctx);
+    } catch {
+      /* the graph is built; a failed extra just means a slower start */
+    }
+  }
 
-      // Be polite: go silent when the tab is hidden.
-      document.addEventListener('visibilitychange', () => {
-        const a = g;
-        if (!a) return;
-        if (document.hidden) void a.ctx.suspend().catch(() => undefined);
-        else void a.ctx.resume().catch(() => undefined);
+  /**
+   * Listen document-wide (capture phase, so nothing can swallow it) for the first tap or key press, and keep
+   * listening: the handler is a one-line check once the context is running, and it is what wakes the sound up
+   * again after iOS interrupts it.
+   */
+  function installGestureUnlock(): void {
+    try {
+      const onGesture = (): void => {
+        if (g && stateOf(g.ctx) === 'running') return;
+        unlock();
+      };
+      for (const type of GESTURE_EVENTS) document.addEventListener(type, onGesture, { capture: true, passive: true });
+      // One mute choice for every copy of the game open in this browser (a second tab, a test window).
+      window.addEventListener('storage', (e) => {
+        if (forcedMute || e.key !== MUTE_KEY) return;
+        if (e.newValue !== '1' && e.newValue !== '0') return; // a cleared or removed key says nothing about what the player wants
+        applyMuted(e.newValue === '1');
       });
     } catch {
-      g = null; // audio is optional; the game carries on silently
+      /* no document (should not happen in a browser): unlock() is still callable by hand */
     }
   }
 
@@ -657,9 +753,9 @@ export function createSfx(): Sfx {
     }
   }
 
-  function setMuted(m: boolean): void {
+  /** Apply a mute choice to this page (no saving: callers decide that). */
+  function applyMuted(m: boolean): void {
     muted = m;
-    writeMuted(m);
     const a = g;
     if (!a) return;
     try {
@@ -667,6 +763,12 @@ export function createSfx(): Sfx {
     } catch {
       /* ignore */
     }
+  }
+
+  function setMuted(m: boolean): void {
+    if (forcedMute) return; // a ?mute=1 page stays silent and never saves anything
+    applyMuted(m);
+    writeMuted(m);
   }
 
   function setMusic(on: boolean): void {
@@ -677,6 +779,8 @@ export function createSfx(): Sfx {
       /* ignore */
     }
   }
+
+  installGestureUnlock();
 
   return {
     unlock,

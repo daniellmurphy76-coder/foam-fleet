@@ -72,6 +72,33 @@ export function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
+/** `?name=1` in the page address (the test switches: `touch=1`, `mute=1`). */
+function urlFlag(name: string): boolean {
+  try {
+    return new URLSearchParams(window.location.search).get(name) === '1';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A touch device (iPad, phone, touchscreen laptop), or `?touch=1` to pretend on any device.
+ * Same test the input module uses, so the menu and the touch controls always agree.
+ */
+export function touchAvailable(): boolean {
+  if (urlFlag('touch')) return true;
+  try {
+    return navigator.maxTouchPoints > 0 && window.matchMedia('(any-pointer: coarse)').matches;
+  } catch {
+    return false;
+  }
+}
+
+/** `?mute=1`: silent test mode. The game keeps quiet for that page load and the sound buttons do nothing. */
+export function silentTestMode(): boolean {
+  return urlFlag('mute');
+}
+
 // localStorage can throw (private windows, blocked cookies), so always go through these.
 export function storeGet(key: string): string | null {
   try {
@@ -205,14 +232,15 @@ export function makeSwatches(
 }
 
 // ───────────── audio unlock ─────────────
-// Browsers only allow sound after a click or key press, so listen for the first one.
+// Browsers only allow sound after a click, a key press or a tap, so listen for the first one.
+// iPad Safari counts the END of a touch (not its start), so pointerup, touchend and click are listed too.
 const unlockInstalled = new WeakSet<Sfx>();
+const UNLOCK_EVENTS = ['pointerdown', 'pointerup', 'touchend', 'click', 'keydown'];
 export function installUnlock(sfx: Sfx): void {
   if (unlockInstalled.has(sfx)) return;
   unlockInstalled.add(sfx);
   const go = (): void => sfx.unlock(); // safe to call over and over
-  window.addEventListener('pointerdown', go, true);
-  window.addEventListener('keydown', go, true);
+  for (const type of UNLOCK_EVENTS) window.addEventListener(type, go, { capture: true, passive: true });
 }
 
 // ───────────── keyboard / gamepad focus navigation ─────────────

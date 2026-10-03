@@ -1,17 +1,77 @@
 /*
- * Foam Fleet HUD, v2 additions (loaded after styles.css, which still holds the v1 HUD):
+ * Foam Fleet HUD, v2 + v3 additions (loaded after styles.css, which still holds the v1 HUD):
  * mini-map, coaching hints, Easy Driving badge, Team Up banner, Balloon Pop counter,
- * team markers, and the results-screen extras (team banner, trophy celebration).
+ * team markers, the results-screen extras (team banner, trophy celebration), iPad safe areas,
+ * and the touch layout (everything under `html.ff-touch`, see the section near the end).
  * Same rules as before: --u scales one player's panel, --g scales the whole HUD.
  */
+
+/* ───────────────────────── safe areas (iPad corners, status bar, home bar) ───────────────────────── */
+
+:root {
+  --ff-sat: env(safe-area-inset-top, 0px);
+  --ff-sar: env(safe-area-inset-right, 0px);
+  --ff-sab: env(safe-area-inset-bottom, 0px);
+  --ff-sal: env(safe-area-inset-left, 0px);
+}
+/*
+ * The shared pieces (timer, team pills, scoreboard, feed) live in the safe part of the screen. The player
+ * panels must NOT move with them: their rectangles come from the game in window pixels, so they cancel the shift.
+ */
+.ff-live {
+  inset: var(--ff-sat) var(--ff-sar) var(--ff-sab) var(--ff-sal);
+}
+.ff-panels {
+  inset: calc(var(--ff-sat) * -1) calc(var(--ff-sar) * -1) calc(var(--ff-sab) * -1) calc(var(--ff-sal) * -1);
+}
+/*
+ * Inside a panel, anything near a screen edge adds the inset itself. --pl / --pr are only non-zero for a panel
+ * that touches the left / right edge of the screen (hud.ts adds .at-l / .at-r), so the split-screen divider
+ * never gets a margin.
+ */
+.ff-vp {
+  --ub: var(--u); /* the panel scale, kept under a second name so a child can re-define --u */
+  --pl: 0px;
+  --pr: 0px;
+  --cs: 0.75; /* touch layout: how much smaller the stats cluster is drawn */
+  --tagtop: calc(16px * var(--u) + var(--ff-sat));
+  --tagx: calc(16px * var(--u) + var(--pl));
+}
+.ff-vp.at-l {
+  --pl: var(--ff-sal);
+}
+.ff-vp.at-r {
+  --pr: var(--ff-sar);
+}
+.ff-live.is-split .ff-vp {
+  --cs: 0.9;
+  --tagtop: calc(92px * var(--g) + var(--ff-sat)); /* just below the timer on the divider */
+}
+.ff-tag {
+  top: var(--tagtop);
+  left: var(--tagx);
+}
+.ff-live.is-split .ff-tag {
+  top: var(--tagtop); /* v1 has a rule of this strength for the split-screen offset; this one wins by coming later */
+}
+.ff-arrow {
+  top: calc(92px * var(--g) + var(--ff-sat));
+}
+.ff-live.is-split .ff-arrow {
+  top: calc(16px * var(--u) + var(--ff-sat));
+}
+.ff-cluster {
+  left: var(--tagx);
+  bottom: calc(16px * var(--u) + var(--ff-sab));
+}
 
 /* ───────────────────────── mini-map ───────────────────────── */
 
 /* JS sets the canvas size (CSS px) and --mapd on the panel; this just parks it bottom-right. */
 .ff-vp .ff-map {
   position: absolute;
-  right: calc(16px * var(--u));
-  bottom: calc(16px * var(--u));
+  right: calc(16px * var(--u) + var(--pr));
+  bottom: calc(16px * var(--u) + var(--ff-sab));
   border-radius: 50%;
   box-shadow: 0 4px 0 rgba(6, 23, 61, 0.5), 0 8px 14px rgba(0, 0, 0, 0.25);
 }
@@ -21,9 +81,9 @@
 /* The strip between the bottom-left cluster (~300u wide) and the mini-map, so a hint never covers either. */
 .ff-hintzone {
   position: absolute;
-  left: calc(322px * var(--u));
-  right: calc(var(--mapd, 110px) + 16px * var(--u) + 12px);
-  bottom: calc(16px * var(--u));
+  left: calc(322px * var(--u) + var(--pl));
+  right: calc(var(--mapd, 110px) + 16px * var(--u) + 12px + var(--pr));
+  bottom: calc(16px * var(--u) + var(--ff-sab));
   min-width: calc(160px * var(--u));
   display: flex;
   justify-content: center;
@@ -32,8 +92,8 @@
 /* One big window: there is room to keep the hint truly centered (equal space each side). */
 @media (min-width: 1100px) {
   .ff-live:not(.is-split) .ff-hintzone {
-    left: max(322px * var(--u), var(--mapd, 110px) + 16px * var(--u) + 12px);
-    right: max(322px * var(--u), var(--mapd, 110px) + 16px * var(--u) + 12px);
+    left: calc(max(322px * var(--u), var(--mapd, 110px) + 16px * var(--u) + 12px) + var(--pl));
+    right: calc(max(322px * var(--u), var(--mapd, 110px) + 16px * var(--u) + 12px) + var(--pr));
   }
 }
 .ff-hint {
@@ -175,7 +235,7 @@
 .ff-balloons {
   position: absolute;
   top: calc(10px * var(--g));
-  left: calc(50% + 102px * var(--g));
+  left: calc(50% + 132px * var(--g)); /* clears the stopwatch, which is wider than the battle timer ("10:00.0") */
   display: flex;
   align-items: center;
   gap: calc(8px * var(--g));
@@ -399,6 +459,101 @@
 .ff-award-desc {
   font-size: 0.85em;
   font-weight: 500;
+}
+
+/* ───────────────────────── touch layout (html.ff-touch) ───────────────────────── */
+
+/*
+ * With on-screen touch controls the thumbs live in the bottom corners of each player's half of the screen, so
+ * nothing in the HUD may sit in the bottom ~45% of a panel's corners. Everything that used to be down there
+ * (stats cluster, mini-map, hints) moves up. In "u" terms a panel is at least ~800u wide and ~600u tall:
+ *   - top-left stack: name + score (about 125u tall), then the stats cluster under it, drawn a little smaller;
+ *   - top-right: the global scoreboard (made compact), then the mini-map under it;
+ *   - hints: just above the reticle, in the middle column between those two stacks.
+ * These rules all start with `html.ff-touch`, which makes them stronger than the v1 rules, so order does not matter.
+ */
+
+/* Player 1 (the panel at the left edge) clears the Pause button, which sits at the top-left of the whole screen. */
+html.ff-touch .ff-vp.at-l {
+  --tagx: calc(16px * var(--u) + var(--pl) + 60px);
+}
+
+/* Race: place, lap and gate share one line, so the name/score stack is as short as in battle. */
+html.ff-touch .ff-racebox {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 calc(12px * var(--u));
+  max-width: 100%;
+}
+/* One player: the Pause nudge plus that one line can reach the race clock, so wrap before it. */
+html.ff-touch .ff-live:not(.is-split) .ff-vp .ff-tag {
+  max-width: calc(50% - var(--tagx) - 130px * var(--g));
+}
+
+/* The stats cluster: a narrow column right under the name/score stack (JS measures the stack as --tagh). */
+html.ff-touch .ff-cluster {
+  --u: calc(var(--ub) * var(--cs));
+  top: calc(var(--tagtop) + var(--tagh, calc(125px * var(--ub))) + 10px * var(--ub));
+  bottom: auto;
+  display: grid;
+  grid-template-columns: max-content;
+  justify-items: start;
+  gap: calc(8px * var(--u));
+}
+
+/* The scoreboard gets compact rows, so the mini-map fits under it above the thumb zone. */
+html.ff-touch .ff-sb {
+  gap: 2px;
+  font-size: calc(17px * var(--g));
+}
+html.ff-touch .ff-sbrow {
+  padding: 0.04em 0.6em 0.1em 0.35em;
+  border-width: 1px;
+  line-height: 1.2;
+}
+
+/* Mini-map: top-right of the panel, under the scoreboard (--sbh is the scoreboard's height, measured in JS). */
+html.ff-touch .ff-vp .ff-map {
+  top: calc(var(--ff-sat) + 14px * var(--g) + var(--sbh, calc(170px * var(--g))) + 8px);
+  right: calc(14px * var(--g) + var(--pr));
+  bottom: auto;
+}
+/* 2 players: the scoreboard is over Player 2's side, so Player 1's map goes just under the clock instead. */
+html.ff-touch .ff-live.is-split .ff-vp:first-child .ff-map {
+  top: calc(var(--ff-sat) + 92px * var(--g));
+  right: calc(10px * var(--g));
+}
+
+/* Hints: just above the reticle (which is centered at 46% down), in the middle column. */
+html.ff-touch .ff-live .ff-hintzone {
+  left: 33%;
+  right: 33%;
+  bottom: calc(54% + 50px * var(--u));
+  min-width: 0;
+}
+html.ff-touch .ff-live.is-split .ff-hintzone {
+  left: 26%;
+  right: 26%;
+}
+html.ff-touch .ff-hint {
+  font-size: calc(20px * var(--u));
+}
+/* If a big announcement ("GO!") is still showing, hud.ts sets --hd so the hint waits for it to finish. */
+html.ff-touch .ff-hint.on {
+  animation-delay: var(--hd, 0ms);
+}
+
+/* 2 players: the shared event feed hangs under both name/cluster stacks, in the middle of the screen. */
+html.ff-touch .ff-live.is-split .ff-feed {
+  top: calc(92px * var(--g) + 290px * var(--uf));
+}
+
+/* The results card's middle part scrolls with a finger (the card itself does not). */
+.ff-res-mid {
+  touch-action: pan-y;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
 }
 
 /* ───────────────────────── animations ───────────────────────── */

@@ -111,8 +111,8 @@ export function fallbackMenu(root: HTMLElement, defaults: () => MatchSetup): Men
 export function fallbackInput(): InputManager {
   const idle = idleController('human');
   return {
-    poll: noop, humanController: () => idle, menu: EMPTY_MENU, schemeOf: () => 'keysA', gamepadCount: () => 0,
-    rumble: noop, dispose: noop,
+    poll: noop, humanController: () => idle, menu: EMPTY_MENU, schemeOf: () => 'keysA', touchActive: false,
+    layoutTouch: noop, gamepadCount: () => 0, rumble: noop, dispose: noop,
   };
 }
 

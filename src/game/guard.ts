@@ -19,7 +19,7 @@ export const V2_METHODS = {
   sfx: ['pop', 'honk', 'rescue', 'trophy'],
   fx: ['pop', 'notes'],
   hud: ['hint'],
-  input: ['schemeOf'],
+  input: ['schemeOf', 'layoutTouch'],
 } as const;
 
 /**

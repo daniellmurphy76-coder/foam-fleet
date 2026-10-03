@@ -26,7 +26,7 @@ export interface PlayerHost {
   readonly cams: readonly ChaseCamera[];
 }
 
-type Scheme = 'keysA' | 'keysB' | 'gamepad';
+type Scheme = 'keysA' | 'keysB' | 'gamepad' | 'touch';
 type HintKind = 'start' | 'shoot' | 'go' | 'stuck';
 
 /** Slower than this while the player wants to go = stuck. */
@@ -53,27 +53,37 @@ const STEER_TEXT: Record<Scheme, string> = {
   keysA: 'Steer with A and D',
   keysB: 'Steer with the arrow keys',
   gamepad: 'Left stick to steer',
+  touch: 'Drag the stick to steer',
 };
 const SHOOT_TEXT: Record<Scheme, string> = {
   keysA: 'Space to shoot!',
   keysB: 'Enter to shoot!',
   gamepad: 'A to shoot!',
+  touch: 'Tap FIRE to shoot!',
 };
 const SHOOT_NOW_TEXT: Record<Scheme, string> = {
   keysA: 'Press SPACE to shoot!',
   keysB: 'Press ENTER to shoot!',
   gamepad: 'Press A to shoot!',
+  touch: 'Tap FIRE to shoot!',
 };
 const GO_TEXT: Record<Scheme, string> = {
   keysA: 'Hold W to go!',
   keysB: 'Hold the UP arrow to go!',
   gamepad: 'Hold the right trigger to go!',
+  touch: 'Push the stick up to go!',
 };
 const STUCK_TEXT: Record<Scheme, string> = {
   keysA: 'Stuck? Press R!',
   keysB: 'Stuck? Press the / key!',
   gamepad: 'Stuck? Press Y!',
+  touch: 'Stuck? Tap RESCUE!',
 };
+
+/** "Steer with A and D, Space to shoot!" is one line; on touch the two halves read better as two sentences. */
+function joinHint(scheme: Scheme, steer: string, rest: string): string {
+  return scheme === 'touch' ? `${steer}. ${rest.charAt(0).toUpperCase()}${rest.slice(1)}` : `${steer}, ${rest}`;
+}
 
 export class HumanPlayer {
   // What this player did (Trophy Shelf).
@@ -230,14 +240,14 @@ export class HumanPlayer {
   private startText(scheme: Scheme): string {
     const steer = STEER_TEXT[scheme];
     switch (this.host.setup.mode) {
-      case 'race': return `${steer}, drive through the gates!`;
-      case 'practice': return `${steer}, drive into balloons to pop them!`;
-      default: return `${steer}, ${SHOOT_TEXT[scheme]}`;
+      case 'race': return joinHint(scheme, steer, 'drive through the gates!');
+      case 'practice': return joinHint(scheme, steer, 'drive into balloons to pop them!');
+      default: return joinHint(scheme, steer, SHOOT_TEXT[scheme]);
     }
   }
 
   private scheme(): Scheme {
     const s = this.host.input.schemeOf(this.slot as 0 | 1, this.host.setup.humans);
-    return s === 'keysB' || s === 'gamepad' ? s : 'keysA';
+    return s === 'keysB' || s === 'gamepad' || s === 'touch' ? s : 'keysA';
   }
 }
