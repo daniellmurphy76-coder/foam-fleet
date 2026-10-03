@@ -72,6 +72,12 @@ export function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
+/** The words of a failed online request (the session already made them kid-friendly), or a safe default. */
+export function errorText(err: unknown, fallback = 'Something went wrong. Please try again!'): string {
+  const text = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
+  return text.trim() || fallback;
+}
+
 /** `?name=1` in the page address (the test switches: `touch=1`, `mute=1`). */
 function urlFlag(name: string): boolean {
   try {

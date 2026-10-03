@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { CONFIG } from '../config';
 import { probeSolid } from '../ai/steering';
 import { SHARK_ID_BASE } from '../types';
-import type { AimTarget, BotDifficulty, Boat, Effects, ModeId, SharkBump, SharkTag, Sharks, World } from '../types';
+import type { AimTarget, BotDifficulty, Boat, Effects, ModeId, SharkBump, SharkNetState, SharkTag, Sharks, World } from '../types';
 import { MEGA_SCALE, NOSE_Z } from './sharkModel';
 import { createSharkRig } from './sharkRig';
 import type { SharkPose, SharkRig } from './sharkRig';
@@ -77,6 +77,14 @@ const GATE_KEEP_OUT = 16;
 const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
 const rand = (a: number, b: number): number => a + Math.random() * (b - a);
 
+// ───────────────────────────── The network snapshot (private format) ─────────────────────────────
+// A flat number array:  [mega health (-1 = not out), mega max health, waves left, entry count, ...entries]
+// One entry per shark that is in the lagoon (STRIDE numbers, whole numbers so they pack small on the wire):
+//   slot, phase, mode + 4 * wave, x (cm), z (cm), heading (mrad), speed (cm/s), turn rate (mrad/s),
+//   appear (1/1000), progress through the lunge/flip/dive (1/1000)
+const NET_HEAD = 4;
+const NET_STRIDE = 10;
+
 interface KeepOut {
   x: number;
   z: number;
@@ -102,6 +110,14 @@ class SharkSystem implements Sharks {
   private clock = 0;
   private t = 0;
   private disposed = false;
+
+  // Online guest: set by the first applyNetState. From then on the sharks are puppets of the host's snapshots.
+  private netMode = false;
+  private netWaveLeft = 0;
+  private netNearNext = false;
+  /** Where each slot's entry starts in the previous / next snapshot (-1 = that shark is not in it). */
+  private readonly netPrevAt = new Int32Array(SLOTS);
+  private readonly netNextAt = new Int32Array(SLOTS);
 
   // Scratch space, reused every frame.
   private readonly nrm = new THREE.Vector3();
@@ -149,6 +165,7 @@ class SharkSystem implements Sharks {
   // ───────────────────────────── The public face ─────────────────────────────
 
   get waveLeft(): number {
+    if (this.netMode) return this.netWaveLeft;
     let n = 0;
     for (let i = 0; i < SLOTS; i++) {
       const s = this.sharks[i];
@@ -196,7 +213,12 @@ class SharkSystem implements Sharks {
     this.separate(step);
     this.checkBumps();
 
-    // Draw everyone, and refresh the hit spheres and the mini-map dots.
+    this.draw(step);
+    return bumps;
+  }
+
+  /** Draw everyone, and refresh the hit spheres and the mini-map dots (the half of update() a guest runs too). */
+  private draw(step: number): void {
     this.rig.begin();
     const dots = this.mapDots;
     dots.length = 0;
@@ -215,7 +237,6 @@ class SharkSystem implements Sharks {
     }
     this.rig.end();
     this.refreshTargets();
-    return bumps;
   }
 
   hit(sharkId: number, boatId: number, direction: THREE.Vector3): SharkTag | null {
@@ -276,6 +297,186 @@ class SharkSystem implements Sharks {
       this.edgeSpot(s, base + (TAU * k) / free.length + rand(-0.06, 0.06));
     }
     this.refreshTargets();
+  }
+
+  // ───────────────────────────── Online ─────────────────────────────
+
+  /** Host: every shark in the lagoon as a flat list of whole numbers (the format is described at the top of the file). */
+  netState(): SharkNetState {
+    const out: number[] = [this.megaOut ? this.megaInfo.health : -1, this.megaInfo.maxHealth, this.waveLeft, 0];
+    let n = 0;
+    for (let i = 0; i < SLOTS; i++) {
+      const s = this.sharks[i];
+      if (s.phase === PHASE_OFF) continue;
+      n++;
+      out.push(
+        i,
+        s.phase,
+        s.mode + (s.wave ? 4 : 0),
+        Math.round(s.x * 100),
+        Math.round(s.z * 100),
+        Math.round(wrapPi(s.heading) * 1000),
+        Math.round(s.speed * 100),
+        Math.round(s.turnVel * 1000),
+        Math.round(clamp(s.appear, 0, 1) * 1000),
+        Math.round(clamp(s.seqDur > 0 ? s.seqT / s.seqDur : 0, 0, 1) * 1000),
+      );
+    }
+    out[3] = n;
+    return out;
+  }
+
+  /**
+   * Guest: show the sharks between two host snapshots. Only the render half of update() runs (no brains, no bumps).
+   * Where a shark is comes from blending the two snapshots; what it is doing (swimming, lunging, flipping...) comes
+   * from the nearer one, and when that changes the captured start values are set up here and the splashes play.
+   */
+  applyNetState(prev: SharkNetState, next: SharkNetState, alpha: number, t: number, dt: number): void {
+    if (this.disposed) return;
+    this.netMode = true;
+    this.t = t;
+    const step = dt > 0 ? Math.min(dt, MAX_STEP) : 0;
+    this.clock += step;
+    const k = alpha < 0 ? 0 : alpha > 1 ? 1 : alpha;
+    // Switch to the next snapshot's view of things at the halfway point, and back only well before it, so a wobble
+    // in the caller's clock never makes a shark flip back and forth (and replay its splash).
+    if (k >= 0.5) this.netNearNext = true;
+    else if (k < 0.3) this.netNearNext = false;
+    const near = this.netNearNext ? next : prev;
+    const prevAt = this.netPrevAt;
+    const nextAt = this.netNextAt;
+    this.indexNet(prev, prevAt);
+    this.indexNet(next, nextAt);
+    const nearAt = this.netNearNext ? nextAt : prevAt;
+
+    // The MEGA SHARK's health, the wave count.
+    if (near.length >= NET_HEAD) {
+      const health = near[0];
+      if (this.megaOut && health >= 0 && health < this.megaInfo.health) this.netMegaHit();
+      if (health >= 0) this.megaInfo.health = this.megaOut ? Math.min(this.megaInfo.health, health) : health; // only ever goes down
+      this.megaOut = health >= 0;
+      this.megaInfo.maxHealth = near[1];
+      this.netWaveLeft = near[2];
+    }
+
+    for (let i = 0; i < SLOTS; i++) {
+      const s = this.sharks[i];
+      const at = nearAt[i];
+      if (at < 0) {
+        // Not in the lagoon (any more).
+        if (s.phase !== PHASE_OFF) {
+          s.phase = PHASE_OFF;
+          s.target.alive = false;
+          s.spray = 0;
+        }
+        continue;
+      }
+      s.flash = Math.max(0, s.flash - step * 6);
+      s.shake = Math.max(0, s.shake - step * 2.6);
+
+      // Where it is: a blend of both snapshots when it is in both, else just the nearer one.
+      const a = prevAt[i];
+      const b = nextAt[i];
+      let seq = near[at + 9] / 1000;
+      if (a >= 0 && b >= 0) {
+        s.x = lerp(prev[a + 3], next[b + 3], k) / 100;
+        s.z = lerp(prev[a + 4], next[b + 4], k) / 100;
+        const h0 = prev[a + 5] / 1000;
+        s.heading = h0 + wrapPi(next[b + 5] / 1000 - h0) * k;
+        s.speed = lerp(prev[a + 6], next[b + 6], k) / 100;
+        s.turnVel = lerp(prev[a + 7], next[b + 7], k) / 1000;
+        s.appear = lerp(prev[a + 8], next[b + 8], k) / 1000;
+        // Progress only blends inside one and the same lunge/flip/dive.
+        if (prev[a + 1] === next[b + 1] && next[b + 9] >= prev[a + 9]) seq = lerp(prev[a + 9], next[b + 9], k) / 1000;
+      } else {
+        s.x = near[at + 3] / 100;
+        s.z = near[at + 4] / 100;
+        s.heading = near[at + 5] / 1000;
+        s.speed = near[at + 6] / 100;
+        s.turnVel = near[at + 7] / 1000;
+        s.appear = near[at + 8] / 1000;
+      }
+      const flags = near[at + 2];
+      s.mode = flags & 3;
+      s.wave = (flags & 4) !== 0;
+      if (near[at + 1] !== s.phase) this.netPhase(s, near[at + 1]);
+      s.seqT = seq * s.seqDur;
+    }
+    this.draw(step);
+  }
+
+  /** Where each shark's entry starts in a snapshot, by slot (-1 = not in it). */
+  private indexNet(state: SharkNetState, out: Int32Array): void {
+    out.fill(-1);
+    const n = state.length >= NET_HEAD ? state[3] : 0;
+    for (let k = 0; k < n; k++) {
+      const at = NET_HEAD + k * NET_STRIDE;
+      if (at + NET_STRIDE > state.length) break;
+      const slot = state[at];
+      if (slot >= 0 && slot < SLOTS) out[slot] = at;
+    }
+  }
+
+  /**
+   * A shark changed what it is doing (as seen in the snapshots): capture the start values update() would have
+   * (the flip remembers where it took off from), and play the splashes and bubbles the host's sharks play.
+   */
+  private netPhase(s: Shark, to: number): void {
+    const from = s.phase;
+    const mega = s.mega;
+    if (from === PHASE_OFF) {
+      // Sent in (or back from a dive): start the way launch() does.
+      s.yRide = this.rideFor(s);
+      s.exY = s.yRide;
+      s.exPitch = 0;
+      s.pitchBase = s.mode === MODE_CHASE ? CHASE_PITCH : 0;
+      s.bank = 0;
+      s.jaw = REST_JAW;
+      s.spray = 0;
+      s.flash = 0;
+      s.shake = 0;
+      s.vx = 0;
+      s.vz = 0;
+    }
+    switch (to) {
+      case PHASE_LUNGE:
+        s.seqDur = mega ? MEGA_LUNGE_SEC : LUNGE_SEC;
+        s.jawStart = s.jaw;
+        break;
+      case PHASE_FLIP:
+        // Darted: the same splash hit() makes, then a flip from wherever it was.
+        s.seqDur = mega ? MEGA_FLIP_SEC : FLIP_SEC;
+        s.flipH = mega ? 3.4 : 1.9;
+        s.flipY0 = s.exY;
+        s.flipPitch0 = s.exPitch;
+        s.jawStart = s.jaw;
+        s.flash = 1;
+        this.surfacePoint(s.x, s.z, 0);
+        this.fx.splash(this.surf, mega ? 3 : 1.1);
+        if (mega) this.fx.bubbles(this.surf);
+        break;
+      case PHASE_DIVE:
+        s.seqDur = mega ? MEGA_DIVE_SEC : DIVE_SEC;
+        this.splashDown(s);
+        break;
+      case PHASE_SWIM:
+        if (from === PHASE_LUNGE) this.splashAtNose(s); // the pounce is over: the nose lands
+        break;
+      default:
+        break;
+    }
+    s.phase = to;
+  }
+
+  /** The MEGA SHARK took a dart and is still going (what hit() does on the host): a flash, a shake, a wide jaw, a splash. */
+  private netMegaHit(): void {
+    const s = this.sharks[MEGA_SLOT];
+    if (s.phase === PHASE_OFF) return;
+    s.flash = 1;
+    s.shake = 1;
+    s.jaw = Math.max(s.jaw, 0.7);
+    this.surfacePoint(s.x, s.z, 0);
+    this.fx.splash(this.surf, 1.4);
   }
 
   dispose(): void {
@@ -773,9 +974,7 @@ class SharkSystem implements Sharks {
     if (tau < 1) return;
 
     // Splash down at the nose, then turn away.
-    const scale = s.mega ? MEGA_SCALE : 1;
-    this.surfacePoint(s.x + Math.sin(s.heading) * NOSE_Z * scale, s.z + Math.cos(s.heading) * NOSE_Z * scale, 0);
-    this.fx.splash(this.surf, s.mega ? 3 : 1.1);
+    this.splashAtNose(s);
     s.phase = PHASE_SWIM;
     s.mode = MODE_FLEE;
     s.fleeT = FLEE_SEC * (s.mega ? 1.1 : 1);
@@ -810,6 +1009,21 @@ class SharkSystem implements Sharks {
     this.drift(s, dt);
     if (s.seqT < s.seqDur) return;
     // Back down with a splash, and off it goes.
+    this.splashDown(s);
+    s.phase = PHASE_DIVE;
+    s.seqT = 0;
+    s.seqDur = s.mega ? MEGA_DIVE_SEC : DIVE_SEC;
+  }
+
+  /** The splash where a lunging shark's nose lands. */
+  private splashAtNose(s: Shark): void {
+    const scale = s.mega ? MEGA_SCALE : 1;
+    this.surfacePoint(s.x + Math.sin(s.heading) * NOSE_Z * scale, s.z + Math.cos(s.heading) * NOSE_Z * scale, 0);
+    this.fx.splash(this.surf, s.mega ? 3 : 1.1);
+  }
+
+  /** The splash and bubbles where a flipping shark comes back down, just before it dives. */
+  private splashDown(s: Shark): void {
     this.surfacePoint(s.x, s.z, 0);
     if (s.mega) {
       this.fx.splash(this.surf, 3.6);
@@ -824,9 +1038,6 @@ class SharkSystem implements Sharks {
       this.surfacePoint(s.x, s.z, -0.2);
       this.fx.bubbles(this.surf);
     }
-    s.phase = PHASE_DIVE;
-    s.seqT = 0;
-    s.seqDur = s.mega ? MEGA_DIVE_SEC : DIVE_SEC;
   }
 
   private dive(s: Shark, dt: number): void {

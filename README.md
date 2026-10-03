@@ -1,7 +1,8 @@
 # Foam Fleet
 
 Toy speedboats with foam-dart blasters, racing, battling, popping balloons and scaring off goofy cartoon sharks
-around a tropical lagoon. 1 or 2 players on one computer (split screen), plus computer boats.
+around a tropical lagoon. 1 or 2 players on one computer (split screen), or 2 to 4 players on different devices
+over the internet, plus computer boats.
 
 ## Start the game
 
@@ -12,7 +13,7 @@ npm run dev
 
 Then open http://localhost:5180 in Chrome or Edge. Press **F11** for full screen.
 
-### Play online (iPad, any computer)
+### Open it on the web (iPad, any computer)
 
 Play it at **https://daniellmurphy76-coder.github.io/foam-fleet/**
 
@@ -38,6 +39,35 @@ Every push to `main` builds the game and publishes it to GitHub Pages
 
 A keyboard or Bluetooth gamepad still works exactly as on a computer. Pressing a key or a gamepad button hides
 the touch layout, and touching the screen brings it back.
+
+## Play online
+
+Two to four people, one player on each device (a laptop and an iPad, or two houses), can play together in any
+mode: Dart Battle, Buoy Race, Team Up, Balloon Pop or Boats vs. Sharks. Everybody opens the same game address
+(see "Open it on the web" above). It needs the internet; no accounts, no chat.
+
+1. **Host:** on the title screen tap **Play Online**, then **Host a game**. A four-letter code appears (for
+   example **DUCK**). Read it out to your friends. The code never has an I, L or O, so it is easy to say.
+2. **Everyone else:** tap **Play Online**, then **Join a game**, and type the code. Use the letters on the screen
+   (touch, mouse or gamepad) or a keyboard. A link ending in `?join=DUCK` opens the Join screen with the code
+   already typed.
+3. **In the lobby:** everybody picks a name, boat color, boat and Easy Driving. The host picks the game, the
+   computer boats and the length, and taps **Start!** once at least one friend has joined. A game that has
+   started can't be joined, so wait for everybody first.
+4. **Play:** each player drives their own boat on their own screen. After the match the host can tap
+   **Rematch** or go back to the **Lobby**, where more friends can join.
+
+Good to know:
+
+- The game runs on the host's device and everyone else watches it live, so the host should have the faster
+  device and keep the game window open and in front. Online games never pause when a window loses focus.
+- The host's **Pause** pauses the game for everybody. A friend's **Pause** only asks "Leave the game?" while the
+  game goes on. If a friend leaves, their boat stops and everybody sees "Sam left the game". If the host leaves,
+  everybody goes back to the title screen.
+- The first connection can take a few seconds. A wrong code answers "No game with that code. Check the letters!"
+  after about five seconds. The free connection service (PeerJS) can occasionally be slow or busy: if a game
+  will not connect, wait a moment and try again, or play on the same Wi-Fi.
+- Every device uses its own keyboard, gamepad or touch controls, and its own sound settings, exactly as offline.
 
 ## Modes
 
@@ -141,6 +171,11 @@ for the full-speed, do-it-yourself handling.
   `?quick=battle&humans=2&touch=1`.
 - `?mute=1` makes that page silent. The Sound button and the **M** key do nothing there, and nothing is saved,
   so the family's own Sound setting is never changed. Use it on every test page.
+- Online testing: open two windows side by side (not two tabs in one window: a tab in the background runs slowly),
+  both with `?mute=1`. In the first, run `await __foam.online.host()` in the console (it returns the code); in
+  the second, `await __foam.online.join('DUCK')`, then `__foam.online.start({ mode: 'battle' })` in the first.
+  `__foam.net` shows the role, code, slot, round-trip time and snapshot age, and `__foam.online.leave()` leaves.
+  `?join=DUCK` opens the Join screen with the code typed in.
 - In the browser console, `__foam.snapshot()` shows the game state (boats, teams, balloons left, the sharks and
   the Boats vs. Sharks wave and life rings, what each human has done so far), `__foam.timeScale = 4` fast-forwards, `__foam.autopilot = true` lets the computer
   drive your boat, and `__foam.start({ mode: 'team', bots: 3 })` starts a match.

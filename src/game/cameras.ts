@@ -165,6 +165,33 @@ export class ChaseCamera {
   }
 }
 
+export type CameraOp = 'shake' | 'kick' | 'snap';
+
+/**
+ * The camera of an online player who sits at another device. It is never drawn or moved here: the kicks, shakes
+ * and snaps the match would give it go to `send` instead (the host turns them into events), so that player's
+ * own device plays them on its own camera.
+ */
+export class RemoteCamera extends ChaseCamera {
+  constructor(easyDriving: boolean, private readonly send: (op: CameraOp, amount: number) => void) {
+    super(easyDriving);
+  }
+
+  override kick(amount: number): void {
+    this.send('kick', amount);
+  }
+
+  override shake(amount: number): void {
+    this.send('shake', amount);
+  }
+
+  override snap(): void {
+    this.send('snap', 0);
+  }
+
+  override update(): void {}
+}
+
 /** A slow cinematic orbit around a point (used behind the menu and on the results screen). */
 export class OrbitCamera {
   readonly camera = new THREE.PerspectiveCamera(55, 16 / 9, NEAR, FAR);

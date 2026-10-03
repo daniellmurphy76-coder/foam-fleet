@@ -29,6 +29,8 @@ const KINDS_RACE: readonly PowerUpKind[] = ['triple', 'shield', 'turbo']; // rap
 type CrateState = 'live' | 'popping' | 'gone';
 
 interface Crate {
+  /** crateIndex: 0..maxActive-1, stable for the whole match (also the crate's bit in netState). */
+  index: number;
   group: THREE.Group;
   box: THREE.Mesh;
   ring: THREE.Mesh;
@@ -187,6 +189,7 @@ export function createPickups(scene: THREE.Scene, world: World, mode: ModeId): P
     group.position.set(s.x, 0, s.z);
     root.add(group);
     return {
+      index: i,
       group,
       box,
       ring,
@@ -220,6 +223,50 @@ export function createPickups(scene: THREE.Scene, world: World, mode: ModeId): P
   };
   crates.forEach((c) => setVisible(c, true));
 
+  /**
+   * Bob, spin and pop one crate (live or popping) at time t. Returns false when its pop-away just finished
+   * and it went away. Shared by the host's update() and a guest's applyNetState().
+   */
+  const animateCrate = (c: Crate, t: number, dt: number): boolean => {
+    c.age += dt;
+    const h = waveHeight(c.x, c.z, t);
+    c.group.position.y = h;
+
+    // Bob, spin and wobble (the box itself); the ring and beam stay put on the water.
+    const bob = 0.22 * Math.sin(t * 2.3 + c.phase);
+    c.box.position.y = HOVER + bob;
+    c.box.rotation.set(0.14 * Math.sin(t * 1.9 + c.phase), c.box.rotation.y + dt * 1.7, 0.1 * Math.cos(t * 1.6 + c.phase));
+    c.pos.y = h + HOVER + bob;
+
+    // The ring lies on the surface: tip it to match the wave and pulse it.
+    waveNormal(c.x, c.z, t, normal);
+    tilt.setFromUnitVectors(UP, normal);
+    c.ring.quaternion.copy(tilt);
+    const pulse = 1 + 0.12 * Math.sin(t * 3 + c.phase);
+
+    let boxScale: number;
+    let fx: number;
+    if (c.state === 'live') {
+      const p = Math.min(1, c.age / POP_IN_SEC);
+      boxScale = easeOutBack(p);
+      fx = p;
+    } else {
+      // Quick "pop": swell, then shrink to nothing.
+      const q = Math.min(1, c.age / POP_OUT_SEC);
+      boxScale = q < 0.35 ? 1 + 0.4 * (q / 0.35) : 1.4 * (1 - (q - 0.35) / 0.65);
+      fx = 1 - q;
+      if (q >= 1) {
+        c.state = 'gone';
+        setVisible(c, false);
+        return false;
+      }
+    }
+    c.box.scale.setScalar(Math.max(0.0001, boxScale));
+    c.ring.scale.setScalar(Math.max(0.0001, fx * pulse));
+    c.beam.scale.set(Math.max(0.0001, fx), 1, Math.max(0.0001, fx));
+    return true;
+  };
+
   return {
     positions,
 
@@ -241,43 +288,7 @@ export function createPickups(scene: THREE.Scene, world: World, mode: ModeId): P
           }
         }
 
-        c.age += dt;
-        const h = waveHeight(c.x, c.z, t);
-        c.group.position.y = h;
-
-        // Bob, spin and wobble (the box itself); the ring and beam stay put on the water.
-        const bob = 0.22 * Math.sin(t * 2.3 + c.phase);
-        c.box.position.y = HOVER + bob;
-        c.box.rotation.set(0.14 * Math.sin(t * 1.9 + c.phase), c.box.rotation.y + dt * 1.7, 0.1 * Math.cos(t * 1.6 + c.phase));
-        c.pos.y = h + HOVER + bob;
-
-        // The ring lies on the surface: tip it to match the wave and pulse it.
-        waveNormal(c.x, c.z, t, normal);
-        tilt.setFromUnitVectors(UP, normal);
-        c.ring.quaternion.copy(tilt);
-        const pulse = 1 + 0.12 * Math.sin(t * 3 + c.phase);
-
-        let boxScale: number;
-        let fx: number;
-        if (c.state === 'live') {
-          const p = Math.min(1, c.age / POP_IN_SEC);
-          boxScale = easeOutBack(p);
-          fx = p;
-        } else {
-          // Quick "pop": swell, then shrink to nothing.
-          const q = Math.min(1, c.age / POP_OUT_SEC);
-          boxScale = q < 0.35 ? 1 + 0.4 * (q / 0.35) : 1.4 * (1 - (q - 0.35) / 0.65);
-          fx = 1 - q;
-          if (q >= 1) {
-            c.state = 'gone';
-            setVisible(c, false);
-            continue;
-          }
-        }
-        c.box.scale.setScalar(Math.max(0.0001, boxScale));
-        c.ring.scale.setScalar(Math.max(0.0001, fx * pulse));
-        c.beam.scale.set(Math.max(0.0001, fx), 1, Math.max(0.0001, fx));
-
+        if (!animateCrate(c, t, dt)) continue;
         if (c.state !== 'live') continue;
 
         // Who is close enough? The nearest boat wins if two arrive in the same frame.
@@ -295,7 +306,7 @@ export function createPickups(scene: THREE.Scene, world: World, mode: ModeId): P
         }
         if (best) {
           const kind = kinds[Math.floor(rand() * kinds.length) % kinds.length];
-          (events ??= []).push({ boatId: best.id, kind, position: c.pos.clone() });
+          (events ??= []).push({ crateIndex: c.index, boatId: best.id, kind, position: c.pos.clone() });
           c.state = 'popping';
           c.age = 0;
           c.respawnAt = t + CONFIG.powerUps.respawnSec;
@@ -305,6 +316,40 @@ export function createPickups(scene: THREE.Scene, world: World, mode: ModeId): P
 
       if (changed) rebuildPositions();
       return events ?? NONE;
+    },
+
+    /** Host: which crates are live right now (bit i = crate i). A crate that is popping or waiting to come back is not live. */
+    netState(): number {
+      let mask = 0;
+      for (const c of crates) if (c.state === 'live' && c.index < 31) mask |= 1 << c.index;
+      return mask;
+    },
+
+    /** Guest: animate the crates, no collecting, and show each one live or gone as the host says (with the pop-in / pop-away). */
+    applyNetState(liveMask: number, t: number, dt: number): void {
+      lastT = t;
+      if (disposed) return;
+      let changed = false;
+      for (const c of crates) {
+        const want = c.index < 31 && ((liveMask >>> c.index) & 1) === 1;
+        if (c.state === 'gone') {
+          if (!want) continue;
+          c.state = 'live'; // pops in
+          c.age = 0;
+          setVisible(c, true);
+          changed = true;
+        } else if (c.state === 'live' && !want) {
+          c.state = 'popping'; // grabbed: swell and pop away
+          c.age = 0;
+          changed = true;
+        } else if (c.state === 'popping' && want) {
+          c.state = 'live'; // (an older snapshot got in: show it again rather than leave it half-popped)
+          c.age = 0;
+          changed = true;
+        }
+        animateCrate(c, t, dt);
+      }
+      if (changed) rebuildPositions();
     },
 
     /** Takes every crate off the water; they come back after the usual respawn time. */

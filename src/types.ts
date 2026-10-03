@@ -181,6 +181,8 @@ export interface World extends WorldQuery {
 }
 
 export interface PickupEvent {
+  /** Which crate (0..maxActive-1, stable for the whole match). */
+  crateIndex: number;
   boatId: number;
   kind: PowerUpKind;
   position: THREE.Vector3;
@@ -192,6 +194,13 @@ export interface Pickups {
   /** Bob/spin crates, respawn them, detect boat overlap. Returns crates collected this frame. */
   update(t: number, dt: number, boats: readonly Boat[]): PickupEvent[];
   clear(): void;
+  /** Host: bitmask of crates that are live (bit i = crateIndex i). */
+  netState(): number;
+  /**
+   * Guest: animate the crates (bob, spin) WITHOUT collecting, and force each crate live/gone to match
+   * `liveMask`; a crate going live -> gone plays its pop-away animation, gone -> live its pop-in.
+   */
+  applyNetState(liveMask: number, t: number, dt: number): void;
   dispose(): void;
 }
 
@@ -214,6 +223,13 @@ export interface Balloons {
   update(t: number, dt: number, boats: readonly Boat[]): BalloonPop[];
   /** Pop one by dart. Returns null if it was already popped. */
   pop(targetId: number, boatId: number): BalloonPop | null;
+  /** Host: alive bitmask, 32 balloons per word (bit i of word w = balloon w*32+i). */
+  netState(): number[];
+  /**
+   * Guest: animate (sway, bob; no magnet, no ram pops) and force alive/popped to match `aliveMask`.
+   * Popping visuals come from events, so this only hides/shows.
+   */
+  applyNetState(aliveMask: readonly number[], t: number, dt: number): void;
   dispose(): void;
 }
 /** Something the blaster can lock onto that is not a boat (a shark). */
@@ -260,8 +276,20 @@ export interface Sharks {
   spawnWave(count: number, mega: boolean): void;
   /** Everything the minimap needs. */
   readonly mapDots: readonly { x: number; z: number; heading: number; mega: boolean }[];
+  /** Host: every shark's state for the network snapshot. The format is private to the sharks module. */
+  netState(): SharkNetState;
+  /**
+   * Guest: show the sharks between two consecutive host snapshots (`alpha` 0..1 from prev to next).
+   * Render-only: no AI, no bumps, no randomness that matters. Phase changes seen in the snapshots
+   * (lunge, flip, dive, rise) play their own splashes/bubbles locally. targets/mapDots/mega/waveLeft
+   * stay correct so aim lock, the reticle, the minimap and the HUD work on guests.
+   */
+  applyNetState(prev: SharkNetState, next: SharkNetState, alpha: number, t: number, dt: number): void;
   dispose(): void;
 }
+
+/** Opaque shark snapshot: a flat number array whose layout only src/sharks knows. */
+export type SharkNetState = number[];
 
 
 // ───────────────────────────── Boats ─────────────────────────────
@@ -349,7 +377,43 @@ export interface Boat {
   respawn(spawn: SpawnPoint): void;
   /** Rescue: move to `spot`, zero velocity and stun; KEEP ammo, boost and power-ups. */
   teleport(spot: SpawnPoint): void;
+  /** Host: this boat's state for the network snapshot. */
+  netState(): BoatNetState;
+  /**
+   * Guest: show this boat as a puppet. Take pose and flags from `s` (already interpolated by the caller)
+   * and run only the visual animation (wave bob, tilt, flames, shield, turret, wobble, flag): no physics,
+   * no aim picking. Afterwards every getter (speed, ammo, boost, shielded, stunned, powerUp, aimTargetId,
+   * reloading...) reflects `s`.
+   */
+  applyNetState(s: BoatNetState, dt: number, t: number, world: WorldQuery, aimTargets?: readonly AimTarget[]): void;
+  /** Guest: replay a shot (recoil + muzzle flash). */
+  netFire(): void;
+  /** Guest: replay a hit (flash + wobble, or the shield popping when `blocked`). Visual only. */
+  netHit(blocked: boolean, stunSeconds: number): void;
   dispose(): void;
+}
+
+/** Everything a guest needs to show one boat (and the owning player's HUD). */
+export interface BoatNetState {
+  x: number;
+  z: number;
+  heading: number;
+  vx: number;
+  vz: number;
+  /** Last steering input -1..1 (head turn, banking). */
+  steer: number;
+  boosting: boolean;
+  shielded: boolean;
+  stunned: boolean;
+  powerUp: PowerUpKind | null;
+  powerUpLeft: number;
+  ammo: number;
+  reloading: boolean;
+  reloadProgress: number;
+  boost: number;
+  aimTargetId: number | null;
+  /** Bumped on every respawn/teleport so guests snap instead of sliding across the lagoon. */
+  epoch: number;
 }
 
 export interface BumpEvent {
@@ -371,6 +435,11 @@ export interface DartSpawn {
 }
 
 export interface DartHit {
+  /** Network id of the dart (same as DartSystem.spawn returned). */
+  dartId: number;
+  /** Boat-local pose of the stuck dart (tip position, quaternion); null when a shield blocked it. */
+  tip: [number, number, number] | null;
+  quat: [number, number, number, number] | null;
   ownerId: number;
   targetId: number;
   point: THREE.Vector3;
@@ -388,6 +457,7 @@ export interface DartTarget {
 }
 
 export interface DartTargetHit {
+  dartId: number;
   ownerId: number;
   targetId: number;
   point: THREE.Vector3;
@@ -402,7 +472,16 @@ export interface DartUpdateResult {
 }
 
 export interface DartSystem {
-  spawn(spawn: DartSpawn): void;
+  /** Fire a dart. Returns its network id (unique for the match). */
+  spawn(spawn: DartSpawn): number;
+  /** Guest: fire a cosmetic copy of host dart `id` that has already flown `age` seconds. */
+  spawnNet(id: number, spawn: DartSpawn, age: number): void;
+  /** Guest: host dart `id` stuck into `boat` at this boat-local pose (plays the hit burst). */
+  netStick(id: number, boat: Boat, tip: readonly [number, number, number], quat: readonly [number, number, number, number]): void;
+  /** Guest: host dart `id` bounced off a shield at `point` (plays the shield sparkle). */
+  netDeflect(id: number, point: readonly [number, number, number]): void;
+  /** Guest: host dart `id` was used up on a balloon or shark (small puff, remove it). */
+  netKill(id: number): void;
   /**
    * Fly darts and collide them with boats, optional extra `targets` (alive ones only),
    * obstacles and water. Darts never hit their owner and pass straight through the owner's
@@ -680,9 +759,29 @@ export interface Hud {
   hint(text: string, viewport: number, ms?: number): void;
   /** Short message in the event feed ("Sam tagged Salty Sal!"). */
   feed(text: string, color?: number): void;
-  showPause(onResume: () => void, onQuit: () => void): void;
+  /**
+   * `opts` rewords the box: an online guest's Pause does not stop the game, so the app says "Leave the game?"
+   * (title) with "Keep playing" / "Leave" instead of "Paused" / "Resume" / "Quit to Menu" (the defaults).
+   */
+  showPause(
+    onResume: () => void,
+    onQuit: () => void,
+    opts?: { title?: string; resumeLabel?: string; quitLabel?: string },
+  ): void;
   hidePause(): void;
-  showResults(result: MatchResult, onRematch: () => void, onMenu: () => void): void;
+  /**
+   * `onRematch` null = this device can't start a rematch (an online guest): show `opts.waiting` instead.
+   * `opts.menuLabel` renames the Menu button (e.g. "Leave"). `opts.lost` = Boats vs. Sharks was lost: an online
+   * guest gets no per-player stats in its MatchResult (HostResults), so it says so (no confetti, no fanfare).
+   */
+  showResults(
+    result: MatchResult,
+    onRematch: (() => void) | null,
+    onMenu: () => void,
+    opts?: { waiting?: string; menuLabel?: string; lost?: boolean },
+  ): void;
+  /** Small connection pill (top-left, under Pause) for online play, e.g. "Online · 3 players", null hides it. */
+  setNetStatus(text: string | null): void;
   hideResults(): void;
   /** Route keyboard/gamepad navigation into whichever overlay (pause/results) is open. */
   handleMenuInput(input: MenuInput): void;
@@ -710,11 +809,67 @@ export interface MatchSetup {
   durationSec: number;
   /** Race laps. */
   laps: number;
+  /**
+   * Online play only (absent or null for local play). Every human in the match, index = boat id (0 = host),
+   * and which one plays on THIS device. Online, `humans` is 1 and `players` is [online.players[localSlot]].
+   */
+  online?: OnlineRoster | null;
+}
+
+export interface OnlineRoster {
+  /** 2..4 humans; index = boat id. */
+  players: PlayerSetup[];
+  localSlot: number;
+}
+
+export interface LobbyPlayer {
+  slot: number;
+  name: string;
+  color: number;
+  look: BoatLook;
+  easyDriving: boolean;
+  isHost: boolean;
+  isYou: boolean;
+}
+
+export interface LobbyState {
+  role: 'host' | 'guest';
+  /** Room code (e.g. "DUCK"), or '' while still connecting. */
+  code: string;
+  players: LobbyPlayer[];
+  /** Kid-friendly status line, e.g. "Waiting for players...", "Waiting for the host to start". */
+  status: string;
+  /** Kid-friendly problem message, or null. */
+  error: string | null;
+  /** Host: the match settings the host has picked (mirrored to guests so they can see them). */
+  settings: { mode: ModeId; bots: number; botDifficulty: BotDifficulty; durationSec: number; laps: number } | null;
+}
+
+/** What the menu calls when the player uses the online screens. The app implements these. */
+export interface OnlineMenuHooks {
+  /** "Host a game": open a room. Resolves with the room code, or rejects with a kid-friendly message. */
+  host(profile: PlayerSetup): Promise<string>;
+  /** "Join": connect to room `code`. Resolves once the host accepted us; rejects with a kid-friendly message. */
+  join(code: string, profile: PlayerSetup): Promise<void>;
+  /** Host changed game settings in the lobby (mirrored to guests). */
+  settings(setup: MatchSetup): void;
+  /** This player changed name/color/boat/Easy Driving while in the lobby. */
+  profile(profile: PlayerSetup): void;
+  /** Host tapped Start: the app builds the online match from `setup` + the lobby players. */
+  start(setup: MatchSetup): void;
+  /** Leave the online lobby (host closes the room; guest disconnects). */
+  leave(): void;
 }
 
 export interface Menu {
   /** Show the title/setup screens, prefilled with `initial` (or defaults). */
   show(initial: MatchSetup | null, onStart: (setup: MatchSetup) => void): void;
+  /** Enable the "Play Online" button and its screens. */
+  setOnlineHooks(hooks: OnlineMenuHooks): void;
+  /** Open an online screen directly: the join screen (optionally prefilled), or the lobby (after a match). */
+  showOnline(view: 'join' | 'lobby', code?: string): void;
+  /** The app pushes the current lobby whenever it changes while an online screen is open. */
+  updateLobby(state: LobbyState): void;
   hide(): void;
   /** Feed keyboard/gamepad navigation each frame while visible. */
   update(input: MenuInput): void;

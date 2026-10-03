@@ -500,6 +500,36 @@ export function createBalloons(scene: THREE.Scene, world: World): Balloons {
       return popBalloon(b, boatId);
     },
 
+    /** Host: which balloons are still floating, 32 per word (bit i of word w = balloon w * 32 + i). */
+    netState(): number[] {
+      const words: number[] = new Array(Math.ceil(total / 32)).fill(0);
+      for (const b of balloons) if (b.alive) words[b.id >> 5] |= 1 << (b.id & 31);
+      for (let w = 0; w < words.length; w++) words[w] >>>= 0; // whole positive numbers go over the wire
+      return words;
+    },
+
+    /**
+     * Guest: sway and bob every balloon that is still floating (no magnet, no ramming), and hide or show each one
+     * as the host says. The pop itself (shreds, sound, score) comes from events, so this only hides.
+     */
+    applyNetState(aliveMask: readonly number[], t: number, _dt: number): void {
+      if (disposed) return;
+      for (const b of balloons) {
+        const word = aliveMask[b.id >> 5];
+        const want = word === undefined ? b.alive : ((word >>> (b.id & 31)) & 1) === 1; // a short list says nothing about the rest
+        if (b.alive && !want) {
+          b.alive = false;
+          remaining--;
+          hide(b);
+        } else if (!b.alive && want) {
+          b.alive = true; // (an older snapshot got in: bring it back; place() below puts it where it belongs)
+          remaining++;
+        }
+        if (b.alive) place(b, t);
+      }
+      touch();
+    },
+
     dispose(): void {
       if (disposed) return;
       disposed = true;

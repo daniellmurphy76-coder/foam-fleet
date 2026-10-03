@@ -1,11 +1,26 @@
 import './styles.css';
-import type { BoatLook, BotDifficulty, MatchSetup, Menu, MenuInput, ModeId, Sfx, TrophyDef } from '../types';
+import type {
+  BoatLook,
+  BotDifficulty,
+  LobbyPlayer,
+  LobbyState,
+  MatchSetup,
+  Menu,
+  MenuInput,
+  ModeId,
+  OnlineMenuHooks,
+  PlayerSetup,
+  Sfx,
+  TrophyDef,
+} from '../types';
 import { CONFIG } from '../config';
+import { CODE_ALPHABET, CODE_LENGTH, MAX_ONLINE_PLAYERS } from '../net/protocol';
 import {
   button,
   collectRows,
   cssColor,
   el,
+  errorText,
   field,
   guardActivationKeys,
   installUnlock,
@@ -18,10 +33,11 @@ import {
   svgNode,
   touchAvailable,
 } from './dom';
+import type { Swatches } from './dom';
 import { createGarage, defaultLook, describeLook, sanitizeLook } from './garage';
 import { TROPHIES, loadShelf, loadShelfColors } from './trophies';
 
-/** Title, match-setup, Boat Garage and Trophy Shelf screens. */
+/** Title, match-setup, Boat Garage, Trophy Shelf and the Play Online screens (online, join, lobby). */
 
 // Same key as v1: old saves still load, and anything they lack (looks, Easy Driving) gets a default.
 const STORAGE_KEY = 'foamfleet.setup.v1';
@@ -30,6 +46,14 @@ const MAX_BOTS = 5; // the setup screen offers 0..5 bots
 const MAX_HELPERS = 3; // Boats vs. Sharks: 0..3 helper boats on your team
 const BATTLE_SECONDS = [120, 180, 300]; // 2 / 3 / 5 minutes
 const RACE_LAPS = [1, 3, 5];
+/** Letter keys per row on the join keypad (23 letters + Delete = 3 rows of 8: big keys, short screen). */
+const KEYPAD_COLS = 8;
+/** The name box tells the host about a new name this long after the last key (it does not send every letter). */
+const PROFILE_SEND_MS = 400;
+/** After a color change a lobby update may still carry the old color: don't let it undo the pick for this long. */
+const PROFILE_ECHO_MS = 1500;
+/** Start! stays pressed this long (a double-tap must not start twice), then comes back if no match began. */
+const START_REARM_MS = 4000;
 
 const MODES: ReadonlyArray<{ id: ModeId; label: string; icon: string; sub: string }> = [
   { id: 'battle', label: 'Dart Battle', icon: '🎯', sub: 'Tag boats with foam darts. Most tags wins!' },
@@ -188,6 +212,13 @@ const BOAT_SVG = `
   <path d="M220 12 H236 M226 24 H240" stroke="#ffffff" stroke-width="4" stroke-linecap="round" stroke-opacity=".8"/>
 </svg>`;
 
+/** A tiny boat for the lobby's player list; the hull takes the player's color (--c). */
+const LOBBY_BOAT_SVG = `
+<svg viewBox="0 0 48 32" aria-hidden="true">
+  <path class="hull" d="M3 18 H45 Q42 29 31 29 H14 Q6 29 3 18 Z" stroke="#06173d" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M17 18 L21 8 H31 L35 18 Z" fill="#bfeaff" stroke="#06173d" stroke-width="3" stroke-linejoin="round"/>
+</svg>`;
+
 const SPEAKER_SVG = `
 <svg class="ff-sound-icon" viewBox="0 0 24 24" aria-hidden="true">
   <path d="M3 9 H7 L12 4.5 V19.5 L7 15 H3 Z" fill="#0b2a5b"/>
@@ -234,7 +265,57 @@ function shelfCard(name: string, earned: ReadonlySet<string>, color: number | nu
 
 // ───────────── the menu ─────────────
 
-type Screen = 'title' | 'setup' | 'garage' | 'shelf';
+type Screen = 'title' | 'setup' | 'garage' | 'shelf' | 'online' | 'join' | 'lobby';
+
+const SKILL_ORDER: readonly BotDifficulty[] = ['easy', 'normal', 'hard'];
+/** Letters a game code never uses (the look-alikes), for the little note on the join screen: "I, L or O". */
+const MISSING_LETTERS = [...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'].filter((ch) => !CODE_ALPHABET.includes(ch));
+const MISSING_TEXT =
+  MISSING_LETTERS.length < 2
+    ? MISSING_LETTERS.join('')
+    : MISSING_LETTERS.slice(0, -1).join(', ') + ' or ' + MISSING_LETTERS[MISSING_LETTERS.length - 1];
+
+/** Only letters a code can have, in capitals, at most CODE_LENGTH of them (typed, pasted or from a link). */
+function cleanCode(text: string): string {
+  let out = '';
+  for (const ch of text.toUpperCase()) if (out.length < CODE_LENGTH && CODE_ALPHABET.includes(ch)) out += ch;
+  return out;
+}
+
+/** A friendly "Oops!" box for things that go wrong online. Hidden until it has something to say. */
+interface Problem {
+  root: HTMLElement;
+  /** Show this message, or hide the box (null). */
+  set(text: string | null): void;
+}
+function makeProblem(): Problem {
+  const root = el('div', 'ff-problem');
+  root.setAttribute('role', 'alert');
+  root.hidden = true;
+  const ico = el('span', 'ff-problem-ico', '😕');
+  ico.setAttribute('aria-hidden', 'true');
+  const msg = el('div', 'ff-problem-msg');
+  const body = el('div', 'ff-problem-body');
+  body.append(el('div', 'ff-problem-head', 'Oops!'), msg);
+  root.append(ico, body);
+  return {
+    root,
+    set(text) {
+      root.hidden = !text; // null and '' both mean "nothing to say"
+      if (text) msg.textContent = text;
+    },
+  };
+}
+
+/** The game-option widgets (game, computer boats, helpers, skill, length). The setup screen has one set, the lobby another. */
+interface Options {
+  /** The "Game" field: the five game cards. */
+  modeBox: HTMLElement;
+  /** The rest, top to bottom: computer boats, helper boats, skill, length, and the two game notes. */
+  boxes: HTMLElement[];
+  /** Make every widget match `form`, for a game with this many humans. */
+  sync(humans: number): void;
+}
 
 export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
   root.classList.add('ff-ui');
@@ -246,8 +327,24 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
   let started = false; // stops a double-click from starting the match twice
   let screen: Screen = 'title';
   let garageFor: 0 | 1 = 0; // whose boat the garage is showing
+  let garageBack: 'setup' | 'lobby' = 'setup'; // ...and which screen it goes back to
   let onStart: ((setup: MatchSetup) => void) | null = null;
   let form: Form = loadForm();
+
+  // ── online state ──
+  let hooks: OnlineMenuHooks | null = null; // null until the app calls setOnlineHooks: no Play Online button before that
+  let pendingOnline: { view: 'join' | 'lobby'; code?: string } | null = null; // showOnline() that came too early
+  let role: 'host' | 'guest' | null = null; // set while we are in a room
+  let lobby: LobbyState | null = null; // the newest lobby the app pushed
+  let roomCode = ''; // the room's code until the first lobby arrives
+  let busy: '' | 'host' | 'join' = ''; // a host / join request is in flight
+  let netToken = 0; // bumped when the player walks away, so a late answer is not acted on
+  let joinCode = ''; // letters typed on the join screen
+  let lobbyStarting = false; // Start! was pressed
+  let startTimer = 0;
+  let profileTimer = 0; // a half-typed name goes out after a short pause
+  let profileSentAt = 0;
+  let settingsKey = ''; // the settings the host app was last told about
 
   const menuEl = el('div', 'ff-menu');
   menuEl.hidden = true;
@@ -257,18 +354,36 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     storeSet(STORAGE_KEY, JSON.stringify(form));
   }
 
-  function maxBots(): number {
-    return Math.max(0, Math.min(MAX_BOTS, CONFIG.match.maxBoats - form.humans));
+  function maxBots(humans: number): number {
+    return Math.max(0, Math.min(MAX_BOTS, CONFIG.match.maxBoats - humans));
   }
   /** Team Up needs someone to play against; Balloon Pop has no computer boats at all. */
   function minBots(): number {
     return form.mode === 'team' ? 1 : 0;
   }
-  /** The computer boats this setup really gets (the saved numbers are kept for the other modes). */
-  function botCount(): number {
+  /** The computer boats this game really gets (the saved numbers are kept for the other modes). */
+  function botCount(humans: number): number {
     if (form.mode === 'practice') return 0;
-    if (form.mode === 'sharks') return Math.max(0, Math.min(form.helpers, MAX_HELPERS, maxBots())); // helper boats
-    return Math.max(minBots(), Math.min(form.bots, maxBots()));
+    if (form.mode === 'sharks') return Math.max(0, Math.min(form.helpers, MAX_HELPERS, maxBots(humans))); // helper boats
+    return Math.max(minBots(), Math.min(form.bots, maxBots(humans)));
+  }
+  /** Humans in the online lobby (just you until the first lobby arrives). */
+  function lobbyHumans(): number {
+    return Math.max(1, lobby?.players.length ?? 1);
+  }
+
+  function cleanName(i: number): string {
+    return form.names[i].trim().slice(0, NAME_MAX) || `Player ${i + 1}`;
+  }
+
+  /** Online, you are Player 1 of the setup screen: same name, color, boat and Easy Driving. */
+  function profile(): PlayerSetup {
+    return { name: cleanName(0), color: form.colors[0], look: { ...form.looks[0] }, easyDriving: form.easy[0] };
+  }
+
+  /** Is this lobby row me? (The host's own row may not carry `isYou`.) */
+  function isMe(p: LobbyPlayer): boolean {
+    return p.isYou || (role === 'host' && p.isHost);
   }
 
   // ───── backdrop: sky, sun, bubbles and rolling waves (pure CSS, no images) ─────
@@ -305,12 +420,19 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
   const boatArt = el('div', 'ff-boat-art');
   boatArt.append(svgNode(BOAT_SVG));
 
+  // "The host left the game" and friends land here when the app sends the player back to the title.
+  const titleNotice = makeProblem();
+  titleNotice.root.classList.add('ff-problem--title');
+
   const playBtn = button('Play', 'ff-btn ff-btn--primary ff-btn--hero');
   const playRow = el('div', 'ff-row');
   playRow.append(playBtn);
+  const onlineBtn = button('🌐 Play Online', 'ff-btn ff-btn--xl ff-btn--online');
+  onlineBtn.hidden = true; // until the app turns online play on
   const shelfBtn = button('🏆 Trophy Shelf', 'ff-btn ff-btn--lg');
-  const shelfRow = el('div', 'ff-row');
-  shelfRow.append(shelfBtn);
+  // Play Online and the Trophy Shelf share a row (left / right hops between them), so the title does not grow taller.
+  const moreRow = el('div', 'ff-row ff-title-row');
+  moreRow.append(onlineBtn, shelfBtn);
 
   function keysCard(heading: string, lines: Array<{ keys: string[]; text: string }>): HTMLElement {
     const card = el('div', 'ff-keys');
@@ -360,7 +482,7 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
       { keys: ['X'], text: 'Honk' },
     ]),
   );
-  titleEl.append(logo, tagline, boatArt, playRow, shelfRow, controls);
+  titleEl.append(logo, tagline, boatArt, titleNotice.root, playRow, moreRow, controls);
 
   // ───── setup screen ─────
   const setupEl = el('section', 'ff-screen ff-setup');
@@ -372,12 +494,13 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
   backRow.append(backBtn);
   head.append(backRow, el('h2', 'ff-setup-title ff-ol', 'Get ready!'));
 
+  /** Something in `form` changed: fix clashes, redraw every screen that shows it, save. */
   function changed(): void {
     // Two humans can't share a boat color: if P1 and P2 collide, P2 gets the next free one.
     if (form.humans === 2 && form.colors[0] === form.colors[1]) {
       form.colors[1] = CONFIG.colors.find((c) => c !== form.colors[0]) ?? form.colors[1];
     }
-    form.bots = Math.min(form.bots, maxBots());
+    form.bots = Math.min(form.bots, maxBots(form.humans));
     applyForm();
     save();
   }
@@ -394,102 +517,178 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
       changed();
     },
   );
-  const botsSeg = makeSeg<number>(
-    sfx,
-    'Computer boats',
-    Array.from({ length: MAX_BOTS + 1 }, (_, n) => ({ value: n, label: String(n) })),
-    (v) => {
-      form.bots = v;
-      changed();
-    },
-  );
-  const helpersSeg = makeSeg<number>(
-    sfx,
-    'Helper boats',
-    Array.from({ length: MAX_HELPERS + 1 }, (_, n) => ({ value: n, label: String(n) })),
-    (v) => {
-      form.helpers = v;
-      changed();
-    },
-  );
-  const modeSeg = makeSeg<ModeId>(
-    sfx,
-    'Game mode',
-    MODES.map((m) => ({ value: m.id, label: m.label, icon: m.icon, sub: m.sub })),
-    (v) => {
-      form.mode = v;
-      changed();
-    },
-  );
-  modeSeg.row.classList.add('ff-modes');
-  const battleSeg = makeSeg<number>(
-    sfx,
-    'Match length',
-    BATTLE_SECONDS.map((s) => ({ value: s, label: s / 60 + ' min' })),
-    (v) => {
-      form.durationSec = v;
-      changed();
-    },
-  );
-  const lapsSeg = makeSeg<number>(
-    sfx,
-    'Race laps',
-    RACE_LAPS.map((n) => ({ value: n, label: n + (n === 1 ? ' lap' : ' laps') })),
-    (v) => {
-      form.laps = v;
-      changed();
-    },
-  );
-  const skillSeg = makeSeg<BotDifficulty>(
-    sfx,
-    'Bot skill',
-    [
-      { value: 'easy', label: SKILL_LABELS[0] },
-      { value: 'normal', label: SKILL_LABELS[1] },
-      { value: 'hard', label: SKILL_LABELS[2] },
-    ],
-    (v) => {
-      form.skill = v;
-      changed();
-    },
-  );
 
-  const modeField = field('Game', modeSeg.row);
+  /** The game options, built once for the setup screen and once for the online lobby (`onPick` runs after a change). */
+  function buildOptions(onPick: () => void): Options {
+    const botsSeg = makeSeg<number>(
+      sfx,
+      'Computer boats',
+      Array.from({ length: MAX_BOTS + 1 }, (_, n) => ({ value: n, label: String(n) })),
+      (v) => {
+        form.bots = v;
+        onPick();
+      },
+    );
+    const helpersSeg = makeSeg<number>(
+      sfx,
+      'Helper boats',
+      Array.from({ length: MAX_HELPERS + 1 }, (_, n) => ({ value: n, label: String(n) })),
+      (v) => {
+        form.helpers = v;
+        onPick();
+      },
+    );
+    const modeSeg = makeSeg<ModeId>(
+      sfx,
+      'Game mode',
+      MODES.map((m) => ({ value: m.id, label: m.label, icon: m.icon, sub: m.sub })),
+      (v) => {
+        form.mode = v;
+        onPick();
+      },
+    );
+    modeSeg.row.classList.add('ff-modes');
+    const battleSeg = makeSeg<number>(
+      sfx,
+      'Match length',
+      BATTLE_SECONDS.map((s) => ({ value: s, label: s / 60 + ' min' })),
+      (v) => {
+        form.durationSec = v;
+        onPick();
+      },
+    );
+    const lapsSeg = makeSeg<number>(
+      sfx,
+      'Race laps',
+      RACE_LAPS.map((n) => ({ value: n, label: n + (n === 1 ? ' lap' : ' laps') })),
+      (v) => {
+        form.laps = v;
+        onPick();
+      },
+    );
+    const skillSeg = makeSeg<BotDifficulty>(
+      sfx,
+      'Bot skill',
+      [
+        { value: 'easy', label: SKILL_LABELS[0] },
+        { value: 'normal', label: SKILL_LABELS[1] },
+        { value: 'hard', label: SKILL_LABELS[2] },
+      ],
+      (v) => {
+        form.skill = v;
+        onPick();
+      },
+    );
+
+    const modeField = field('Game', modeSeg.row);
+    const teamHint = el('div', 'ff-help');
+    const botsField = field('Computer boats', botsSeg.row, teamHint);
+    const helpersHint = el('div', 'ff-help', 'Helper boats are on your team. They scare off sharks too!');
+    const helpersField = field('Helper boats', helpersSeg.row, helpersHint);
+    const lengthField = field('Battle length', battleSeg.row, lapsSeg.row);
+    const skillHint = el('div', 'ff-help', BOT_SKILL_HINT);
+    const skillField = field('Bot skill', skillSeg.row, skillHint);
+    const practiceNote = el(
+      'div',
+      'ff-note',
+      `No computer boats here! Pop all ${CONFIG.practice.balloons} balloons as fast as you can. ` +
+        'Gold balloons are worth 3. Dart them, or just drive right through them!',
+    );
+    const sharksNote = el(
+      'div',
+      'ff-note',
+      `Scare off ${CONFIG.sharks.waves.length} waves of sharks with your darts, then the MEGA SHARK! ` +
+        `Every bump pops a life ring. Your team has ${CONFIG.sharks.lifeRings}.`,
+    );
+
+    function teamSplitText(humans: number, count: number): string {
+      const total = humans + count;
+      const mine = Math.max(humans, Math.ceil(total / 2)); // humans + helper boats
+      const helpers = mine - humans;
+      const them = total - mine;
+      const [mineName, theirName] = CONFIG.team.names;
+      const who = humans === 1 ? 'you' : humans === 2 ? 'you both' : 'you all';
+      const plus = helpers > 0 ? ` + ${helpers} helper boat${helpers === 1 ? '' : 's'}` : '';
+      return `${mineName}: ${who}${plus}. ${theirName}: ${them} boat${them === 1 ? '' : 's'}.`;
+    }
+
+    function sync(humans: number): void {
+      const f = form;
+      const cap = maxBots(humans);
+      const count = botCount(humans);
+      const practice = f.mode === 'practice';
+      const sharks = f.mode === 'sharks';
+      const hasBots = !practice && !sharks;
+
+      modeSeg.select(f.mode);
+
+      // computer boats (not in Balloon Pop; Team Up needs at least one rival; Boats vs. Sharks has helper boats instead)
+      botsField.box.hidden = !hasBots;
+      botsField.label.textContent = f.mode === 'team' ? 'Computer boats (both teams)' : 'Computer boats';
+      botsSeg.select(count);
+      botsSeg.buttons.forEach((b, n) => {
+        b.disabled = n > cap || n < minBots();
+      });
+      teamHint.hidden = f.mode !== 'team';
+      if (f.mode === 'team') teamHint.textContent = teamSplitText(humans, count);
+      helpersField.box.hidden = !sharks;
+      helpersSeg.select(count);
+      helpersSeg.buttons.forEach((b, n) => {
+        b.disabled = n > cap;
+      });
+
+      // the skill buttons: bot skill, or in Boats vs. Sharks how fast the sharks swim
+      skillField.box.hidden = practice;
+      skillField.label.textContent = sharks ? 'Shark speed' : 'Bot skill';
+      skillSeg.row.setAttribute('aria-label', sharks ? 'Shark speed' : 'Bot skill');
+      skillSeg.buttons.forEach((b, i) => {
+        b.textContent = (sharks ? SPEED_LABELS : SKILL_LABELS)[i];
+      });
+      skillSeg.select(f.skill);
+      const noBots = count === 0 && !sharks; // sharks swim whether or not any helpers come along
+      skillSeg.buttons.forEach((b) => {
+        b.disabled = noBots;
+      });
+      skillHint.textContent = sharks ? SHARK_SPEED_HINT : BOT_SKILL_HINT;
+      skillHint.hidden = !(noBots || sharks);
+
+      // length: minutes (Dart Battle, Team Up), laps (Buoy Race), nothing (Balloon Pop counts up; Boats vs. Sharks has waves)
+      lengthField.box.hidden = practice || sharks;
+      lengthField.label.textContent = f.mode === 'race' ? 'Race laps' : f.mode === 'team' ? 'Match length' : 'Battle length';
+      battleSeg.row.hidden = f.mode === 'race';
+      lapsSeg.row.hidden = f.mode !== 'race';
+      battleSeg.select(f.durationSec);
+      lapsSeg.select(f.laps);
+      practiceNote.hidden = !practice;
+      sharksNote.hidden = !sharks;
+    }
+
+    return {
+      modeBox: modeField.box,
+      boxes: [botsField.box, helpersField.box, skillField.box, lengthField.box, practiceNote, sharksNote],
+      sync,
+    };
+  }
+  const setupOpts = buildOptions(changed);
+
   const playersField = field('Players', playersSeg.row);
-  const teamHint = el('div', 'ff-help');
-  const botsField = field('Computer boats', botsSeg.row, teamHint);
-  const helpersHint = el('div', 'ff-help', 'Helper boats are on your team. They scare off sharks too!');
-  const helpersField = field('Helper boats', helpersSeg.row, helpersHint);
-  const lengthField = field('Battle length', battleSeg.row, lapsSeg.row);
-  const skillHint = el('div', 'ff-help', BOT_SKILL_HINT);
-  const skillField = field('Bot skill', skillSeg.row, skillHint);
-  const practiceNote = el(
-    'div',
-    'ff-note',
-    `No computer boats here! Pop all ${CONFIG.practice.balloons} balloons as fast as you can. ` +
-      'Gold balloons are worth 3. Dart them, or just drive right through them!',
-  );
-  const sharksNote = el(
-    'div',
-    'ff-note',
-    `Scare off ${CONFIG.sharks.waves.length} waves of sharks with your darts, then the MEGA SHARK! ` +
-      `Every bump pops a life ring. Your team has ${CONFIG.sharks.lifeRings}.`,
-  );
 
-  // per-player name + color + Easy Driving + garage
+  // per-player name + color + Easy Driving + garage (the setup screen has two; the online lobby has one for you)
   interface PlayerCard {
     card: HTMLElement;
     input: HTMLInputElement;
-    swatches: ReturnType<typeof makeSwatches>;
+    swatches: Swatches;
     easyBtn: HTMLButtonElement;
     easyState: HTMLElement;
     easyHint: HTMLElement;
     garageBtn: HTMLButtonElement;
     garageSub: HTMLElement;
   }
-  function buildPlayerCard(i: 0 | 1): PlayerCard {
+  function buildPlayerCard(i: 0 | 1, online = false): PlayerCard {
+    // an edit in the lobby also tells the host (and through it the other players)
+    const edited = (): void => (online ? profileChanged() : changed());
     const card = el('div', 'ff-pcard');
-    card.append(el('div', 'ff-label', `Player ${i + 1}`));
+    card.append(el('div', 'ff-label', online ? 'Your boat' : `Player ${i + 1}`));
 
     const nameRow = el('div', 'ff-row');
     const input = el('input', 'ff-input');
@@ -501,19 +700,21 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     input.setAttribute('autocapitalize', 'words');
     input.setAttribute('autocorrect', 'off');
     input.setAttribute('enterkeyhint', 'done');
-    input.placeholder = `Player ${i + 1}`;
+    input.placeholder = online ? 'Your name' : `Player ${i + 1}`;
     input.setAttribute('data-nav', '');
-    input.setAttribute('aria-label', `Player ${i + 1} name`);
+    input.setAttribute('aria-label', online ? 'Your name' : `Player ${i + 1} name`);
     input.addEventListener('input', () => {
       form.names[i] = input.value;
       save();
+      if (online) scheduleProfile();
     });
     input.addEventListener('focus', () => input.select()); // easy to type over the default
+    if (online) input.addEventListener('blur', flushProfile);
     nameRow.append(input);
 
-    const swatches = makeSwatches(sfx, `Player ${i + 1} boat color`, CONFIG.colors, (c) => {
+    const swatches = makeSwatches(sfx, online ? 'Your boat color' : `Player ${i + 1} boat color`, CONFIG.colors, (c) => {
       form.colors[i] = c;
-      changed();
+      edited();
     });
 
     // Easy Driving: one big switch, with a sentence about what it does.
@@ -526,7 +727,7 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     easyBtn.addEventListener('click', () => {
       form.easy[i] = !form.easy[i];
       sfx.uiSelect();
-      changed();
+      edited();
     });
     const easyRow = el('div', 'ff-row');
     easyRow.append(easyBtn);
@@ -537,7 +738,7 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     garageBtn.append(garageSub);
     garageBtn.addEventListener('click', () => {
       sfx.uiSelect();
-      openGarage(i);
+      openGarage(i, online ? 'lobby' : 'setup');
     });
     const garageRow = el('div', 'ff-row');
     garageRow.append(garageBtn);
@@ -546,21 +747,14 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     return { card, input, swatches, easyBtn, easyState, easyHint, garageBtn, garageSub };
   }
   const pcards: [PlayerCard, PlayerCard] = [buildPlayerCard(0), buildPlayerCard(1)];
+  const ocard = buildPlayerCard(0, true); // "Your boat" in the online lobby
 
   const optsCol = el('div', 'ff-col');
-  optsCol.append(
-    playersField.box,
-    botsField.box,
-    helpersField.box,
-    skillField.box,
-    lengthField.box,
-    practiceNote,
-    sharksNote,
-  );
+  optsCol.append(playersField.box, ...setupOpts.boxes);
   const grid = el('div', 'ff-grid');
   grid.append(optsCol, pcards[0].card, pcards[1].card);
   const setupCard = el('div', 'ff-card ff-setup-card');
-  setupCard.append(modeField.box, grid);
+  setupCard.append(setupOpts.modeBox, grid);
 
   const startBtn = button('Start!', 'ff-btn ff-btn--primary ff-btn--hero');
   const startRow = el('div', 'ff-row ff-start-wrap');
@@ -572,21 +766,34 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
   const garage = createGarage(sfx);
   garage.el.hidden = true;
 
-  function openGarage(i: 0 | 1): void {
+  /** For a paint swatch: a short tag ("P2") if somebody else already has that color, else null. */
+  function takenFor(i: 0 | 1, online: boolean): (c: number) => string | null {
+    if (online) {
+      return (c) => {
+        const other = lobby?.players.find((p) => !isMe(p) && p.color === c);
+        return other ? 'P' + (other.slot + 1) : null;
+      };
+    }
+    return (c) => (form.humans === 2 && form.colors[1 - i] === c ? 'P' + (2 - i) : null);
+  }
+
+  function openGarage(i: 0 | 1, back: 'setup' | 'lobby'): void {
     garageFor = i;
+    garageBack = back;
+    const edited = (): void => (back === 'lobby' ? profileChanged() : changed());
     garage.open(
       {
         title: `${cleanName(i)}'s boat`,
         look: form.looks[i],
         color: form.colors[i],
-        takenBy: (c) => (form.humans === 2 && form.colors[1 - i] === c ? 'P' + (2 - i) : null),
+        takenBy: takenFor(i, back === 'lobby'),
         onLook: (look) => {
           form.looks[i] = look;
-          changed();
+          edited();
         },
         onColor: (c) => {
           form.colors[i] = c;
-          changed();
+          edited();
         },
       },
       closeGarage,
@@ -594,7 +801,7 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     showScreen('garage');
   }
   function closeGarage(): void {
-    showScreen('setup', pcards[garageFor].garageBtn);
+    showScreen(garageBack, (garageBack === 'lobby' ? ocard : pcards[garageFor]).garageBtn);
   }
 
   // ───── Trophy Shelf screen ─────
@@ -635,6 +842,186 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     }
   }
 
+  // ───── Play Online: host or join ─────
+  const onlineEl = el('section', 'ff-screen ff-online');
+  onlineEl.hidden = true;
+  const onlineBackBtn = button('← Back', 'ff-btn');
+  const onlineBackRow = el('div', 'ff-row');
+  onlineBackRow.append(onlineBackBtn);
+  const onlineHead = el('div', 'ff-setup-head');
+  onlineHead.append(onlineBackRow, el('h2', 'ff-setup-title ff-ol', 'Play Online'));
+
+  /** A big card-button: picture, title, one line about it. */
+  function bigCard(icon: string, title: string, sub: string): { btn: HTMLButtonElement; title: HTMLElement } {
+    const btn = button('', 'ff-btn ff-bigcard');
+    const ico = el('span', 'ff-bigcard-ico', icon);
+    ico.setAttribute('aria-hidden', 'true');
+    const heading = el('span', 'ff-bigcard-title', title);
+    btn.append(ico, heading, el('span', 'ff-bigcard-sub', sub));
+    return { btn, title: heading };
+  }
+  const hostCard = bigCard('🎉', 'Host a game', 'Start a game and share the code');
+  const joinCard = bigCard('🎟️', 'Join a game', 'Type the code from the other screen');
+  const hostBtn = hostCard.btn;
+  const joinBtn = joinCard.btn;
+  const onlineCards = el('div', 'ff-row ff-bigcards');
+  onlineCards.append(hostBtn, joinBtn);
+  const onlineProblem = makeProblem();
+  const onlineHelp = el('p', 'ff-online-help ff-ol', 'Everyone opens this same game page. You need the internet!');
+  onlineEl.append(onlineHead, onlineCards, onlineProblem.root, onlineHelp);
+
+  // ───── Play Online: join with a code ─────
+  const joinEl = el('section', 'ff-screen ff-join');
+  joinEl.hidden = true;
+  const joinBackBtn = button('← Back', 'ff-btn');
+  const joinBackRow = el('div', 'ff-row');
+  joinBackRow.append(joinBackBtn);
+  const joinHead = el('div', 'ff-setup-head');
+  joinHead.append(joinBackRow, el('h2', 'ff-setup-title ff-ol', 'Join a game'));
+
+  // The code: four big letter tiles. Under them sits an invisible text box, so a real keyboard works too
+  // (it must be a text box: the game's own keys, like W A S D and M, are switched off while one is focused).
+  // inputmode="none" keeps the iPad's own keyboard from popping up over our big one.
+  const codeBox = el('div', 'ff-row ff-codebox');
+  const codeTiles = Array.from({ length: CODE_LENGTH }, () => el('span', 'ff-slot is-empty'));
+  codeTiles.forEach((t) => t.setAttribute('aria-hidden', 'true'));
+  const codeInput = el('input', 'ff-codeinput');
+  codeInput.type = 'text';
+  codeInput.autocomplete = 'off';
+  codeInput.spellcheck = false;
+  codeInput.setAttribute('inputmode', 'none');
+  codeInput.setAttribute('autocapitalize', 'characters');
+  codeInput.setAttribute('autocorrect', 'off');
+  codeInput.setAttribute('enterkeyhint', 'go');
+  codeInput.setAttribute('data-nav', '');
+  codeInput.setAttribute('aria-label', `Game code: ${CODE_LENGTH} letters`);
+  codeBox.append(...codeTiles, codeInput);
+
+  const keypad = el('div', 'ff-keypad');
+  const keyButtons: HTMLButtonElement[] = [];
+  const keyItems = [...CODE_ALPHABET, '⌫'];
+  for (let r = 0; r * KEYPAD_COLS < keyItems.length; r++) {
+    const row = el('div', 'ff-row ff-keyrow');
+    row.style.setProperty('--n', String(KEYPAD_COLS));
+    for (const ch of keyItems.slice(r * KEYPAD_COLS, (r + 1) * KEYPAD_COLS)) {
+      const isDelete = ch === '⌫';
+      const k = button(ch, 'ff-btn ff-keyl' + (isDelete ? ' ff-keyl--del' : ''));
+      if (isDelete) {
+        k.setAttribute('aria-label', 'Delete');
+        k.append(el('span', 'ff-keyl-sub', 'Delete'));
+      } else {
+        k.setAttribute('aria-label', ch);
+      }
+      k.addEventListener('click', (e) => {
+        if (busy !== '') return;
+        // (detail 0 = pressed from the keyboard or a gamepad, not with a mouse or finger)
+        if (isDelete) {
+          sfx.uiMove();
+          setCode(joinCode.slice(0, -1));
+        } else {
+          sfx.uiSelect();
+          addLetter(ch, e.detail === 0);
+        }
+        // After a mouse click or a tap, typing goes back to the code box, so a real keyboard still works.
+        if (e.detail > 0 && !touchDevice) codeInput.focus({ preventScroll: true });
+      });
+      row.append(k);
+      keyButtons.push(k);
+    }
+    keypad.append(row);
+  }
+
+  const joinLead = el('p', 'ff-join-lead', 'Type the code from the other screen');
+  const joinHelp = el(
+    'p',
+    'ff-help ff-join-help',
+    `Codes have ${CODE_LENGTH} letters.` + (MISSING_TEXT ? ` They never use ${MISSING_TEXT}.` : ''),
+  );
+  const joinProblem = makeProblem();
+  const joinCardEl = el('div', 'ff-card ff-join-card');
+  joinCardEl.append(joinLead, codeBox, joinHelp, joinProblem.root, keypad);
+  const joinGoBtn = button('Join!', 'ff-btn ff-btn--primary ff-btn--hero');
+  joinGoBtn.disabled = true;
+  const joinGoRow = el('div', 'ff-row ff-start-wrap');
+  joinGoRow.append(joinGoBtn);
+  joinEl.append(joinHead, joinCardEl, joinGoRow);
+
+  // ───── Play Online: the lobby ─────
+  const lobbyEl = el('section', 'ff-screen ff-setup ff-lobby');
+  lobbyEl.hidden = true;
+  const lobbyLeaveBtn = button('← Leave', 'ff-btn');
+  const lobbyLeaveRow = el('div', 'ff-row');
+  lobbyLeaveRow.append(lobbyLeaveBtn);
+  const lobbyHead = el('div', 'ff-setup-head');
+  lobbyHead.append(lobbyLeaveRow, el('h2', 'ff-setup-title ff-ol', 'Online game'));
+
+  // the room code, big enough to read out across the room
+  const lobbyTiles = Array.from({ length: CODE_LENGTH }, () => el('span', 'ff-slot ff-slot--lobby'));
+  lobbyTiles.forEach((t) => t.setAttribute('aria-hidden', 'true'));
+  const lobbyCodeTiles = el('div', 'ff-codetiles');
+  lobbyCodeTiles.setAttribute('role', 'img');
+  lobbyCodeTiles.append(...lobbyTiles);
+  const lobbyCodeLabel = el('div', 'ff-label', 'Game code');
+  const lobbyCodeCol = el('div', 'ff-codecol');
+  lobbyCodeCol.append(lobbyCodeLabel, lobbyCodeTiles);
+  const lobbyCodeHelp = el('div', 'ff-codehelp');
+  const codeBlock = el('div', 'ff-codeblock');
+  codeBlock.append(lobbyCodeCol, lobbyCodeHelp);
+
+  // who is here
+  interface LobbyRow {
+    root: HTMLElement;
+    name: HTMLElement;
+    tags: HTMLElement;
+  }
+  const lobbyRows: LobbyRow[] = [];
+  const lobbyList = el('div', 'ff-lplayers');
+  lobbyList.setAttribute('role', 'list');
+  for (let i = 0; i < MAX_ONLINE_PLAYERS; i++) {
+    const rowEl = el('div', 'ff-lplayer is-open');
+    rowEl.setAttribute('role', 'listitem');
+    const boat = el('span', 'ff-lboat');
+    boat.setAttribute('aria-hidden', 'true');
+    boat.append(svgNode(LOBBY_BOAT_SVG));
+    const name = el('span', 'ff-lname');
+    const tags = el('span', 'ff-ltags');
+    rowEl.append(boat, name, tags);
+    lobbyList.append(rowEl);
+    lobbyRows.push({ root: rowEl, name, tags });
+  }
+  const lobbyPlayersField = field('Players', lobbyList);
+  const lobbyStatus = el('div', 'ff-lobby-status');
+  lobbyStatus.setAttribute('role', 'status');
+  const lobbyProblem = makeProblem();
+  const lobbyWho = el('div', 'ff-col');
+  lobbyWho.append(lobbyPlayersField.box, lobbyStatus, lobbyProblem.root);
+  const lobbyGrid = el('div', 'ff-grid ff-lgrid');
+  lobbyGrid.append(lobbyWho, ocard.card);
+
+  // the game settings: the host picks (same widgets as the setup screen), guests just read
+  const lobbyOpts = buildOptions(settingsChanged);
+  const lobbyOptsGrid = el('div', 'ff-grid ff-lopts');
+  lobbyOptsGrid.append(...lobbyOpts.boxes);
+  const lobbyHostBox = el('div', 'ff-col');
+  lobbyHostBox.append(lobbyOpts.modeBox, lobbyOptsGrid);
+  const lobbyGuestBox = el('div', 'ff-col');
+
+  const lobbyCard = el('div', 'ff-card ff-setup-card');
+  lobbyCard.append(codeBlock, lobbyGrid, lobbyHostBox, lobbyGuestBox);
+
+  const lobbyStartBtn = button('Start!', 'ff-btn ff-btn--primary ff-btn--hero');
+  const lobbyStartSub = el('span', 'ff-start-sub');
+  lobbyStartBtn.append(lobbyStartSub);
+  const lobbyStartRow = el('div', 'ff-row ff-start-wrap ff-lstart');
+  lobbyStartRow.append(lobbyStartBtn);
+  const lobbyWait = el('div', 'ff-start-wrap ff-waitbar');
+  lobbyWait.setAttribute('role', 'status');
+  const lobbyDots = el('span', 'ff-dots');
+  lobbyDots.setAttribute('aria-hidden', 'true');
+  lobbyDots.append(el('i'), el('i'), el('i'));
+  lobbyWait.append(el('span', '', 'Waiting for the host to start...'), lobbyDots);
+  lobbyEl.append(lobbyHead, lobbyCard, lobbyStartRow, lobbyWait);
+
   // ───── sound toggle (always reachable) ─────
   const soundRow = el('div', 'ff-row ff-sound-wrap');
   const soundBtn = button('', 'ff-btn ff-sound');
@@ -659,85 +1046,46 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     if (!sfx.muted) sfx.uiSelect();
   });
 
-  menuEl.append(titleEl, setupEl, garage.el, shelfEl, soundRow);
+  menuEl.append(titleEl, setupEl, garage.el, shelfEl, onlineEl, joinEl, lobbyEl, soundRow);
 
   // ───── keeping the screen in sync with `form` ─────
-  function teamSplitText(): string {
-    const humans = form.humans;
-    const total = humans + botCount();
-    const mine = Math.max(humans, Math.ceil(total / 2)); // humans + helper boats
-    const helpers = mine - humans;
-    const them = total - mine;
-    const [mineName, theirName] = CONFIG.team.names;
-    const who = humans === 1 ? 'you' : 'you both';
-    const plus = helpers > 0 ? ` + ${helpers} helper boat${helpers === 1 ? '' : 's'}` : '';
-    return `${mineName}: ${who}${plus}. ${theirName}: ${them} boat${them === 1 ? '' : 's'}.`;
+  /** One player card (setup screen or lobby) shows form slot `i`. */
+  function syncCard(pc: PlayerCard, i: 0 | 1, takenBy: (c: number) => string | null): void {
+    pc.card.style.setProperty('--c', cssColor(form.colors[i]));
+    pc.swatches.sync(form.colors[i], takenBy);
+    const easy = form.easy[i];
+    pc.easyBtn.setAttribute('aria-pressed', String(easy));
+    pc.easyState.textContent = easy ? 'ON' : 'OFF';
+    pc.easyHint.textContent = easy
+      ? 'Your boat cruises by itself, turns gently and glides past rocks. Just steer and shoot!'
+      : 'You do all the driving: go, brake and steer yourself. For pros!';
+    pc.garageSub.textContent = describeLook(form.looks[i]);
   }
 
   function applyForm(): void {
     const f = form;
-    const cap = maxBots();
-    const count = botCount();
-    const practice = f.mode === 'practice';
-    const sharks = f.mode === 'sharks';
-    const hasBots = !practice && !sharks;
-
     playersSeg.select(f.humans);
-    modeSeg.select(f.mode);
-
-    // computer boats (not in Balloon Pop; Team Up needs at least one rival; Boats vs. Sharks has helper boats instead)
-    botsField.box.hidden = !hasBots;
-    botsField.label.textContent = f.mode === 'team' ? 'Computer boats (both teams)' : 'Computer boats';
-    botsSeg.select(count);
-    botsSeg.buttons.forEach((b, n) => {
-      b.disabled = n > cap || n < minBots();
-    });
-    teamHint.hidden = f.mode !== 'team';
-    if (f.mode === 'team') teamHint.textContent = teamSplitText();
-    helpersField.box.hidden = !sharks;
-    helpersSeg.select(count);
-    helpersSeg.buttons.forEach((b, n) => {
-      b.disabled = n > cap;
-    });
-
-    // the skill buttons: bot skill, or in Boats vs. Sharks how fast the sharks swim
-    skillField.box.hidden = practice;
-    skillField.label.textContent = sharks ? 'Shark speed' : 'Bot skill';
-    skillSeg.row.setAttribute('aria-label', sharks ? 'Shark speed' : 'Bot skill');
-    skillSeg.buttons.forEach((b, i) => {
-      b.textContent = (sharks ? SPEED_LABELS : SKILL_LABELS)[i];
-    });
-    skillSeg.select(f.skill);
-    const noBots = count === 0 && !sharks; // sharks swim whether or not any helpers come along
-    skillSeg.buttons.forEach((b) => {
-      b.disabled = noBots;
-    });
-    skillHint.textContent = sharks ? SHARK_SPEED_HINT : BOT_SKILL_HINT;
-    skillHint.hidden = !(noBots || sharks);
-
-    // length: minutes (Dart Battle, Team Up), laps (Buoy Race), nothing (Balloon Pop counts up; Boats vs. Sharks has waves)
-    lengthField.box.hidden = practice || sharks;
-    lengthField.label.textContent = f.mode === 'race' ? 'Race laps' : f.mode === 'team' ? 'Match length' : 'Battle length';
-    battleSeg.row.hidden = f.mode === 'race';
-    lapsSeg.row.hidden = f.mode !== 'race';
-    battleSeg.select(f.durationSec);
-    lapsSeg.select(f.laps);
-    practiceNote.hidden = !practice;
-    sharksNote.hidden = !sharks;
-
+    setupOpts.sync(f.humans);
+    lobbyOpts.sync(lobbyHumans());
     pcards.forEach((pc, i) => {
       pc.card.hidden = i >= f.humans;
-      pc.card.style.setProperty('--c', cssColor(f.colors[i]));
-      pc.swatches.sync(f.colors[i], (c) => (f.humans === 2 && f.colors[1 - i] === c ? 'P' + (2 - i) : null));
-      const easy = f.easy[i];
-      pc.easyBtn.setAttribute('aria-pressed', String(easy));
-      pc.easyState.textContent = easy ? 'ON' : 'OFF';
-      pc.easyHint.textContent = easy
-        ? 'Your boat cruises by itself, turns gently and glides past rocks. Just steer and shoot!'
-        : 'You do all the driving: go, brake and steer yourself. For pros!';
-      pc.garageSub.textContent = describeLook(f.looks[i]);
+      syncCard(pc, i === 1 ? 1 : 0, takenFor(i === 1 ? 1 : 0, false));
     });
+    syncCard(ocard, 0, takenFor(0, true));
     boatArt.style.setProperty('--boat', cssColor(f.colors[0]));
+  }
+
+  /** The name boxes show what is in `form` (a name typed on the other screen must show up here too). */
+  function syncNames(): void {
+    pcards.forEach((pc, i) => {
+      if (document.activeElement !== pc.input) pc.input.value = form.names[i];
+    });
+    if (document.activeElement !== ocard.input) ocard.input.value = lobbyName();
+  }
+  /** The name the host gave us (it may have added a 2 to tell two Sams apart), else the one we typed. */
+  function lobbyName(): string {
+    const me = lobby?.players.find(isMe);
+    return me ? me.name : form.names[0];
   }
 
   // ───── screen switching ─────
@@ -747,9 +1095,20 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     setupEl.hidden = which !== 'setup';
     garage.el.hidden = which !== 'garage';
     shelfEl.hidden = which !== 'shelf';
+    onlineEl.hidden = which !== 'online';
+    joinEl.hidden = which !== 'join';
+    lobbyEl.hidden = which !== 'lobby';
     if (which !== 'garage') garage.close(); // frees the 3D preview
+    if (which !== 'title') titleNotice.set(null);
+    if (which === 'setup' || which === 'lobby') syncNames();
     if (which === 'setup' && !focusEl) setupEl.scrollTop = 0;
     if (which === 'garage') garage.el.scrollTop = 0;
+    if (which === 'online') onlineEl.scrollTop = 0;
+    if (which === 'join') joinEl.scrollTop = 0;
+    if (which === 'lobby') {
+      renderLobby();
+      if (!focusEl) lobbyEl.scrollTop = 0;
+    }
     if (which === 'shelf') {
       renderShelf();
       shelfEl.scrollTop = 0;
@@ -762,6 +1121,12 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
   function mainButton(): HTMLElement {
     if (screen === 'setup') return startBtn;
     if (screen === 'shelf') return shelfBackBtn;
+    if (screen === 'online') return hostBtn;
+    if (screen === 'join') {
+      if (joinCode.length === CODE_LENGTH) return joinGoBtn;
+      return touchDevice ? keyButtons[0] : codeInput; // (no code box focus on an iPad: it needs no keyboard)
+    }
+    if (screen === 'lobby') return role === 'host' && !lobbyStartBtn.disabled ? lobbyStartBtn : lobbyLeaveBtn;
     return playBtn;
   }
 
@@ -789,10 +1154,6 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     onStart(buildSetup());
   });
 
-  function cleanName(i: number): string {
-    return form.names[i].trim().slice(0, NAME_MAX) || `Player ${i + 1}`;
-  }
-
   function buildSetup(): MatchSetup {
     const humans = form.humans;
     const players: MatchSetup['players'] = [];
@@ -807,12 +1168,342 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     return {
       mode: form.mode,
       humans,
-      bots: botCount(),
+      bots: botCount(humans),
       botDifficulty: form.skill,
       players,
       durationSec: form.durationSec,
       laps: form.laps,
     };
+  }
+
+  // ───── online: host / join ─────
+  onlineBtn.addEventListener('click', () => {
+    sfx.uiSelect();
+    onlineProblem.set(null);
+    showScreen('online');
+  });
+  onlineBackBtn.addEventListener('click', leaveOnline);
+  hostBtn.addEventListener('click', startHosting);
+  joinBtn.addEventListener('click', () => {
+    if (busy !== '') return;
+    sfx.uiSelect();
+    setCode('');
+    showScreen('join');
+  });
+  joinBackBtn.addEventListener('click', leaveJoin);
+  joinGoBtn.addEventListener('click', tryJoin);
+  lobbyLeaveBtn.addEventListener('click', leaveRoom);
+  lobbyStartBtn.addEventListener('click', startOnlineMatch);
+
+  /** Disable the buttons that would start a second request while one is still on its way. */
+  function applyBusy(): void {
+    const on = busy !== '';
+    hostBtn.disabled = on;
+    joinBtn.disabled = on;
+    hostCard.title.textContent = busy === 'host' ? 'Opening your game...' : 'Host a game';
+    for (const k of keyButtons) k.disabled = on;
+    joinGoBtn.textContent = busy === 'join' ? 'Joining...' : 'Join!';
+    joinGoBtn.disabled = on || joinCode.length < CODE_LENGTH;
+  }
+
+  function startHosting(): void {
+    const h = hooks;
+    if (busy !== '' || !h) return;
+    sfx.uiSelect();
+    onlineProblem.set(null);
+    busy = 'host';
+    const token = ++netToken;
+    applyBusy();
+    onlineBackBtn.focus({ preventScroll: true });
+    Promise.resolve()
+      .then(() => h.host(profile()))
+      .then(
+        (code) => {
+          busy = '';
+          applyBusy();
+          if (token !== netToken) h.leave(); // the player walked away while it was opening: close that room again
+          else enterLobby('host', code);
+        },
+        (err: unknown) => {
+          busy = '';
+          applyBusy();
+          if (token !== netToken) return;
+          onlineProblem.set(errorText(err));
+          hostBtn.focus({ preventScroll: true });
+        },
+      );
+  }
+
+  function tryJoin(): void {
+    const h = hooks;
+    if (busy !== '' || !h || joinCode.length !== CODE_LENGTH) return;
+    sfx.uiSelect();
+    joinProblem.set(null);
+    const code = joinCode;
+    busy = 'join';
+    const token = ++netToken;
+    applyBusy();
+    joinBackBtn.focus({ preventScroll: true });
+    Promise.resolve()
+      .then(() => h.join(code, profile()))
+      .then(
+        () => {
+          busy = '';
+          applyBusy();
+          if (token !== netToken) h.leave();
+          else enterLobby('guest', code);
+        },
+        (err: unknown) => {
+          busy = '';
+          applyBusy();
+          if (token !== netToken) return;
+          joinProblem.set(errorText(err));
+          mainButton().focus({ preventScroll: true });
+        },
+      );
+  }
+
+  /** Back from the Play Online screen to the title (a room that is still opening is shut again when it is ready). */
+  function leaveOnline(): void {
+    sfx.uiMove();
+    if (busy === 'host') netToken++;
+    showScreen('title', onlineBtn);
+  }
+
+  /** Back from the join screen (a join still on its way is undone when it arrives). */
+  function leaveJoin(): void {
+    sfx.uiMove();
+    if (busy === 'join') netToken++;
+    showScreen('online', joinBtn);
+  }
+
+  // ───── online: the join code ─────
+  function renderCode(): void {
+    codeTiles.forEach((tile, i) => {
+      tile.textContent = joinCode.charAt(i);
+      tile.classList.toggle('is-empty', i >= joinCode.length);
+      tile.classList.toggle('is-next', i === joinCode.length);
+    });
+    joinGoBtn.disabled = busy !== '' || joinCode.length < CODE_LENGTH;
+  }
+
+  function setCode(text: string): void {
+    joinCode = cleanCode(text);
+    if (codeInput.value !== joinCode) codeInput.value = joinCode;
+    joinProblem.set(null); // a new try, a fresh start
+    renderCode();
+  }
+
+  function addLetter(ch: string, viaKeys: boolean): void {
+    if (joinCode.length >= CODE_LENGTH) return;
+    setCode(joinCode + ch);
+    // With keys or a gamepad, land on the big Join button once the code is complete.
+    if (viaKeys && joinCode.length === CODE_LENGTH) joinGoBtn.focus({ preventScroll: true });
+  }
+
+  /** A little shake when a typed letter can't be part of a code. */
+  function shakeCode(): void {
+    codeBox.classList.remove('is-shake');
+    void codeBox.offsetWidth; // restart the animation
+    codeBox.classList.add('is-shake');
+  }
+  codeBox.addEventListener('animationend', () => codeBox.classList.remove('is-shake'));
+
+  codeInput.addEventListener('input', () => {
+    const typed = codeInput.value.toUpperCase();
+    if ([...typed].some((ch) => !CODE_ALPHABET.includes(ch))) shakeCode(); // not a letter a code has
+    setCode(typed);
+  });
+
+  // ───── online: the lobby ─────
+  function renderGuestSettings(): void {
+    lobbyGuestBox.replaceChildren();
+    const s = lobby?.settings ?? null;
+    if (!s) {
+      lobbyGuestBox.append(el('div', 'ff-help', 'The host is picking the game...'));
+      return;
+    }
+    const mode = MODES.find((m) => m.id === s.mode) ?? MODES[0];
+    const card = el('div', 'ff-gmode');
+    const ico = el('span', 'ff-gmode-ico', mode.icon);
+    ico.setAttribute('aria-hidden', 'true');
+    const text = el('div', 'ff-gmode-text');
+    text.append(el('div', 'ff-gmode-name', mode.label), el('div', 'ff-help', mode.sub));
+    card.append(ico, text);
+
+    const chips = el('div', 'ff-chips');
+    const chip = (label: string, value: string): void => {
+      const c = el('div', 'ff-chip');
+      c.append(el('span', 'ff-chip-label', label), el('b', 'ff-chip-value', value));
+      chips.append(c);
+    };
+    const sharks = s.mode === 'sharks';
+    if (s.mode !== 'practice') {
+      chip(sharks ? 'Helper boats' : 'Computer boats', String(s.bots));
+      if (sharks || s.bots > 0) {
+        const skill = (sharks ? SPEED_LABELS : SKILL_LABELS)[SKILL_ORDER.indexOf(s.botDifficulty)] ?? '';
+        chip(sharks ? 'Shark speed' : 'Bot skill', skill);
+      }
+    }
+    if (s.mode === 'race') chip('Race laps', String(s.laps));
+    else if (s.mode === 'battle' || s.mode === 'team') chip('Match length', s.durationSec / 60 + ' min');
+
+    lobbyGuestBox.append(field('Game (the host picks)', card, chips).box);
+  }
+
+  /** The lobby's players (or just you, while the first lobby is still on its way to a host). */
+  function lobbyPlayers(): LobbyPlayer[] {
+    if (lobby && lobby.players.length > 0) return lobby.players;
+    if (role !== 'host') return [];
+    return [
+      { slot: 0, name: cleanName(0), color: form.colors[0], look: form.looks[0], easyDriving: form.easy[0], isHost: true, isYou: true },
+    ];
+  }
+
+  /** Redraw everything the lobby shows from `lobby` + `form`. Only runs when something changed. */
+  function renderLobby(): void {
+    const host = role !== 'guest';
+    const code = lobby?.code || roomCode;
+    for (let i = 0; i < CODE_LENGTH; i++) {
+      lobbyTiles[i].textContent = code.charAt(i) || '·';
+      lobbyTiles[i].classList.toggle('is-empty', code.charAt(i) === '');
+    }
+    lobbyCodeTiles.setAttribute('aria-label', code ? `Game code ${[...code].join(' ')}` : 'Getting the game code');
+    lobbyCodeHelp.textContent = code
+      ? `On the other device: Play Online → Join → type ${code}`
+      : 'Getting your game ready...';
+    lobbyStatus.textContent = lobby?.status || (host ? 'Waiting for players...' : 'Joining the game...');
+    lobbyProblem.set(lobby?.error ?? null);
+
+    const players = lobbyPlayers();
+    lobbyPlayersField.label.textContent = `Players (${players.length} of ${MAX_ONLINE_PLAYERS})`;
+    lobbyRows.forEach((row, i) => {
+      const p: LobbyPlayer | undefined = players[i];
+      row.root.classList.toggle('is-open', p === undefined);
+      if (p) {
+        row.root.style.setProperty('--c', cssColor(p.color));
+        row.name.textContent = p.name;
+        row.tags.textContent = [isMe(p) ? '(you)' : '', p.isHost ? '(host)' : ''].filter(Boolean).join(' ');
+      } else {
+        row.name.textContent = 'Waiting for a player...';
+        row.tags.textContent = '';
+      }
+    });
+    if (document.activeElement !== ocard.input) ocard.input.value = lobbyName();
+
+    lobbyHostBox.hidden = !host;
+    lobbyGuestBox.hidden = host;
+    if (host) lobbyOpts.sync(players.length);
+    else renderGuestSettings();
+
+    lobbyStartRow.hidden = !host;
+    lobbyWait.hidden = host;
+    lobbyStartBtn.disabled = lobbyStarting || players.length < 2;
+    lobbyStartSub.textContent =
+      players.length < 2 ? 'Waiting for a friend to join...' : lobbyStarting ? 'Here we go!' : 'Everyone is here!';
+  }
+
+  /** A brand new room is open (we hosted it, or the host let us in). */
+  function enterLobby(r: 'host' | 'guest', code: string): void {
+    if (lobby && lobby.code && lobby.code !== code) lobby = null; // an old room's lobby
+    role = r;
+    roomCode = code.toUpperCase();
+    lobbyStarting = false;
+    settingsKey = '';
+    if (r === 'host') pushSettings(); // tell the room what the host picked (the lobby mirrors it to guests)
+    if (screen === 'lobby') renderLobby();
+    else showScreen('lobby');
+  }
+
+  /** The player left the room (or walked away from joining it). */
+  function resetOnline(): void {
+    role = null;
+    lobby = null;
+    roomCode = '';
+    netToken++; // an answer still on its way is no longer wanted
+    lobbyStarting = false;
+    settingsKey = '';
+    window.clearTimeout(startTimer);
+    startTimer = 0;
+    window.clearTimeout(profileTimer);
+    profileTimer = 0;
+    onlineProblem.set(null);
+    setCode('');
+  }
+
+  function leaveRoom(): void {
+    const h = hooks;
+    sfx.uiMove();
+    resetOnline();
+    showScreen('title', onlineBtn);
+    h?.leave();
+  }
+
+  /** The match settings as the online app wants them (it adds the lobby's players itself). */
+  function onlineSetup(): MatchSetup {
+    return {
+      mode: form.mode,
+      humans: 1,
+      bots: botCount(lobbyHumans()),
+      botDifficulty: form.skill,
+      players: [profile()],
+      durationSec: form.durationSec,
+      laps: form.laps,
+      online: null,
+    };
+  }
+
+  /** Tell the app the host's settings (only when they really changed: friends joining can shrink the bot count). */
+  function pushSettings(): void {
+    if (!hooks || role !== 'host') return;
+    const s = onlineSetup();
+    const key = [s.mode, s.bots, s.botDifficulty, s.durationSec, s.laps].join('|');
+    if (key === settingsKey) return;
+    settingsKey = key;
+    hooks.settings(s);
+  }
+
+  /** The host changed a setting in the lobby. */
+  function settingsChanged(): void {
+    changed();
+    pushSettings();
+  }
+
+  /** The player changed their name, color, boat or Easy Driving while in the lobby. */
+  function profileChanged(): void {
+    changed();
+    pushProfile();
+  }
+  function pushProfile(): void {
+    window.clearTimeout(profileTimer);
+    profileTimer = 0;
+    if (!hooks || role === null) return;
+    profileSentAt = performance.now();
+    hooks.profile(profile());
+  }
+  /** A name is typed one letter at a time: tell the host once the typing pauses. */
+  function scheduleProfile(): void {
+    window.clearTimeout(profileTimer);
+    profileTimer = window.setTimeout(pushProfile, PROFILE_SEND_MS);
+  }
+  function flushProfile(): void {
+    if (profileTimer !== 0) pushProfile();
+  }
+
+  function startOnlineMatch(): void {
+    if (!hooks || role !== 'host' || lobbyStarting || lobbyHumans() < 2) return;
+    lobbyStarting = true; // a double tap must not start two matches; it comes back if no match begins
+    sfx.uiSelect();
+    save();
+    flushProfile();
+    renderLobby();
+    window.clearTimeout(startTimer);
+    startTimer = window.setTimeout(() => {
+      startTimer = 0;
+      lobbyStarting = false;
+      if (screen === 'lobby') renderLobby();
+    }, START_REARM_MS);
+    hooks.start(onlineSetup());
   }
 
   // ───── input from mouse / keyboard focus / gamepad ─────
@@ -834,8 +1525,11 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     const typing = active instanceof HTMLInputElement;
 
     if (back) {
-      if (typing) active.blur(); // Escape just leaves the name box
-      else if (screen === 'setup') {
+      if (screen === 'join') {
+        leaveJoin(); // even from the code box
+      } else if (typing) {
+        active.blur(); // Escape just leaves the name box
+      } else if (screen === 'setup') {
         sfx.uiMove();
         showScreen('title');
       } else if (screen === 'garage') {
@@ -844,11 +1538,21 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
       } else if (screen === 'shelf') {
         sfx.uiMove();
         showScreen('title', shelfBtn);
+      } else if (screen === 'online') {
+        leaveOnline();
+      } else if (screen === 'lobby') {
+        // Leaving shuts the room for everyone when you are the host, so Back only walks to the Leave button.
+        sfx.uiMove();
+        lobbyLeaveBtn.focus();
       }
       return;
     }
     if (confirm) {
-      if (typing) {
+      if (screen === 'join' && active === codeInput) {
+        // Enter in the code box = Join (or on to the keypad while the code is short)
+        if (joinCode.length === CODE_LENGTH) tryJoin();
+        else keyButtons[0].focus();
+      } else if (typing) {
         // Enter in the name box = "done", hop to the colors
         const next = stepFocus(collectRows(menuEl), active, 0, 1);
         active.blur();
@@ -878,9 +1582,19 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
   }
 
   // ───── public ─────
+  /** Make the menu visible (first time, or coming back from a match). */
+  function open(): void {
+    menuEl.hidden = false;
+    visible = true;
+    started = false;
+    // Keyboard and gamepad users get the focus ring right away; on an iPad it waits for a key or button press.
+    menuEl.classList.toggle('ff-nav', !touchDevice);
+    refreshSound();
+  }
+
   function show(initial: MatchSetup | null, cb: (setup: MatchSetup) => void): void {
     onStart = cb;
-    started = false;
+    resetOnline(); // the title screen is offline: any room we were in is over
     form = loadForm();
     if (initial) {
       form.humans = initial.humans === 2 ? 2 : 1;
@@ -899,26 +1613,86 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     }
     pcards[0].input.value = form.names[0];
     pcards[1].input.value = form.names[1];
+    ocard.input.value = form.names[0];
     changed();
-    menuEl.hidden = false;
-    visible = true;
-    // Keyboard and gamepad users get the focus ring right away; on an iPad it waits for a key or button press.
-    menuEl.classList.toggle('ff-nav', !touchDevice);
-    refreshSound();
+    open();
     showScreen('title');
   }
 
   function hide(): void {
+    flushProfile(); // a half-typed name still goes out
     garage.close();
     menuEl.hidden = true;
     visible = false;
     started = false;
+    window.clearTimeout(startTimer);
+    startTimer = 0;
+    titleNotice.set(null);
+  }
+
+  function setOnlineHooks(h: OnlineMenuHooks): void {
+    hooks = h;
+    onlineBtn.hidden = false;
+    if (pendingOnline) {
+      const p = pendingOnline;
+      pendingOnline = null;
+      showOnline(p.view, p.code);
+    }
+  }
+
+  function showOnline(view: 'join' | 'lobby', code?: string): void {
+    if (!hooks) {
+      pendingOnline = { view, code }; // online play is not switched on yet: do it as soon as it is
+      return;
+    }
+    if (!visible) open();
+    if (view === 'join') {
+      setCode(code ?? '');
+      showScreen('join');
+      return;
+    }
+    // Back in the lobby (after a match): the app has the room, we just show it again.
+    role = role ?? lobby?.role ?? (busy === 'join' ? 'guest' : 'host');
+    lobbyStarting = false;
+    window.clearTimeout(startTimer);
+    startTimer = 0;
+    if (code) roomCode = cleanCode(code);
+    if (screen === 'lobby') renderLobby();
+    else showScreen('lobby');
+    if (role === 'host') pushSettings(); // (show() forgot what the room was last told)
+  }
+
+  function updateLobby(state: LobbyState): void {
+    lobby = state;
+    // The host keeps every boat a different color, so it may have moved ours: follow it (unless we just picked one).
+    const me = state.players.find((p) => p.isYou || (state.role === 'host' && p.isHost));
+    if (me && me.color !== form.colors[0] && CONFIG.colors.includes(me.color) && performance.now() - profileSentAt > PROFILE_ECHO_MS) {
+      form.colors[0] = me.color;
+      changed();
+    }
+    if (role === 'host') pushSettings(); // friends joining leave fewer seats for computer boats
+    if (!visible) return; // drawn when the lobby is shown again
+    if (screen === 'lobby' || (screen === 'garage' && garageBack === 'lobby')) renderLobby(); // (or waiting behind the garage)
+    else {
+      lobbyOpts.sync(lobbyHumans());
+      if (state.error) showProblem(state.error); // e.g. "The host left the game", sent as the app returns to the title
+    }
+  }
+
+  /** A problem message on whatever online screen is open (or the title screen, where players land after one). */
+  function showProblem(text: string): void {
+    if (screen === 'online') onlineProblem.set(text);
+    else if (screen === 'join') joinProblem.set(text);
+    else titleNotice.set(text);
   }
 
   return {
     show,
     hide,
     update,
+    setOnlineHooks,
+    showOnline,
+    updateLobby,
     get visible(): boolean {
       return visible;
     },

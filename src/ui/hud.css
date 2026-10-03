@@ -1,8 +1,9 @@
 /*
- * Foam Fleet HUD, v2 + v3 + v4 additions (loaded after styles.css, which still holds the v1 HUD):
+ * Foam Fleet HUD, v2 + v3 + v4 + v5 additions (loaded after styles.css, which still holds the v1 HUD):
  * mini-map, coaching hints, Easy Driving badge, Team Up banner, Balloon Pop counter,
  * the Boats vs. Sharks banner (wave, life rings, MEGA health bar),
- * team markers, the results-screen extras (team banner, trophy celebration), iPad safe areas,
+ * team markers, the results-screen extras (team banner, trophy celebration, online waiting note), the online
+ * connection pill, iPad safe areas,
  * and the touch layout (everything under `html.ff-touch`, see the section near the end).
  * Same rules as before: --u scales one player's panel, --g scales the whole HUD.
  */
@@ -636,6 +637,71 @@
   font-weight: 500;
 }
 
+/* ───────────────────────── online play (v5) ───────────────────────── */
+
+/*
+ * The connection pill ("Online · DUCK · 3 players") is the last thing in the first player's name/score stack
+ * (hud.ts puts it there), so it sits top-left under the name and score, inside the safe area, and the touch layout
+ * (Pause button, stats cluster under the stack) just flows around it. It is small on purpose.
+ */
+.ff-net {
+  display: flex;
+  align-items: center;
+  gap: calc(7px * var(--u));
+  max-width: 100%;
+  padding: calc(2px * var(--u)) calc(14px * var(--u)) calc(4px * var(--u)) calc(10px * var(--u));
+  border: calc(2px * var(--u)) solid rgba(255, 255, 255, 0.85);
+  border-radius: 999px;
+  background: var(--ff-panel);
+  color: #fff;
+  font-size: calc(15px * var(--u));
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.ff-net-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ff-net-dot {
+  flex: none;
+  width: 0.7em;
+  height: 0.7em;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: #7be8a6;
+}
+/* Trouble ("Reconnecting..."): sunny pill with a blinking dot. The words say it too, so it is never only a color. */
+.ff-net.is-warn {
+  border-color: var(--ff-deep);
+  background: var(--ff-sun);
+  color: var(--ff-deep);
+}
+.ff-net.is-warn .ff-net-dot {
+  border-color: var(--ff-deep);
+  background: var(--ff-orange);
+  animation: ff-net-blink 0.7s ease-in-out infinite alternate;
+}
+
+/* Results, online guest: "Waiting for the host..." where the Rematch button would be. */
+.ff-res-wait {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5em;
+  min-width: min(100%, 260px);
+  min-height: clamp(60px, 10vmin, 96px);
+  padding: 0.2em 1.2em;
+  border: 4px dashed var(--ff-sun);
+  border-radius: 22px;
+  color: #fff;
+  font-size: clamp(20px, 3.6vmin, 34px);
+  font-weight: 700;
+  line-height: 1.15;
+  text-align: center;
+}
+
 /* ───────────────────────── touch layout (html.ff-touch) ───────────────────────── */
 
 /*
@@ -788,6 +854,10 @@ html.ff-touch .ff-live.is-sharks.is-split .ff-feed {
   25% { scale: 1.06 1.2; }
   100% { scale: 1; }
 }
+@keyframes ff-net-blink {
+  from { opacity: 1; }
+  to { opacity: 0.25; }
+}
 
 @media (prefers-reduced-motion: reduce) {
   .ff-hint.on {
@@ -800,7 +870,8 @@ html.ff-touch .ff-live.is-sharks.is-split .ff-feed {
   .ff-shark-ready,
   .ff-shark.hit,
   .ff-ring.pop,
-  .ff-mega.hit {
+  .ff-mega.hit,
+  .ff-net.is-warn .ff-net-dot {
     animation: none;
   }
   .ff-award {

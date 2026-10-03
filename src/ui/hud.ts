@@ -45,6 +45,10 @@ const TOUCH_CLASS = 'ff-touch';
 const MEGA_SEGS_MAX = 24;
 /** Boats vs. Sharks: most life rings the banner draws (the game gives 12). */
 const RINGS_MAX = 24;
+/** Online: a connection line that says something is wrong gets the warning look (yellow, blinking dot). */
+const NET_TROUBLE = /reconnect|lost|trouble|problem/i;
+/** Online guests get no stats, so the "sharks won" look falls back on the headline the host wrote. */
+const SHARKS_WIN_TITLE = /sharks win/i;
 
 // ───────────── little pieces of art (all our own static markup) ─────────────
 
@@ -241,6 +245,8 @@ function watchSize(target: HTMLElement, onSize: () => void): void {
 
 interface Panel {
   root: HTMLElement;
+  /** The name + score stack (top-left): the online connection pill hangs under it. */
+  tag: HTMLElement;
   setRect(v: Viewport): void;
   apply(p: PlayerHud, state: HudState, nowMs: number): void;
   /** Coaching line (bottom of this player's view; just above the middle with touch controls). */
@@ -613,7 +619,7 @@ function createPanel(): Panel {
     announcer.clear();
   }
 
-  return { root, setRect, apply, showHint, setTouch, reset, announcer };
+  return { root, tag, setRect, apply, showHint, setTouch, reset, announcer };
 }
 
 // ───────────── the HUD ─────────────
@@ -629,6 +635,15 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
   live.append(panelsEl);
   const panels: Panel[] = [];
   let panelsOn = 0;
+
+  // Online connection pill ("Online · DUCK · 3 players", "Reconnecting..."). It hangs under the first player's
+  // name/score stack, so it follows that stack in every layout and never lands on the touch Pause button or controls.
+  const netEl = el('div', 'ff-net');
+  netEl.hidden = true;
+  netEl.setAttribute('role', 'status');
+  const netText = el('span', 'ff-net-text');
+  netEl.append(el('i', 'ff-net-dot'), netText);
+  let cNet: string | null = null;
 
   // timer
   const timerEl = el('div', 'ff-timer');
@@ -784,7 +799,8 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
   pauseRow1.append(resumeBtn);
   const pauseRow2 = el('div', 'ff-row');
   pauseRow2.append(quitBtn);
-  pauseCard.append(el('h2', 'ff-h1 ff-ol', 'Paused'), pauseRow1, pauseRow2);
+  const pauseTitle = el('h2', 'ff-h1 ff-ol', 'Paused');
+  pauseCard.append(pauseTitle, pauseRow1, pauseRow2);
   pauseEl.append(pauseCard);
   const pauseBtns = [resumeBtn, quitBtn];
   let pauseCb: { onResume: () => void; onQuit: () => void } | null = null;
@@ -816,12 +832,22 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
   resMid.append(resTeams, awardsEl, resBody);
   const rematchBtn = button('Rematch', 'ff-btn ff-btn--primary ff-btn--xl');
   const menuBtn = button('Menu', 'ff-btn ff-btn--xl');
+  // Online guest: no Rematch button (only the host can start one), a "Waiting for the host..." note in its place.
+  const resWait = el('div', 'ff-res-wait');
+  resWait.setAttribute('role', 'status');
+  resWait.hidden = true;
+  const resWaitText = el('span', 'ff-res-wait-text');
+  const resWaitDots = el('span', 'ff-dots');
+  resWaitDots.setAttribute('aria-hidden', 'true');
+  resWaitDots.append(el('i'), el('i'), el('i'));
+  resWait.append(resWaitText, resWaitDots);
   const resActions = el('div', 'ff-row ff-res-actions');
-  resActions.append(rematchBtn, menuBtn);
+  resActions.append(rematchBtn, resWait, menuBtn);
   resCard.append(resTitle, resMid, resActions);
   resultsEl.append(confetti, resCard);
   const resultBtns = [rematchBtn, menuBtn];
-  let resultsCb: { onRematch: () => void; onMenu: () => void } | null = null;
+  const resultBtnsMenuOnly = [menuBtn]; // while the Rematch button is away
+  let resultsCb: { onRematch: (() => void) | null; onMenu: () => void } | null = null;
   let resultsArmedAt = 0;
   let trophyTimer = 0; // pending "play the trophy fanfare" (cleared when the results close)
 
@@ -855,7 +881,7 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
   });
   rematchBtn.addEventListener('click', () => {
     const cb = resultsCb;
-    if (!cb) return;
+    if (!cb || !cb.onRematch) return;
     sfx.uiSelect();
     hideResults();
     cb.onRematch();
@@ -1223,6 +1249,7 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
       const p = createPanel();
       p.setTouch(cTouch);
       panelsEl.append(p.root);
+      if (panels.length === 0) p.tag.append(netEl);
       panels.push(p);
     }
     for (let i = 0; i < panels.length; i++) {
@@ -1282,8 +1309,30 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
     while (feedEl.childElementCount > feedMax) feedEl.lastElementChild?.remove();
   }
 
-  function showPause(onResume: () => void, onQuit: () => void): void {
+  /** Small connection pill for online play; null (or empty) hides it. */
+  function setNetStatus(text: string | null): void {
+    if (text === cNet) return; // (the app may say the same thing every frame)
+    cNet = text;
+    const t = text === null ? '' : text.trim();
+    netEl.hidden = t === '';
+    if (t === '') return;
+    netText.textContent = t;
+    netEl.classList.toggle('is-warn', NET_TROUBLE.test(t));
+  }
+
+  /**
+   * `opts` is an extra for online play (not in the shared Hud type): an online guest's Pause does not stop the game, so
+   * the app can say "Leave the game?" instead of "Paused". Every call sets all three words, so nothing sticks around.
+   */
+  function showPause(
+    onResume: () => void,
+    onQuit: () => void,
+    opts?: { title?: string; resumeLabel?: string; quitLabel?: string },
+  ): void {
     pauseCb = { onResume, onQuit };
+    pauseTitle.textContent = opts?.title ?? 'Paused';
+    resumeBtn.textContent = opts?.resumeLabel ?? 'Resume';
+    quitBtn.textContent = opts?.quitLabel ?? 'Quit to Menu';
     pauseArmedAt = performance.now() + PAUSE_ARM_MS;
     pauseEl.hidden = false;
     pauseEl.classList.add('ff-nav');
@@ -1390,19 +1439,35 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
     }
   }
 
-  function showResults(result: MatchResult, onRematch: () => void, onMenu: () => void): void {
+  /**
+   * `onRematch` null = an online guest: only the host can start another match, so the Rematch button is swapped for
+   * `opts.waiting`, and `opts.menuLabel` renames the Menu button ("Leave").
+   * `opts.lost` is an extra (not in the shared Hud type): a guest knows the sharks won even though it has no stats.
+   */
+  function showResults(
+    result: MatchResult,
+    onRematch: (() => void) | null,
+    onMenu: () => void,
+    opts?: { waiting?: string; menuLabel?: string; lost?: boolean },
+  ): void {
     hidePause();
     resultsCb = { onRematch, onMenu };
     resultsArmedAt = performance.now() + RESULTS_ARM_MS;
     window.clearTimeout(trophyTimer);
     buildResults(result);
+    rematchBtn.hidden = onRematch === null;
+    resWait.hidden = onRematch !== null;
+    if (onRematch === null) resWaitText.textContent = opts?.waiting ?? 'Waiting for the host...';
+    menuBtn.textContent = opts?.menuLabel ?? 'Menu';
     resultsEl.hidden = false;
     resultsEl.classList.add('ff-nav');
-    rematchBtn.focus({ preventScroll: true });
+    (onRematch === null ? menuBtn : rematchBtn).focus({ preventScroll: true });
     // Boats vs. Sharks: if nobody beat the MEGA SHARK, the sharks won. The game plays the friendly "wah-wah" itself,
     // so here there is no victory fanfare and no confetti (hud.css hides it under .is-lose).
+    const stats = result.stats ?? [];
     const sharksWon =
-      result.mode === 'sharks' && (result.stats ?? []).length > 0 && !(result.stats ?? []).some((st) => st.megaDefeated);
+      result.mode === 'sharks' &&
+      (opts?.lost ?? (stats.length > 0 ? !stats.some((st) => st.megaDefeated) : SHARKS_WIN_TITLE.test(result.title)));
     resultsEl.classList.toggle('is-lose', sharksWon);
     if (!sharksWon) sfx.victory(); // rate-limited inside Sfx, so it is harmless if the game also calls it
     if ((result.awards ?? []).length > 0) {
@@ -1428,7 +1493,7 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
     const { up, down, left, right, confirm } = input;
     if (!(up || down || left || right || confirm)) return;
     const results = open === resultsEl;
-    const btns = results ? resultBtns : pauseBtns;
+    const btns = results ? (rematchBtn.hidden ? resultBtnsMenuOnly : resultBtns) : pauseBtns;
     const active = document.activeElement;
     let idx = btns.indexOf(active as HTMLButtonElement);
     open.classList.add('ff-nav');
@@ -1455,6 +1520,7 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
     showPause,
     hidePause,
     showResults,
+    setNetStatus,
     hideResults,
     handleMenuInput,
   };

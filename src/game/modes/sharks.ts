@@ -172,7 +172,8 @@ export class SharksMode implements GameMode {
 
   onSharkBump(bump: SharkBump): void {
     // A shield soaks the bump up; a bump on a PLAYER's boat costs the team a ring (the MEGA SHARK takes two).
-    // Helper boats just wobble: they're there to help, not to lose the game for you.
+    // Helper boats just wobble: they're there to help, not to lose the game for you. (A player at another device
+    // is still a player: slotOf counts every human in the match, not just the ones on this screen.)
     if (bump.blocked || this.phase === 'won' || this.phase === 'lost') return;
     if (bump.boatId >= 0 && bump.boatId < this.bumps.length) this.bumps[bump.boatId]++;
     if (this.host.slotOf(bump.boatId) < 0) return;

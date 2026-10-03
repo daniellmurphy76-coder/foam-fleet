@@ -15,3 +15,10 @@ export { createHud } from '../ui/hud';
 export { createMenu } from '../ui/menu';
 export { createSfx } from '../audio/sfx';
 export { awardTrophies } from '../ui/trophies';
+
+/**
+ * Online play loads on demand (v5), so offline players never download the net code (or PeerJS), and a
+ * broken net module can only break "Play Online", never the game's start-up.
+ */
+export const loadHostNet = () => import('../net/host');
+export const loadGuestNet = () => import('../net/guest');

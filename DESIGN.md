@@ -734,3 +734,329 @@ A boat built from a giant **shark skeleton**, bone-white with slightly warm ivor
   - `megaRoar` = big silly cartoon roar (wobbly low growl, sliding down, then a goofy squeak);
   - `defeat` = friendly wah-wah trombone.
   - The two-note "duun-dun, duun-dun" shark theme sting plays on `waveStart` (optional, short).
+
+---
+
+# v5: Online multiplayer
+
+**Goal.** Dad on a laptop and the kid on an iPad (2–4 devices, one player each) play together in any of the
+five modes, at the same live URL, from the same house or different houses. No accounts, no chat.
+
+**Decisions.**
+- PeerJS free public signaling, then direct WebRTC data channels.
+- One player per device; local split screen stays as it is for offline play.
+- All five modes online.
+
+**Contracts.**
+- `src/net/protocol.ts`: wire format, constants and transport interfaces.
+- `src/net/session.ts`: HostSession, GuestSession and GuestView, as the app sees them.
+- New net hooks in `src/types.ts`:
+  - `BoatNetState` and `Boat.netState/applyNetState/netFire/netHit`;
+  - `DartSystem.spawn` now returns an id, plus `spawnNet/netStick/netDeflect/netKill`, and
+    `DartHit.dartId/tip/quat`;
+  - `Sharks.netState/applyNetState` (opaque `SharkNetState`);
+  - `Pickups` `crateIndex` + `netState/applyNetState`;
+  - `Balloons.netState/applyNetState`;
+  - `MatchSetup.online` (`OnlineRoster`);
+  - `Hud.showResults` (null rematch) + `setNetStatus`;
+  - `Menu.setOnlineHooks/showOnline/updateLobby`, `OnlineMenuHooks`, `LobbyState`.
+
+**Stubs:** `src/net/transport.ts`, `src/net/host.ts`, `src/net/guest.ts`. **Dependency:** `peerjs` is installed.
+
+## How it works (everyone read this)
+
+**Host-authoritative.** The host device runs the real Match exactly as today, with the host player in slot 0.
+Guests are slots 1..3.
+- **Guests don't simulate.** Each guest builds a render-only GuestView: the same world (it is deterministic),
+  puppet boats from the host's exact `BoatInit`s, sharks, crates, balloons, fx and darts.
+- **Snapshots.** The host sends a `NetSnapshot` every 3rd fixed step (20 Hz) on the fast channel, and
+  one-shot `NetEvent`s on the reliable channel.
+- **Controls.** Guests send their controls at 30 Hz on the fast channel, with running press counters so taps
+  are never lost.
+
+**Interpolation (GuestView).**
+- Keep a buffer of snapshots stamped with host time `t`. Estimate host time smoothly from arrivals.
+- Draw other boats and sharks at `hostNow - INTERP_DELAY`, interpolating position, VELOCITY and heading
+  (with angle wrap).
+- Draw THIS player's boat from the newest snapshot extrapolated by its velocity, capped at
+  `MAX_EXTRAPOLATE`, so steering feels responsive.
+- Snap (no tween) when a boat's `epoch` changes.
+
+**Events.** Each `NetEvent` is replayed once on the guest, in order.
+- `fire` → `darts.spawnNet(id, spawn, age = hostNow - eventT)`. The guest's DartSystem flies darts
+  cosmetically: `update(dt, t, [], world, 0, [])` means no boat/target collisions locally, while islands and
+  water work locally.
+- `stick` / `deflect` / `kill` resolve a dart exactly as the host did.
+- `hit` → `boat.netHit`.
+- `sfx`, `fx`, `announce`, `feed`, `hint`, `cam`, `rumble` call this device's own sfx/fx/hud/camera/input,
+  filtered by `to` and `at`.
+
+**Hidden from guests.** Host-internal fx made inside darts.update and sharks.update are NOT sent as fx
+events: the guest's DartSystem (netStick/netDeflect/netKill) and Sharks (applyNetState phase transitions)
+play their own versions. Only Match/Player-level sfx/fx/hud calls are captured as events.
+
+**Stats and trophies.** The host computes PlayerMatchStats for every human, but awards trophies only for its
+local player. Each guest receives its own stats in `HostResults` and awards its own trophies on its device.
+
+**Connection.**
+- Kid-friendly errors everywhere.
+- A dropped guest's boat just stops (controls time out) and the feed says "Sam left the game".
+- If the host leaves, guests get "The host left the game" and return to the title screen.
+- No auto-pause on blur during online play. The host's pause pauses everyone; a guest's Pause opens a local
+  "Leave the game?" overlay while the game keeps running.
+
+## Transport (`src/net/transport.ts`, may add `src/net/codes.ts`)
+
+Implement `openHost()` and `joinHost(code, hello)` (contracts in protocol.ts) with PeerJS.
+- **Loading:** `await import('peerjs')`, so offline players never download it. Use the default public cloud
+  server and its default STUN.
+- **Room ids:** `PEER_PREFIX + code`, where `code` is CODE_LENGTH random letters from CODE_ALPHABET. On
+  `unavailable-id`, retry with a new code (up to 5 times).
+- **Channels:** two DataConnections per guest. "rel" is reliable, used for `send`; "fast" is unreliable, used
+  for `sendFast`, with fallback to rel until fast opens.
+- **Health:** ping/pong every 1 s gives a smoothed `rttMs`. No message for `LINK_TIMEOUT` = disconnect.
+- **Join:** `joinHost` resolves after both channels open and the hello is sent. It rejects with kid-friendly
+  messages:
+  - "Couldn't reach the game server. Check the internet and try again."
+  - "No game with that code. Check the letters!"
+  - "Couldn't connect to that game. Try again, or play on the same Wi-Fi."
+  - Each with a ~10 s timeout.
+- **Cleanup:** `close()` ends everything; guests get `onClose('The host left the game')`.
+- **Codes:** typed codes are case-insensitive, and characters outside CODE_ALPHABET are rejected.
+
+## Entities net hooks (`src/entities/**`, `src/combat/**`, `src/sharks/**`, `src/world/pickups.ts`, `src/world/balloons.ts`)
+
+Implement every new net member exactly as documented in types.ts.
+
+**Boat.**
+- `netState()` reads the real physics state.
+- `applyNetState` writes position x/z, heading, velocity, inSteer, boosting, shielded (re-trigger the shield
+  appear animation on a rising edge), powerUp, stunned (keep a local wobble timer), aimTargetId, ammo/reload/
+  boost getters and the epoch.
+- It then runs ONLY the visual parts (wave sampling for y/pitch/roll, animate: flames, shield, turret easing
+  toward the lock, flag, propeller, eye glow, marker, wobble), with no physics and no aim picking.
+- Velocity is supplied every frame (interpolated), so the accel-based nose pitch stays smooth.
+- `netFire` = recoil + muzzle flash. `netHit(blocked, stun)` = flash + wobble, or the shield pop. Visual only.
+
+**Darts.**
+- Every dart gets a match-unique id; `spawn` returns it.
+- DartHit/DartTargetHit carry `dartId`; a stuck hit carries the boat-LOCAL `tip` + `quat` right after
+  attach.
+- `spawnNet(id, spawn, age)` advances the new dart by `age` seconds of flight.
+- `netStick(id, boat, tip, quat)` puts dart `id` (or a fresh one if it is unknown or already gone) stuck on
+  `boat` at that pose, with the hit burst in the boat color.
+- `netDeflect` = shield sparkle + tumble. `netKill` = small puff + remove.
+- Fix the stale-trail quirk: clear trails when the last flying dart ends.
+
+**Sharks.**
+- `netState()` = a flat number array: per active slot, the phase/mode/wave flags, x, z, heading, speed,
+  turn rate, appear, and sequence progress; plus MEGA health/max and waveLeft.
+- `applyNetState(prev, next, alpha, t, dt)` interpolates positions/headings and sets phases, initializing
+  the captured start values locally on phase changes (FLIP/LUNGE/DIVE), then runs only the render half
+  (writePose, targets, mapDots).
+- Splashes and bubbles at phase transitions play locally. No AI and no bumps.
+
+**Pickups.**
+- PickupEvent gets `crateIndex`.
+- `netState()` = live bitmask. `applyNetState(mask, t, dt)` animates without collecting and forces live/gone
+  with the pop-in/pop-away animations.
+
+**Balloons.**
+- `netState()` = alive words. `applyNetState(mask, t, dt)` animates (no magnet, no pops) and hides/shows to
+  match.
+
+**Rule:** a guest never passes real/puppet boats into update() calls that could hit, bump, collect or pop.
+
+## Host (`src/game/match.ts`, `players.ts`, `modes/*.ts`, `setup.ts`, `cameras.ts` if needed, `src/net/host.ts`)
+
+**Online roster in Match.**
+- When `setup.online` is set, `humanCount = online.players.length` (2..4). Boat ids 0..n-1 are the humans,
+  using `online.players[i]` for name, color, look and Easy Driving. Bots follow.
+- Add `readonly localSlots: readonly number[]`: the boat ids played on THIS device. Local play: [0] or [0,1].
+  Online host: [localSlot] = [0].
+- Everything per-viewport (HUD players, cameras rendered, touch, rumble, hints, `announce` viewport,
+  `input.humanController(localIndex, localCount)`, `schemeOf`) uses LOCAL slots. Everything per-human for
+  rules (race finish/grace, practice, shark rings, stats) uses all humans.
+- Keep `cams` indexed by human slot. Remote slots may have cameras that are never drawn; their kick/shake/
+  snap become events.
+- Fix every `slotOf` / viewport use accordingly, e.g. shark rings must cost a ring for ANY human, not only
+  local ones. Add `isHumanBoat(id)` vs `viewportOf(id)` where needed.
+
+**Net hooks on Match** (the design is yours; host.ts is the only other user).
+- Remote humans are driven by a RemoteController (Controller kind 'human') fed from GuestControls:
+  - copy values;
+  - convert press-counter increases into fire/rescue/honk presses held for one step;
+  - after `CONTROLS_TIMEOUT` with no packet, return zero controls.
+- **Event capture:** every Match/Player/mode-level sfx, fx, hud.announce/feed/hint, camera kick/shake/snap and
+  rumble becomes a NetEvent (with `to` = human slot when it is for one player, and `at` for positional
+  sounds), while still playing locally for local slots.
+  - Wrap the services, but give darts/sharks the RAW fx (see "How it works").
+  - Fire → `fire` event with dart ids.
+  - Dart hits → `stick`/`deflect` + `hit` events; target hits → `kill`.
+- **Hints for remote players** go as `hint` events with an id; the guest words them for its own controls.
+- **`netSnapshot(seq)`** builds a NetSnapshot: `boats[i].netState()`, sharks/pickups/balloons netState, and
+  NetHud from the mode (scores, ranking, timeLeft/raceTime, race info, next gates, teams, balloons, sharks
+  HUD).
+- **`result()`** awards trophies for LOCAL humans only. Add `statsFor(slot)` so host.ts can send each guest
+  its stats.
+
+**`createHostSession(profile)`** (host.ts) implements HostSession.
+- **Lobby:**
+  - slot 0 = host; guests take the lowest free slot; max `MAX_ONLINE_PLAYERS`;
+  - reject with kid-friendly reasons when the room is full, a match is running, or the version differs;
+  - make every player's color unique by moving duplicates to free CONFIG colors;
+  - keep names ≤ 12 chars, non-empty and unique (append 2, 3, ...).
+- **Mirroring:** broadcast `lobby` on any change. `setProfile`/`setSettings` update and rebroadcast.
+- **`buildSetup(settings)`** = settings (mode, bots, skill, length, laps) + `online.players` from the lobby,
+  `humans` 1, `players` [host], `localSlot` 0. Clamp bots so humans + bots ≤ maxBoats.
+- **`beginMatch(match)`** installs the RemoteControllers and event capture, then sends each guest `start`
+  with its own localSlot + the BoatInit list.
+- **`afterStep`** sends `snap` every SNAPSHOT_EVERY_STEPS, and flushes buffered events as one `ev` per step
+  (or per snapshot) to each guest, routing `to`.
+- **`setState`, `sendResults`, `emit`, `close`** as documented.
+- **Disconnects:** a guest leaving the lobby is just removed. Mid-match, its controller goes idle and
+  `onPlayerLeft(name)` fires.
+
+## Guest (`src/net/guest.ts`, new `src/net/guestView.ts`)
+
+**`joinGuestSession(code, profile)`** implements GuestSession.
+- Calls `joinHost` and waits for `welcome` (resolves) or `reject` (rejects with the reason, kid-friendly).
+- Exposes lobby updates, marking `isYou`.
+- `onStart` / `onState` / `onResults`: on results, call `awardTrophies([stats])` itself and put the awards in
+  `result.awards`.
+- `onClosed`, `setProfile` (sends `profile`), `close()` (sends `bye`).
+
+**`createView(setup, services)`** builds the GuestView: a THREE.Scene, `createWorld(scene, mode)`, puppets
+from `start.inits` (`createBoat`, added to the scene), `createSharks` (mode, its fx, skill from setup) driven
+only by applyNetState, `createPickups`, `createBalloons` (practice only), `createEffects`, `createDartSystem`,
+and a `ChaseCamera` (from src/game/cameras.ts) on its own boat.
+
+**`update(dt)`:**
+1. Run `input.humanController(0, 1).update(ctx, dt)` with a ctx whose `self` is the puppet own boat and whose
+   world is the real world (Easy Driving assist works). Copy the output, count rising edges into press
+   counters, and send GuestControls at CONTROLS_HZ.
+2. Advance the host-time estimate.
+3. Apply due events.
+4. Interpolate snapshots → `boat.applyNetState` per boat (own boat extrapolated), sharks/pickups/balloons
+   `applyNetState`.
+5. `darts.update(dt, t, [], world, 0, [])`, `fx.wake` per boat, `fx.update`, `world.update(t, dt)`, camera
+   update.
+
+**`hudState(vp)`:** HudState for the one local player.
+- PlayerHud from its puppet boat getters + NetHud (score, rank, race, nextGate → arrow from its camera,
+  lockedTarget name: boat name, or shark target name for ids ≥ SHARK_ID_BASE).
+- Scoreboard from NetHud ranking/scores + inits; teams/balloons/sharks from NetHud.
+- MapState from puppets, sharks.mapDots, crate positions, balloons and world.
+
+**Other:** `engineLevel()` from own speed; `boatObject(id)`; `dispose()` frees everything.
+
+## Lobby UI + HUD (`src/ui/menu.ts`, `styles.css`, `dom.ts`, `hud.ts`, `hud.css`)
+
+**Title screen.** A big **Play Online** button (only after `setOnlineHooks`).
+
+**Online screen.** Two big cards: **Host a game** ("Start a game and share the code") and **Join a game**
+("Type the code from the other screen").
+
+**Join screen.**
+- 4 big letter slots plus an on-screen letter keypad (CODE_ALPHABET, Delete, Join). It works by touch,
+  mouse, keyboard typing and gamepad.
+- Prefilled by `showOnline('join', code)`.
+- Shows `join()` errors in a friendly box.
+
+**Lobby.**
+- The room code, BIG, for the host to read out ("Code: DUCK"), plus a hint "On the other device: Play
+  Online → Join → type DUCK".
+- The player list with color, name, a boat icon, "(you)" and "(host)".
+- This player's own card: name, color swatches, Easy Driving, Boat Garage. Changes call `hooks.profile`.
+- **Host:** the game settings (mode cards, computer boats/helpers, skill/shark speed, battle length or race
+  laps, the same controls as setup; changes call `hooks.settings`), and a big **Start!** that is enabled with
+  2+ players (calls `hooks.start(setup)`).
+- **Guest:** the settings read-only plus "Waiting for the host to start...".
+- A **Leave** button calls `hooks.leave()`.
+- `updateLobby(state)` refreshes everything.
+- The menu stays usable by keyboard, gamepad and touch, and keeps the v3 touch rules.
+
+**HUD.**
+- `showResults` with `onRematch === null` shows `opts.waiting` (e.g. "Waiting for the host...") instead of
+  Rematch, and `opts.menuLabel` on the Menu button.
+- `setNetStatus(text)` shows a small pill under the Pause button area (top-left, safe-area aware, not
+  overlapping the v3 touch layout).
+
+## App (`src/game/app.ts`, `src/main.ts`, `src/game/fallbacks.ts`, `guard.ts`, `debug.ts`, `modules.ts`)
+
+**Hooks.** Implement OnlineMenuHooks and call `menu.setOnlineHooks` at boot.
+- `host`: `createHostSession`, then the lobby.
+- `join`: `joinGuestSession`.
+- `settings` / `profile`: forward to the session.
+- `start`: `session.buildSetup` → `startMatch(setup)` → `session.beginMatch(match)`.
+- `leave`: close the session and return to the title.
+- Push `session.onLobby` to `menu.updateLobby`.
+
+**Online host loop.**
+- Call `session.afterStep(match)` after every fixed step.
+- `setState` on every state change.
+- Emit countdown/GO events (`emit`).
+- `sendResults` at finish.
+- Rematch reuses `startMatch` + `beginMatch`. Menu → `setState('lobby')` and back to the lobby screen.
+- No blur auto-pause; host pause/resume mirrors.
+
+**Viewports.** Use `match.localSlots` (not humanCount) for viewports, HUD players, cameras drawn, and touch
+layout.
+
+**Guest app.**
+- On `onStart`: dispose any view, `createView`, state countdown, `hud.show()`, `layoutTouch` with one
+  viewport.
+- Each frame in countdown/playing/results: `view.update(dt)`, render `view.scene` with `view.camera` in one
+  full viewport, `hud.update(view.hudState(vp))`, `sfx.setEngines([view.engineLevel()])`.
+- `onState` mirrors countdown/playing/paused (a "Paused by the host" announce) and results.
+- `onResults`: `hud.showResults(result, null, leave, { waiting: 'Waiting for the host...', menuLabel: 'Leave' })`
+  plus victory/defeat sound, with an orbit camera around `view.boatObject(winnerId)`.
+- `state 'lobby'` → back to the lobby screen.
+- `onClosed` → title screen with the reason shown.
+- A guest's Pause opens `hud.showPause(resume, leave)` without stopping anything.
+
+**Other.**
+- `?join=CODE` opens `menu.showOnline('join', CODE)` at boot.
+- `hud.setNetStatus` shows e.g. "Online · DUCK · 3 players" / "Reconnecting...".
+- Keep all debug hooks. Add `__foam.net = { role, code, slot, rttMs, snapshotAgeMs, players }` for testing.
+- Keep fallbacks/guard in step with the new Menu/Hud/types members.
+
+## As built (where the code differs from, or adds to, the text above)
+
+- **Transport.**
+  - `GuestPing` carries an optional `rtt` (the guest's own smoothed round trip), which is how the host's
+    `PeerLink.rttMs` gets a value. Ping, pong and bye never reach `onMessage`; a guest `bye` becomes
+    `onDisconnect`, a host `bye` becomes `onClose(reason)`.
+  - `onDisconnect` fires only for remote-caused ends, never after the host itself closed the link.
+  - PeerJS 1.5.5 makes the "fast" channel unordered but still retransmitting, so late and out-of-order
+    snapshots are normal and the guest drops stale ones by `t`.
+  - `joinHost` resolves once "rel" is open and "fast" is open or 3 s have passed (then `sendFast` uses rel).
+  - A wrong code takes about 5 s to fail (the cloud server's own expiry).
+- **Slots.** A guest's slot IS its boat id, so slots never have gaps. When a guest leaves the lobby (or a
+  rematch is built after a leaver), the guests above move down and the host re-sends `welcome` with the new
+  slot before the next `lobby`/`start`. A guest who leaves mid-match stays on the water, parked, until the next
+  match is built.
+- **`viewport` inside the Match is a human SLOT.** Everything the Match, its players and its modes hand to
+  `hud.announce/hint` as `viewport` is a human slot. Online, the `TapHud` wrapper (`modes/netcapture.ts`)
+  turns it into a local viewport or an event with `to`; offline the raw Hud is used and slot == viewport.
+  `Match.sfxAt(x, z)` aims a sound at a place (`at` on the event). A Shark bump sends a `hit` event too.
+- **Hud extras.** `showPause(..., opts?: { title, resumeLabel, quitLabel })` (a guest's "Leave the game?") and
+  `showResults(..., opts?: { waiting, menuLabel, lost })` are in the `Hud` type.
+- **Session extras.** `GuestSession` also has `rttMs` and `snapshotAgeMs` (-1 before the first snapshot), and
+  `HostSession` has `rttMs` (the slowest guest); the app reads them for `__foam.net`. `GuestView` also has
+  `pushSnapshot/pushEvents/noteState` (used by guest.ts only), so the app must keep the view `createView`
+  returned.
+- **Pause and blur online.** The host's Pause mirrors `state` to the guests; a guest's Pause only opens the
+  "Leave the game?" box (its touch Pause button stays up while the host has paused). No blur auto-pause.
+- **Not done:** no spectating or late join (a started game turns joiners away), no kick, no ready toggles, no
+  "Reconnecting..." on the host, no client-side prediction beyond extrapolating the own boat by 0.15 s.
+
+## Verification the orchestrator will run
+
+Two browser tabs, both `?mute=1`: one hosts (`__foam`), one joins with the code. Check:
+- the lobby syncs;
+- a match starts on both;
+- the guest's controls move its boat on the host;
+- snapshots move everything on the guest;
+- darts, hits, pops, sharks and results work in all 5 modes;
+- the host leaving or the guest leaving is handled.

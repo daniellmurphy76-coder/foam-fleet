@@ -11,6 +11,11 @@
  * URL params that start a match with no menu: ?quick=battle|race|team|practice|sharks&humans=1|2&bots=N&difficulty=easy|normal|hard
  * (also &easy=0|1 for Easy Driving, &duration=SECONDS, &laps=N, &autopilot=1, &timescale=N, &nopause=1, &fps=1,
  * &mute=1 for a silent page load that is never saved).
+ *
+ * Online play (v5): ?join=DUCK opens the Join screen with the code filled in. `__foam.net` says who this
+ * device is online (role, room code, slot, ping, how stale the newest snapshot is, how many players), and
+ * `__foam.online` hosts / joins / starts / leaves without clicking through the menus. On a guest,
+ * `__foam.snapshot()` describes what that device is DRAWING (boats, scores, clock), taken from its own HUD data.
  */
 import type { MatchSetup, ModeId, SharkHud } from '../types';
 
@@ -89,6 +94,30 @@ export interface FoamSnapshot {
   render: { calls: number; triangles: number; geometries: number; textures: number } | null;
 }
 
+/** Who this device is in an online game (a live read: every access builds a fresh object). */
+export interface FoamNet {
+  role: 'host' | 'guest' | null;
+  /** Room code, '' offline. */
+  code: string;
+  /** This device's boat id (0 = the host), -1 offline. */
+  slot: number;
+  /** Round trip to the other side in ms (0 when unknown). */
+  rttMs: number;
+  /** Guest: how old the newest snapshot is, in ms (-1 before the first one; 0 on the host). */
+  snapshotAgeMs: number;
+  /** Humans in the room. */
+  players: number;
+}
+
+/** Hosting, joining and starting without the menus (for tests). Each uses a default player profile. */
+export interface FoamOnline {
+  host(name?: string): Promise<string>;
+  join(code: string, name?: string): Promise<void>;
+  /** Host: start a match from these settings plus whoever is in the lobby. */
+  start(setup?: Partial<MatchSetup>): void;
+  leave(): void;
+}
+
 export interface FoamDebug {
   state: string;
   timeScale: number;
@@ -102,6 +131,9 @@ export interface FoamDebug {
   resume(): void;
   /** Run n simulation steps + draws synchronously (GPU-synced); returns ms per frame. */
   bench(n?: number): { stepMs: number; drawMs: number };
+  /** Online play (v5): see FoamNet. */
+  readonly net: FoamNet;
+  online: FoamOnline;
 }
 
 declare global {
@@ -119,7 +151,9 @@ function emptySnapshot(): FoamSnapshot {
   };
 }
 
-/** The one shared debug object. The app fills in the function bodies at boot. */
+const NOT_READY = (): Promise<never> => Promise.reject(new Error('the game has not started yet'));
+
+/** The one shared debug object. The app fills in the function bodies at boot (and swaps `net` for a live getter). */
 export const foam: FoamDebug = {
   state: 'boot',
   timeScale: 1,
@@ -132,6 +166,8 @@ export const foam: FoamDebug = {
   pause: () => {},
   resume: () => {},
   bench: () => ({ stepMs: 0, drawMs: 0 }),
+  net: { role: null, code: '', slot: -1, rttMs: 0, snapshotAgeMs: 0, players: 0 },
+  online: { host: NOT_READY, join: NOT_READY, start: () => {}, leave: () => {} },
 };
 
 const MAX_ERRORS = 100;

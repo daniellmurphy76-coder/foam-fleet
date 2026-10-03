@@ -5,29 +5,42 @@
  *  - friendly coaching hints,
  *  - the numbers that feed the Trophy Shelf (PlayerMatchStats).
  *
- * One HumanPlayer per human. The Match calls `update` every step with that player's controls.
+ * One HumanPlayer per human (online, that includes the humans at other devices). The Match calls `update` every
+ * step with that player's controls. A player at another device (driven by a RemoteController) gets the same
+ * rescue, honk and stats; only the coaching hints differ, because their own device words them for its own controls.
  */
 import * as THREE from 'three';
 import { CONFIG } from '../config';
+import { CONTROLS_TIMEOUT } from '../net/protocol';
+import type { GuestControls } from '../net/protocol';
 import type {
-  Boat, BoatControls, Effects, Hud, HornId, InputManager, MatchSetup, Sfx, SpawnPoint, World,
+  Boat, BoatControls, Controller, Effects, Hud, HornId, InputManager, MatchSetup, Sfx, SpawnPoint, World,
 } from '../types';
 import type { ChaseCamera } from './cameras';
-import { fallbackSafeSpot } from './fallbacks';
+import { ZERO_CONTROLS, fallbackSafeSpot } from './fallbacks';
 
 /** What a HumanPlayer needs from its match. */
 export interface PlayerHost {
   readonly setup: MatchSetup;
   readonly world: World;
   readonly fx: Effects;
+  /** `viewport` arguments are human slots: the match turns them into this device's viewports (or events). */
   readonly hud: Hud;
   readonly sfx: Sfx;
   readonly input: InputManager;
   readonly cams: readonly ChaseCamera[];
+  /** Boat ids played on THIS device, in viewport order. */
+  readonly localSlots: readonly number[];
+  /** The viewport of human `slot` on this device, or -1 when that player sits at another device. */
+  viewportOf(slot: number): number;
+  /** The sound system, aimed at a spot in the lagoon (online it tells the guests where the sound comes from). */
+  sfxAt(x: number, z: number): Sfx;
+  /** Coaching hint for a player at another device: they word it for their own controls. */
+  netHint(slot: number, kind: HintKind): void;
 }
 
 type Scheme = 'keysA' | 'keysB' | 'gamepad' | 'touch';
-type HintKind = 'start' | 'shoot' | 'go' | 'stuck';
+export type HintKind = 'start' | 'shoot' | 'go' | 'stuck';
 
 /** Slower than this while the player wants to go = stuck. */
 const STUCK_SPEED = 1.5;
@@ -202,7 +215,7 @@ export class HumanPlayer {
     scratch.set(spot.x, boat.position.y, spot.z);
     fx.splash(scratch, 2.2); // ...and where it lands
     fx.sparkle(scratch, GOLD);
-    host.sfx.rescue();
+    host.sfxAt(spot.x, spot.z).rescue();
     host.hud.announce('RESCUED!', { sub: automatic ? 'Back on the water!' : undefined, ms: 900, viewport: this.slot });
     host.cams[this.slot]?.snap(boat, world, t); // the camera hops along instead of sliding across the lagoon
 
@@ -218,7 +231,7 @@ export class HumanPlayer {
     const { boat, host } = this;
     this.honkCooldown = HONK_GAP_SEC;
     this.honks++;
-    host.sfx.honk(this.horn);
+    host.sfxAt(boat.position.x, boat.position.z).honk(this.horn);
     host.fx.notes(boat.position, boat.color); // the notes lift themselves above the waterline point
   }
 
@@ -227,6 +240,13 @@ export class HumanPlayer {
   /** Show a hint if the rules allow it (spacing, and at most twice per match). Returns true if it was shown. */
   private hint(kind: HintKind, t: number): boolean {
     if (t - this.lastHintAt < HINT_GAP_SEC || this.hintCount[kind] >= (kind === 'start' ? 1 : HINT_MAX)) return false;
+    if (this.host.viewportOf(this.slot) < 0) {
+      // Another device: it knows which controls that player uses, so it words the hint itself.
+      this.lastHintAt = t;
+      this.hintCount[kind]++;
+      this.host.netHint(this.slot, kind);
+      return true;
+    }
     const scheme = this.scheme();
     let text: string;
     switch (kind) {
@@ -251,7 +271,107 @@ export class HumanPlayer {
   }
 
   private scheme(): Scheme {
-    const s = this.host.input.schemeOf(this.slot as 0 | 1, this.host.setup.humans);
+    // The input manager numbers the players on THIS device (0 or 1), not the match's human slots.
+    const s = this.host.input.schemeOf(this.host.viewportOf(this.slot) as 0 | 1, this.host.localSlots.length as 1 | 2);
     return s === 'keysB' || s === 'gamepad' || s === 'touch' ? s : 'keysA';
   }
+}
+
+/**
+ * Drives the boat of an online player at another device from the controls it sends (GuestControls).
+ *
+ * Held things (throttle, steer, boost, fire) are copied as they arrive. Presses arrive as running counters, so a
+ * quick tap is never lost to a dropped or late packet: each counter that went up becomes a press that is held for
+ * exactly one simulation step (fire is also held while the button is). If nothing arrives for CONTROLS_TIMEOUT
+ * seconds the boat lets go of everything, and `disconnect()` does that for good. (That time is the clock on the
+ * wall, not match time: a fast-forwarded test match must not make a steady 30 Hz stream look like silence.)
+ */
+export class RemoteController implements Controller {
+  readonly kind = 'human' as const;
+
+  private readonly out: BoatControls = { throttle: 0, steer: 0, fire: false, boost: false, rescue: false, honk: false };
+  private readonly held: BoatControls = { throttle: 0, steer: 0, fire: false, boost: false, rescue: false, honk: false };
+  // Press counters as of the last packet (the first packet only sets the baseline), and presses not used yet.
+  private seen = false;
+  private lastFire = 0;
+  private lastRescue = 0;
+  private lastHonk = 0;
+  private pressFire = false;
+  private pressRescue = false;
+  private pressHonk = false;
+  /** When the last packet arrived (performance.now() ms). */
+  private lastAt = -Infinity;
+  private gone = false;
+
+  /** A GuestControls packet arrived (newest wins; the caller drops out-of-order ones). */
+  receive(msg: GuestControls): void {
+    if (this.gone || !msg || !msg.c) return;
+    const c = msg.c;
+    const h = this.held;
+    h.throttle = axis(c.throttle);
+    h.steer = axis(c.steer);
+    h.fire = c.fire === true;
+    h.boost = c.boost === true;
+    h.rescue = c.rescue === true;
+    h.honk = c.honk === true;
+    const p = msg.presses;
+    if (p) {
+      const fire = count(p.fire);
+      const rescue = count(p.rescue);
+      const honk = count(p.honk);
+      if (this.seen) {
+        // A counter that went DOWN means the other side started counting again: just take the new baseline.
+        if (fire > this.lastFire) this.pressFire = true;
+        if (rescue > this.lastRescue) this.pressRescue = true;
+        if (honk > this.lastHonk) this.pressHonk = true;
+      }
+      this.lastFire = fire;
+      this.lastRescue = rescue;
+      this.lastHonk = honk;
+      this.seen = true;
+    }
+    this.lastAt = performance.now();
+  }
+
+  /** Forget presses that came in while the boats could not be driven (the countdown, the results screen). */
+  discard(): void {
+    this.pressFire = false;
+    this.pressRescue = false;
+    this.pressHonk = false;
+  }
+
+  /** The player left: the boat sits still from now on. */
+  disconnect(): void {
+    this.gone = true;
+    this.discard();
+  }
+
+  update(): BoatControls {
+    if (this.gone || performance.now() - this.lastAt > CONTROLS_TIMEOUT * 1000) {
+      this.discard();
+      return ZERO_CONTROLS;
+    }
+    const o = this.out;
+    const h = this.held;
+    o.throttle = h.throttle;
+    o.steer = h.steer;
+    o.boost = h.boost;
+    // Rescue and honk act on the press (the player's own update looks for the button going down), so a press
+    // counter that went up shows as one step of "held"; a button that is simply still down shows as held too.
+    o.fire = h.fire || this.pressFire;
+    o.rescue = h.rescue || this.pressRescue;
+    o.honk = h.honk || this.pressHonk;
+    this.discard();
+    return o;
+  }
+}
+
+/** A stick or trigger value from the wire: a finite number in -1..1, else 0. */
+function axis(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) ? (v < -1 ? -1 : v > 1 ? 1 : v) : 0;
+}
+
+/** A running press counter from the wire: a finite number, else 0. */
+function count(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }

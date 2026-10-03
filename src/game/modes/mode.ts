@@ -12,16 +12,20 @@ import type {
 export interface ModeHost {
   readonly setup: MatchSetup;
   readonly boats: readonly Boat[];
+  /** EVERY human in the match, including online players at other devices (not just the ones on this screen). */
   readonly humanCount: number;
   readonly world: World;
+  /** `viewport` arguments are human slots (a boat id): the match sends them to that player's screen, wherever it is. */
   readonly hud: Hud;
   readonly sfx: Sfx;
   /** Balloon Pop's balloons; null in every other mode. */
   readonly balloons: Balloons | null;
   /** Every shark in the lagoon (Boats vs. Sharks sends its waves in through this). */
   readonly sharks: Sharks;
-  /** Which human viewport a boat belongs to (0 or 1), or -1 for a computer boat. */
+  /** A human's slot (= its boat id), or -1 for a computer boat. Counts humans on other devices too. */
   slotOf(boatId: number): number;
+  /** The sound system aimed at a spot in the lagoon: online guests far from it do not hear it. */
+  sfxAt(x: number, z: number): Sfx;
 }
 
 /** Scratch object the Match fills in per boat (so we do not allocate every step). */

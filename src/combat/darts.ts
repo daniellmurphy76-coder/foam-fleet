@@ -70,6 +70,8 @@ const STUCK = 5;
 
 interface Dart {
   mesh: THREE.Mesh;
+  /** Network id (unique for the match, from 1); 0 while the dart sits in the pool. */
+  id: number;
   state: number;
   ownerId: number;
   /** Seconds in the current state (or since firing, while flying). */
@@ -273,6 +275,7 @@ export function createDartSystem(scene: THREE.Scene, fx: Effects): DartSystem {
 
   const free: Dart[] = [];
   const live: Dart[] = [];
+  let nextId = 1; // network ids: one per dart fired, never reused in a match
   for (let i = 0; i < POOL_SIZE; i++) {
     const mesh = new THREE.Mesh(geometry, material);
     mesh.visible = false;
@@ -280,6 +283,7 @@ export function createDartSystem(scene: THREE.Scene, fx: Effects): DartSystem {
     root.add(mesh);
     free.push({
       mesh,
+      id: 0,
       state: FLYING,
       ownerId: -1,
       age: 0,
@@ -383,6 +387,9 @@ export function createDartSystem(scene: THREE.Scene, fx: Effects): DartSystem {
     const m = d.mesh;
     _entry.set(ex, ey, ez);
     const hit: DartHit = {
+      dartId: d.id,
+      tip: null,
+      quat: null,
       ownerId: d.ownerId,
       targetId: boat.id,
       point: new THREE.Vector3(),
@@ -420,6 +427,9 @@ export function createDartSystem(scene: THREE.Scene, fx: Effects): DartSystem {
       d.wobbleAxisAngle = Math.random() * Math.PI * 2;
       enforceStuckCap(boat.id, d);
 
+      // The boat-local pose, so a guest can stick its copy of the dart in exactly the same place.
+      hit.tip = [d.tip.x, d.tip.y, d.tip.z];
+      hit.quat = [d.baseQuat.x, d.baseQuat.y, d.baseQuat.z, d.baseQuat.w];
       hit.point.copy(_surface);
       _burst.copy(_surface).addScaledVector(_normal, 0.15); // a hair outside so the burst isn't buried
       fx.hitBurst(_burst, boat.color);
@@ -448,6 +458,7 @@ export function createDartSystem(scene: THREE.Scene, fx: Effects): DartSystem {
   /** The dart reached an extra target (a balloon) at (ex, ey, ez): report it and use the dart up. */
   function hitTarget(d: Dart, target: DartTarget, ex: number, ey: number, ez: number): void {
     (pendingTargetHits ??= []).push({
+      dartId: d.id,
       ownerId: d.ownerId,
       targetId: target.id,
       point: new THREE.Vector3(ex, ey, ez),
@@ -643,9 +654,8 @@ export function createDartSystem(scene: THREE.Scene, fx: Effects): DartSystem {
 
   // ─── public API ───
 
-  function spawn(s: DartSpawn): void {
-    const d = acquire();
-    if (!d) return;
+  /** Put a dart from the pool into the air as dart `id`. */
+  function launch(d: Dart, s: DartSpawn, id: number): void {
     const m = d.mesh;
     _dir.copy(s.direction).normalize();
     m.position.copy(s.origin);
@@ -653,12 +663,133 @@ export function createDartSystem(scene: THREE.Scene, fx: Effects): DartSystem {
     m.scale.setScalar(1);
     m.visible = true;
     d.vel.copy(_dir).multiplyScalar(s.speed);
+    d.id = id;
     d.state = FLYING;
     d.ownerId = s.ownerId;
     d.age = 0;
     d.life = CONFIG.blaster.dartLife;
     d.slot = live.length;
     live.push(d);
+  }
+
+  function spawn(s: DartSpawn): number {
+    const id = nextId++;
+    const d = acquire();
+    if (d) launch(d, s, id);
+    return id;
+  }
+
+  // ─── online (guest) ───
+
+  /** The live dart with network id `id`, or null (it never arrived, or it is already gone). */
+  function findLive(id: number): Dart | null {
+    for (let i = 0; i < live.length; i++) if (live[i].id === id) return live[i];
+    return null;
+  }
+
+  /** A dart for the guest to play with: the one named `id` if it is still around, else a fresh one (null if the pool is full). */
+  function liveOrNew(id: number): Dart | null {
+    const found = findLive(id);
+    if (found) return found;
+    const d = acquire();
+    if (!d) return null;
+    d.id = id;
+    d.ownerId = -1;
+    d.vel.set(0, 0, 0);
+    d.slot = live.length;
+    live.push(d);
+    return d;
+  }
+
+  function spawnNet(id: number, s: DartSpawn, age: number): void {
+    if (findLive(id)) return; // a repeated event
+    const d = acquire();
+    if (!d) return;
+    launch(d, s, id);
+    // The dart left the muzzle `age` seconds ago: fly it that far along its arc (islands and water are checked on the next update).
+    let left = age > 0 ? Math.min(age, d.life - FADE_TIME) : 0;
+    if (left <= 0) return;
+    d.age = left;
+    const v = d.vel;
+    const pos = d.mesh.position;
+    while (left > 1e-6) {
+      const h = left < MAX_STEP ? left : MAX_STEP;
+      v.y -= CONFIG.blaster.dartGravity * h;
+      pos.x += v.x * h;
+      pos.y += v.y * h;
+      pos.z += v.z * h;
+      left -= h;
+    }
+    _dir.copy(v).normalize();
+    d.mesh.quaternion.setFromUnitVectors(Z_AXIS, _dir);
+  }
+
+  function netStick(
+    id: number, boat: Boat, tip: readonly [number, number, number], quat: readonly [number, number, number, number],
+  ): void {
+    let d = findLive(id);
+    if (d && d.state === STUCK && d.hostId === boat.id) return; // a repeated event
+    d = d ?? liveOrNew(id);
+    if (!d) return;
+    const m = d.mesh;
+    // Same pose as on the host: the tip and the angle are in the boat's own space, so it rides along with the boat.
+    boat.object.add(m);
+    d.tip.set(tip[0], tip[1], tip[2]);
+    d.baseQuat.set(quat[0], quat[1], quat[2], quat[3]);
+    m.quaternion.copy(d.baseQuat);
+    m.position.set(0, 0, -DART_HALF_LENGTH).applyQuaternion(m.quaternion).add(d.tip);
+    m.scale.setScalar(1);
+    m.visible = true;
+    d.state = STUCK;
+    d.age = 0;
+    d.life = CONFIG.blaster.stuckDartLife;
+    d.hostId = boat.id;
+    d.settled = false;
+    d.vel.set(0, 0, 0);
+    d.wobbleAxisAngle = Math.random() * Math.PI * 2;
+    enforceStuckCap(boat.id, d);
+
+    // The hit burst, a hair outside the skin where the tip went in (it sits EMBED_DEPTH inside).
+    _stick.set(0, 0, 1).applyQuaternion(d.baseQuat);
+    _burst.copy(d.tip).addScaledVector(_stick, -(EMBED_DEPTH + 0.15));
+    boat.object.updateWorldMatrix(true, false);
+    boat.object.localToWorld(_burst);
+    fx.hitBurst(_burst, boat.color);
+  }
+
+  function netDeflect(id: number, p: readonly [number, number, number]): void {
+    _burst.set(p[0], p[1], p[2]);
+    const d = liveOrNew(id);
+    if (d) {
+      const m = d.mesh;
+      if (m.parent !== root) root.add(m);
+      // Bounce back off the bubble: the way it came, slower, with a hop and a random tumble.
+      d.vel.multiplyScalar(-0.35);
+      d.vel.x += rand(-1.5, 1.5);
+      d.vel.y += rand(2.5, 4.5);
+      d.vel.z += rand(-1.5, 1.5);
+      m.position.copy(_burst);
+      m.scale.setScalar(1);
+      m.visible = true;
+      d.spinAxis.set(rand(-1, 1), rand(-1, 1), rand(-1, 1));
+      if (d.spinAxis.lengthSq() < 1e-4) d.spinAxis.set(1, 0, 0);
+      d.spinAxis.normalize();
+      d.spinRate = rand(10, 18) * (Math.random() < 0.5 ? -1 : 1);
+      d.state = DEFLECTED;
+      d.age = 0;
+      d.life = DEFLECT_LIFE;
+    }
+    fx.sparkle(_burst, SHIELD_SPARKLE);
+  }
+
+  function netKill(id: number): void {
+    const d = findLive(id);
+    if (!d) return;
+    const m = d.mesh;
+    if (m.parent === root) _burst.copy(m.position);
+    else m.getWorldPosition(_burst);
+    (fx as PuffEffects).puff?.(_burst);
+    release(d);
   }
 
   function update(
@@ -669,7 +800,11 @@ export function createDartSystem(scene: THREE.Scene, fx: Effects): DartSystem {
     stunSeconds: number,
     targets?: readonly DartTarget[],
   ): DartUpdateResult {
-    if (live.length === 0) return EMPTY_RESULT;
+    if (live.length === 0) {
+      // The last dart ended on a frame that still drew a trail: don't leave that streak hanging in the air.
+      if (trails.mesh.visible) trails.clear();
+      return EMPTY_RESULT;
+    }
     const step = dt > MAX_STEP ? MAX_STEP : dt < 0 ? 0 : dt;
     cacheBoats(boats);
     targetList = targets ?? NO_TARGETS;
@@ -707,6 +842,10 @@ export function createDartSystem(scene: THREE.Scene, fx: Effects): DartSystem {
 
   return {
     spawn,
+    spawnNet,
+    netStick,
+    netDeflect,
+    netKill,
     update,
     get activeCount(): number {
       return live.length;

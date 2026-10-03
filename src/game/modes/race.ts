@@ -195,11 +195,11 @@ export class RaceMode implements GameMode {
     const n = this.cps.length;
     const k = this.next[i];
     const slot = this.host.slotOf(i);
-    const { hud, sfx } = this.host;
+    const { hud } = this.host;
 
     if (k !== 0) {
       this.next[i] = (k + 1) % n; // after the last gate this wraps to 0: the finish line
-      if (slot >= 0) sfx.checkpoint();
+      if (slot >= 0) this.host.sfxAt(boat.position.x, boat.position.z).checkpoint();
       return;
     }
     if (this.lap[i] === 0) {
@@ -216,14 +216,16 @@ export class RaceMode implements GameMode {
     this.lap[i]++;
     this.next[i] = 1 % n;
     if (slot >= 0) {
-      sfx.lap();
+      this.host.sfxAt(boat.position.x, boat.position.z).lap();
       if (this.lap[i] === this.laps) hud.announce('FINAL LAP!', { viewport: slot, ms: 1600 });
       else hud.announce(`LAP ${this.lap[i]}/${this.laps}`, { viewport: slot, ms: 1100 });
     }
   }
 
   private finish(i: number, boat: Boat, slot: number): void {
-    const { hud, sfx, humanCount, boats } = this.host;
+    // humanCount counts every human, online players at other devices included: "everyone has finished" and the
+    // "N seconds left" warning (announced to each other human's own screen) are about all of them.
+    const { hud, humanCount, boats } = this.host;
     this.finished[i] = true;
     this.finishTime[i] = this.elapsed;
     this.lap[i] = this.laps;
@@ -234,7 +236,7 @@ export class RaceMode implements GameMode {
 
     if (slot >= 0) {
       this.finishedHumans++;
-      sfx.lap();
+      this.host.sfxAt(boat.position.x, boat.position.z).lap();
       hud.announce('FINISHED!', { sub: `${ordinal(place)} place`, viewport: slot, ms: 2600 });
       if (this.finishedHumans === 1) {
         const grace = CONFIG.race.finishGraceSec;

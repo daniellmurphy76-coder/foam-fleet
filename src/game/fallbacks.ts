@@ -12,7 +12,7 @@
 import * as THREE from 'three';
 import { CONFIG } from '../config';
 import type {
-  Boat, BoatControls, BoatInit, Balloons, BalloonPop, Checkpoint, Controller, DartSystem, DartTarget,
+  Boat, BoatControls, BoatInit, BoatNetState, Balloons, BalloonPop, Checkpoint, Controller, DartSystem, DartTarget,
   DartUpdateResult, Effects, Hud, InputManager, MatchSetup, Menu, MenuInput, ModeId, Obstacle, PickupEvent,
   Pickups, PowerUpKind, Sfx, Sharks, SharkBump, SpawnPoint, World, WorldQuery, ActivePowerUp, DartSpawn, AimTarget,
 } from '../types';
@@ -56,7 +56,7 @@ export function quietFx(): Effects {
 export function quietHud(): Hud {
   return {
     show: noop, hide: noop, update: noop, announce: noop, hint: noop, feed: noop, showPause: noop,
-    hidePause: noop, showResults: noop, hideResults: noop, handleMenuInput: noop,
+    hidePause: noop, showResults: noop, setNetStatus: noop, hideResults: noop, handleMenuInput: noop,
   };
 }
 
@@ -83,9 +83,17 @@ export function fallbackHud(root: HTMLElement): Hud {
   };
   return {
     ...quietHud(),
-    showPause: (onResume, onQuit) => panel('Paused', [['Resume', onResume], ['Quit', onQuit]]),
+    showPause: (onResume, onQuit, opts) =>
+      panel(opts?.title ?? 'Paused', [[opts?.resumeLabel ?? 'Resume', onResume], [opts?.quitLabel ?? 'Quit', onQuit]]),
     hidePause: clear,
-    showResults: (result, onRematch, onMenu) => panel(result.title, [['Rematch', onRematch], ['Menu', onMenu]]),
+    showResults: (result, onRematch, onMenu, opts) => {
+      // No rematch button when this device can't start one (an online guest): say what we are waiting for.
+      const buttons: [string, () => void][] = [];
+      if (onRematch) buttons.push(['Rematch', onRematch]);
+      buttons.push([opts?.menuLabel ?? 'Menu', onMenu]);
+      const waiting = !onRematch && opts?.waiting ? ` ${opts.waiting}` : '';
+      panel(`${result.title}${waiting}`, buttons);
+    },
     hideResults: clear,
   };
 }
@@ -104,6 +112,10 @@ export function fallbackMenu(root: HTMLElement, defaults: () => MatchSetup): Men
       el = b;
     },
     hide,
+    // No online screens in the stand-in menu: "Play Online" simply never appears.
+    setOnlineHooks: noop,
+    showOnline: noop,
+    updateLobby: noop,
     update: noop,
     get visible() { return el !== null; },
   };
@@ -246,12 +258,22 @@ export function fallbackWorld(scene: THREE.Scene, mode: ModeId): World {
 
 const NO_EVENTS: PickupEvent[] = [];
 export function fallbackPickups(): Pickups {
-  return { positions: [], update: () => NO_EVENTS, clear: noop, dispose: noop };
+  return { positions: [], update: () => NO_EVENTS, clear: noop, netState: () => 0, applyNetState: noop, dispose: noop };
 }
 
 const NO_DART_RESULT: DartUpdateResult = { hits: [], targetHits: [], waterSplashes: [] };
 export function fallbackDarts(): DartSystem {
-  return { spawn: noop, update: () => NO_DART_RESULT, activeCount: 0, clear: noop, dispose: noop };
+  return {
+    spawn: () => 0,
+    spawnNet: noop,
+    netStick: noop,
+    netDeflect: noop,
+    netKill: noop,
+    update: () => NO_DART_RESULT,
+    activeCount: 0,
+    clear: noop,
+    dispose: noop,
+  };
 }
 
 // ───────────────────────────── sharks ─────────────────────────────
@@ -269,6 +291,8 @@ export function fallbackSharks(): Sharks {
     hit: () => null,
     spawnWave: noop,
     mapDots: [],
+    netState: () => [],
+    applyNetState: noop,
     dispose: noop,
   };
 }
@@ -368,6 +392,22 @@ export function fallbackBalloons(scene: THREE.Scene, world: WorldQuery): Balloon
       const b = items[targetId];
       return b && b.alive ? popOne(b, boatId) : null;
     },
+    netState() {
+      const words: number[] = new Array<number>(Math.ceil(count / 32)).fill(0);
+      for (const b of items) if (b.alive) words[b.id >> 5] |= 1 << (b.id & 31);
+      return words;
+    },
+    applyNetState(aliveMask, t) {
+      remaining = 0;
+      for (const b of items) {
+        const alive = (((aliveMask[b.id >> 5] ?? 0) >>> (b.id & 31)) & 1) === 1;
+        b.alive = alive;
+        b.mesh.visible = alive;
+        if (!alive) continue;
+        remaining++;
+        b.position.y = world.waveHeight(b.position.x, b.position.z, t) + BALLOON_HEIGHT + Math.sin(t * 1.3 + b.id) * 0.12;
+      }
+    },
     dispose() {
       for (const b of items) scene.remove(b.mesh);
       geometry.dispose();
@@ -406,6 +446,9 @@ class FallbackBoat implements Boat {
   readonly team: number;
   readonly easyDriving: boolean;
   private readonly hull: THREE.Mesh;
+  /** Bumped on every respawn / rescue so an online guest snaps instead of sliding. */
+  private epoch = 0;
+  private lastSteer = 0;
 
   constructor(init: BoatInit) {
     this.id = init.id;
@@ -427,6 +470,7 @@ class FallbackBoat implements Boat {
   update(controls: BoatControls, dt: number, t: number, world: { arenaRadius: number; waveHeight(x: number, z: number, t: number): number }): void {
     const c = CONFIG.boat;
     this.boosting = controls.boost;
+    this.lastSteer = controls.steer;
     const top = controls.throttle >= 0 ? (controls.boost ? c.boostSpeed : c.maxSpeed) : c.reverseSpeed;
     this.speed += (controls.throttle * top - this.speed) * Math.min(1, dt * 2);
     this.heading -= controls.steer * c.turnRate * dt * Math.min(1, Math.abs(this.speed) / 6 + 0.3);
@@ -445,11 +489,35 @@ class FallbackBoat implements Boat {
   }
 
   tryFire(): DartSpawn[] { return []; }
+
+  /** Online host: what a guest needs to draw this box. */
+  netState(): BoatNetState {
+    return {
+      x: this.position.x, z: this.position.z, heading: this.heading, vx: this.velocity.x, vz: this.velocity.z,
+      steer: this.lastSteer, boosting: this.boosting, shielded: false, stunned: false, powerUp: null, powerUpLeft: 0,
+      ammo: this.ammo, reloading: false, reloadProgress: 1, boost: this.boost, aimTargetId: null, epoch: this.epoch,
+    };
+  }
+
+  /** Online guest: sit where the host says (no physics). */
+  applyNetState(s: BoatNetState, _dt: number, t: number, world: WorldQuery): void {
+    this.position.set(s.x, world.waveHeight(s.x, s.z, t), s.z);
+    this.velocity.set(s.vx, 0, s.vz);
+    this.heading = s.heading;
+    this.speed = s.vx * Math.sin(s.heading) + s.vz * Math.cos(s.heading);
+    this.boosting = s.boosting;
+    this.object.position.copy(this.position);
+    this.object.rotation.y = this.heading;
+  }
+
+  netFire(): void {}
+  netHit(): void {}
   hitCenter(out: THREE.Vector3): THREE.Vector3 { return out.set(this.position.x, this.position.y + 0.8, this.position.z); }
   onHit(): boolean { return true; }
   applyPowerUp(_kind: PowerUpKind): void {}
 
   respawn(spawn: SpawnPoint): void {
+    this.epoch++;
     this.position.set(spawn.x, 0, spawn.z);
     this.velocity.set(0, 0, 0);
     this.heading = spawn.heading;

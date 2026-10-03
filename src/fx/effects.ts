@@ -48,6 +48,10 @@ const BUBBLE_COLOR = new THREE.Color(0xd2f2ff);
 const HULL_END = 2.0;
 /** Below this speed (m/s) a boat leaves no wake at all. */
 const WAKE_MIN_SPEED = 2.0;
+/** Faster than any boat can go (boost is 34 m/s): a bigger number is a glitch, not a speed. */
+const WAKE_MAX_SPEED = 60;
+/** Most particles one accumulator may emit in one wake() call (a NaN or a long pause can never run away). */
+const MAX_EMITS_PER_CALL = 16;
 /** The wake fades in over this many m/s above the minimum, so it never pops on or off. */
 const WAKE_RAMP = 4.0;
 /** Meters of travel between foam streaks (smaller = denser trail). Each step lays one streak. */
@@ -459,7 +463,10 @@ export function createEffects(scene: THREE.Scene): Effects {
    */
   function wake(boat: Boat): void {
     const speed = boat.speed;
-    const a = Math.abs(speed);
+    // Online, boats are puppets fed from the network: never trust a non-finite or absurd speed or position
+    // (an Infinity here would make the emit loops below run forever).
+    if (!Number.isFinite(speed) || !Number.isFinite(boat.position.x + boat.position.z + boat.heading)) return;
+    const a = Math.min(Math.abs(speed), WAKE_MAX_SPEED);
     if (a < WAKE_MIN_SPEED) return;
 
     let st = wakeStates.get(boat.id);
@@ -521,6 +528,7 @@ export function createEffects(scene: THREE.Scene): Effects {
 
     // 2. A little spray off the stern; a lot more when boosting (a taller, denser rooster tail).
     st.spray += (a * 0.9 + (boosting ? 18 : 0)) * dt;
+    if (!(st.spray < MAX_EMITS_PER_CALL)) st.spray = MAX_EMITS_PER_CALL;
     while (st.spray >= 1) {
       st.spray -= 1;
       const back = (2.6 + a * 0.1 + Math.random() * 1.2) * (boosting ? 1.3 : 1);
@@ -539,6 +547,7 @@ export function createEffects(scene: THREE.Scene): Effects {
 
     // 2b. Just a wisp of mist behind the stern (the foam streaks do the trail work now).
     st.mist += a * 0.08 * dt;
+    if (!(st.mist < MAX_EMITS_PER_CALL)) st.mist = MAX_EMITS_PER_CALL;
     while (st.mist >= 1) {
       st.mist -= 1;
       sparks.emit(
@@ -553,6 +562,7 @@ export function createEffects(scene: THREE.Scene): Effects {
     // 3. Boost puffs: small soft clouds blasting out of the back.
     if (boosting) {
       st.puff += 9 * dt;
+      if (!(st.puff < MAX_EMITS_PER_CALL)) st.puff = MAX_EMITS_PER_CALL;
       while (st.puff >= 1) {
         st.puff -= 1;
         sparks.emit(
@@ -570,6 +580,7 @@ export function createEffects(scene: THREE.Scene): Effects {
     // 4. A little bow spray at speed so fast boats feel fast from the chase camera.
     if (a > 7) {
       st.bow += a * 0.3 * dt;
+      if (!(st.bow < MAX_EMITS_PER_CALL)) st.bow = MAX_EMITS_PER_CALL;
       while (st.bow >= 1) {
         st.bow -= 1;
         const sideSign = Math.random() < 0.5 ? -1 : 1;

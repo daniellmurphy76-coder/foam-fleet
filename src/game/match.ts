@@ -4,17 +4,26 @@
  *
  * The app creates a Match when you press Start (and a quiet "attract" one behind the
  * title screen), steps it 60 times a second, and disposes it when you leave.
+ *
+ * Online (setup.online), this is the HOST's match. Every human is a boat 0..humanCount-1, but only the ones in
+ * `localSlots` sit at this device (the host is slot 0); the others are driven by a RemoteController fed from the
+ * network. Two kinds of "which human" therefore exist and must not be mixed up:
+ *  - rules, stats, scoring, sounds that any human could hear: ALL humans (humanCount, slotOf, isHumanBoat, nearHuman);
+ *  - screens, cameras drawn, touch, rumble, hints on THIS device: LOCAL slots (localSlots, viewportOf, nearLocal).
+ * Everything the match says out loud (sounds, effects, announcements, feed lines, camera kicks, rumble, darts and
+ * their hits) is also written down as NetEvents for the guests: see drainEvents() and netcapture.ts.
  */
 import * as THREE from 'three';
 import { CONFIG } from '../config';
+import type { NetEvent, NetHud as NetHudState, NetSnapshot } from '../net/protocol';
 import { SHARK_ID_BASE } from '../types';
 import type {
-  AimTarget, Balloons, BotDifficulty, BalloonPop, Boat, BoatControls, BoatInit, BumpEvent, Controller, ControllerContext, DartHit,
-  DartSystem, DartSpawn, DartTarget, DartTargetHit, DartUpdateResult, Effects, Hud, InputManager, MapBoat, MapState,
-  MatchResult, MatchSetup, ModeId, Obstacle, PickupEvent, Pickups, PlayerMatchStats, PowerUpKind, Sfx, SharkBump,
-  Sharks, SharkTag, SpawnPoint, TrophyAward, World,
+  AimTarget, Balloons, BotDifficulty, BalloonPop, Boat, BoatControls, BoatInit, BoatNetState, BumpEvent, Controller,
+  ControllerContext, DartHit, DartSystem, DartSpawn, DartTarget, DartTargetHit, DartUpdateResult, Effects, Hud,
+  InputManager, MapBoat, MapState, MatchResult, MatchSetup, ModeId, Obstacle, PickupEvent, Pickups, PlayerMatchStats,
+  PowerUpKind, RaceHudInfo, Sfx, SharkBump, SharkNetState, Sharks, SharkTag, SpawnPoint, TrophyAward, World,
 } from '../types';
-import { ChaseCamera } from './cameras';
+import { ChaseCamera, RemoteCamera } from './cameras';
 import { foam, reportError } from './debug';
 import {
   ZERO_CONTROLS, fallbackBalloons, fallbackBoat, fallbackDarts, fallbackPickups, fallbackSharks, fallbackSpawns,
@@ -27,12 +36,13 @@ import {
 } from './modules';
 import { BattleMode } from './modes/battle';
 import type { GameMode, GateTargets, ModeHost } from './modes/mode';
+import { EventTap, TapFx, TapHud, TapSfx, type TapSite } from './modes/netcapture';
 import { PracticeMode } from './modes/practice';
 import { RaceMode } from './modes/race';
 import { SharksMode } from './modes/sharks';
 import { TeamMode } from './modes/team';
-import { HumanPlayer, type PlayerHost } from './players';
-import { MAX_HELPERS, botLook, sanitizeLook } from './setup';
+import { HumanPlayer, RemoteController, type HintKind, type PlayerHost } from './players';
+import { MAX_HELPERS, botLook, rosterOf, sanitizeLook } from './setup';
 import { clamp } from './util';
 
 /** The simulation always advances in slices of this many seconds. */
@@ -52,6 +62,8 @@ const NO_DARTS: DartUpdateResult = { hits: [], targetHits: [], waterSplashes: []
 const NO_AIM: readonly AimTarget[] = [];
 const NO_SHARK_BUMPS: SharkBump[] = [];
 const NO_SHARK_DOTS: Sharks['mapDots'] = [];
+const NO_SLOTS: readonly number[] = [];
+const NO_EVENTS: readonly NetEvent[] = [];
 
 const GOLD = 0xffd23f;
 /** How long the victory confetti keeps popping after the MEGA SHARK is beaten, and the gap between bursts. */
@@ -81,13 +93,16 @@ function makeMode(id: ModeId, host: ModeHost): GameMode {
   }
 }
 
-export class Match implements ModeHost, PlayerHost {
+export class Match implements ModeHost, PlayerHost, TapSite {
   readonly scene = new THREE.Scene();
   readonly world: World;
   readonly pickups: Pickups;
   readonly darts: DartSystem;
+  /** What the match itself uses for splashes, sparkles and so on (online: also written down for the guests). */
   readonly fx: Effects;
+  /** The HUD as the match talks to it. Online it is a wrapper that also sends events (see netcapture.ts). */
   readonly hud: Hud;
+  /** Same for sound. Aim a sound at a place with sfxAt(). */
   readonly sfx: Sfx;
   readonly input: InputManager;
   readonly mode: GameMode;
@@ -97,11 +112,24 @@ export class Match implements ModeHost, PlayerHost {
   readonly sharks: Sharks;
   /** Humans are boats 0..humanCount-1; computer boats follow. */
   readonly boats: Boat[] = [];
-  /** One chase camera per human, same order as the boats. */
+  /** How every boat was built (index = boat id): online guests build identical puppets from these. */
+  readonly inits: BoatInit[] = [];
+  /**
+   * One chase camera per human (index = human slot = boat id). Only the ones in `localSlots` are drawn and
+   * updated; a human at another device has a RemoteCamera whose kicks and shakes become events.
+   */
   readonly cams: ChaseCamera[] = [];
-  /** One per human: rescue, honk, hints and trophy stats. */
+  /** One per human (online: at other devices too): rescue, honk, hints and trophy stats. */
   readonly players: HumanPlayer[] = [];
+  /** EVERY human in the match. Offline 1 or 2; online the whole roster (2..4), whatever device they are at. */
   readonly humanCount: number;
+  /**
+   * The boat ids played on THIS device, in viewport order (viewport k shows boat localSlots[k]).
+   * Local play: [0] or [0, 1]. Online host: [0]. The attract lagoon: [].
+   */
+  readonly localSlots: readonly number[];
+  /** The online host's match: other humans sit at other devices, and everything is also written down as events. */
+  readonly isOnline: boolean;
 
   /** Match time in seconds. Runs during the countdown too (so the water moves); frozen while paused. */
   t = 0;
@@ -132,16 +160,45 @@ export class Match implements ModeHost, PlayerHost {
   private confettiGap = 0;
   private confettiBoat = 0;
   private readonly confettiAt = new THREE.Vector3();
+  /** Online only: where everything the match says is written down for the guests (null for local play). */
+  private readonly tap: EventTap | null;
+  /** The aimable sound wrapper inside `sfx` (online only). */
+  private readonly tapSfx: TapSfx | null;
+  /** The effects without the event copy: wakes, particles, and what the darts and sharks make. */
+  private readonly rawFx: Effects;
+  /** Online: the controller of each human who sits at another device, else null (index = human slot). */
+  private readonly remotes: (RemoteController | null)[] = [];
+  /** The network ids of the darts of the volley being fired right now (scratch). */
+  private readonly fireIds: number[] = [];
 
   /**
    * `attract` = the quiet demo lagoon behind the title screen: no humans, no rules,
    * and the hud/sfx passed in should be the silent ones.
    */
   constructor(readonly setup: MatchSetup, services: MatchServices, readonly attract = false) {
-    this.hud = services.hud;
-    this.sfx = services.sfx;
+    const online = attract ? null : setup.online ?? null;
+    const roster = rosterOf(setup);
     this.input = services.input;
-    this.humanCount = attract ? 0 : setup.humans;
+    this.isOnline = online !== null;
+    // Humans: all of them (online, the whole roster). Local slots: the ones playing at THIS device.
+    this.humanCount = attract ? 0 : online ? clamp(roster.length, 1, CONFIG.match.maxBoats) : setup.humans;
+    this.localSlots = attract
+      ? NO_SLOTS
+      : online ? [clamp(Math.round(Number(online.localSlot)) || 0, 0, this.humanCount - 1)]
+        : setup.humans === 2 ? [0, 1] : [0];
+    if (online) {
+      // Same sounds, announcements and feed lines as ever on this device, and a copy of each for the guests.
+      const tap = new EventTap();
+      this.tap = tap;
+      this.tapSfx = new TapSfx(services.sfx, tap, this);
+      this.sfx = this.tapSfx;
+      this.hud = new TapHud(services.hud, tap, this);
+    } else {
+      this.tap = null;
+      this.tapSfx = null;
+      this.sfx = services.sfx;
+      this.hud = services.hud;
+    }
     // In Boats vs. Sharks the skill buttons set the SHARKS' speed; the helper boats are always sharp shooters.
     this.botSkill = setup.mode === 'sharks' ? 'hard' : setup.botDifficulty;
     const errDeg = CONFIG.bots.aimErrorDeg[this.botSkill] ?? CONFIG.bots.aimErrorDeg.normal;
@@ -153,14 +210,18 @@ export class Match implements ModeHost, PlayerHost {
     this.world = buildOrFallback('createWorld', () => createWorld(scene, modeId), () => fallbackWorld(scene, modeId));
     this.obstacles = this.world.obstacles;
     this.pickups = buildOrFallback('createPickups', () => createPickups(scene, this.world, modeId), fallbackPickups);
-    this.fx = guard('fx', buildOrFallback('createEffects', () => createEffects(scene), quietFx), {}, V2_METHODS.fx);
-    this.darts = buildOrFallback('createDartSystem', () => createDartSystem(scene, this.fx), fallbackDarts);
+    // The darts and the sharks get the plain effects: the guests' own copies play their splashes and bursts, so
+    // sending those as events too would play them twice. Only what THIS file and the players/modes make is sent.
+    const rawFx = guard('fx', buildOrFallback('createEffects', () => createEffects(scene), quietFx), {}, V2_METHODS.fx);
+    this.rawFx = rawFx;
+    this.fx = this.tap ? new TapFx(rawFx, this.tap) : rawFx;
+    this.darts = buildOrFallback('createDartSystem', () => createDartSystem(scene, rawFx), fallbackDarts);
     this.balloons = modeId === 'practice'
       ? buildOrFallback('createBalloons', () => createBalloons(scene, this.world), () => fallbackBalloons(scene, this.world))
       : null;
     this.sharks = buildOrFallback(
       'createSharks',
-      () => createSharks(scene, this.world, modeId, this.fx, setup.botDifficulty),
+      () => createSharks(scene, this.world, modeId, rawFx, setup.botDifficulty),
       fallbackSharks,
     );
 
@@ -169,15 +230,62 @@ export class Match implements ModeHost, PlayerHost {
 
     for (let i = 0; i < this.humanCount; i++) {
       const boat = this.boats[i];
-      const cam = new ChaseCamera(boat.easyDriving);
-      cam.snap(boat, this.world, 0);
+      let cam: ChaseCamera;
+      if (this.viewportOf(i) >= 0) {
+        cam = new ChaseCamera(boat.easyDriving);
+        cam.snap(boat, this.world, 0);
+      } else {
+        // Nobody here looks through it: its kicks and shakes go to that player's own device.
+        cam = new RemoteCamera(boat.easyDriving, (op, amt) => this.tap?.push({ k: 'cam', op, amt, to: i }));
+      }
       this.cams.push(cam);
-      this.players.push(new HumanPlayer(i, boat, sanitizeLook(setup.players[i]?.look, i).horn, this));
+      this.players.push(new HumanPlayer(i, boat, sanitizeLook(roster[i]?.look, i).horn, this));
     }
   }
 
+  /** A human's slot (= its boat id, whichever device they are at), or -1 for a computer boat. */
   slotOf(boatId: number): number {
-    return boatId < this.humanCount ? boatId : -1;
+    return boatId >= 0 && boatId < this.humanCount ? boatId : -1;
+  }
+
+  isHumanBoat(boatId: number): boolean {
+    return boatId >= 0 && boatId < this.humanCount;
+  }
+
+  /** Which viewport on THIS device shows human `slot`, or -1 (a computer boat, or a human at another device). */
+  viewportOf(slot: number): number {
+    return this.localSlots.indexOf(slot);
+  }
+
+  /** Is any boat played on THIS device within `range` meters of (x, z)? (Whether THIS device could hear it.) */
+  nearLocal(x: number, z: number, range: number): boolean {
+    const r2 = range * range;
+    for (let k = 0; k < this.localSlots.length; k++) {
+      const boat = this.boats[this.localSlots[k]];
+      if (!boat) continue;
+      const dx = boat.position.x - x;
+      const dz = boat.position.z - z;
+      if (dx * dx + dz * dz < r2) return true;
+    }
+    return false;
+  }
+
+  /**
+   * The sound system aimed at a spot in the lagoon. Online, this device plays the sound only if a local boat is
+   * within earshot, and each guest decides the same from the spot we send. Offline it is just `sfx`.
+   */
+  sfxAt(x: number, z: number): Sfx {
+    return this.tapSfx ? this.tapSfx.from(x, z) : this.sfx;
+  }
+
+  /** A coaching hint for a human at another device: their device words it for its own controls. */
+  netHint(slot: number, kind: HintKind): void {
+    this.tap?.push({ k: 'hint', hint: kind, to: slot });
+  }
+
+  /** Online host: the controller of the human at slot `slot` if they sit at another device, else null. */
+  remote(slot: number): RemoteController | null {
+    return this.remotes[slot] ?? null;
   }
 
   // ───────────────────────────── setup ─────────────────────────────
@@ -198,14 +306,15 @@ export class Match implements ModeHost, PlayerHost {
     const spawns = teamMode ? this.pickTeamSpawns(sideA, total - sideA) : this.pickSpawns(total);
 
     // Computer boats get paint colors the humans did not pick.
+    const roster = rosterOf(setup);
     const used = new Set<number>();
-    for (let i = 0; i < humans; i++) used.add(setup.players[i]?.color ?? -1);
+    for (let i = 0; i < humans; i++) used.add(roster[i]?.color ?? -1);
     const freeColors = CONFIG.colors.filter((c) => !used.has(c));
 
     for (let i = 0; i < total; i++) {
       const isHuman = i < humans;
       const botIndex = i - humans;
-      const player = setup.players[i];
+      const player = roster[i];
       // Boats vs. Sharks: everyone is on one team, so the helpers' darts pass through the humans.
       const team = teamMode ? (i < sideA ? 0 : 1) : sharksMode ? 0 : i;
       const init: BoatInit = {
@@ -225,9 +334,10 @@ export class Match implements ModeHost, PlayerHost {
       const boat = buildOrFallback('createBoat', () => createBoat(init), () => fallbackBoat(init));
       this.scene.add(boat.object);
       this.boats.push(boat);
+      this.inits.push(init);
 
       const controller = isHuman
-        ? buildOrFallback('humanController', () => this.input.humanController(i as 0 | 1, setup.humans), () => idleController('human'))
+        ? this.humanDriver(i)
         : buildOrFallback('createBotController', () => createBotController(this.botSkill, i), () => idleController('bot'));
       this.ctrls.push(controller);
       this.autopilots.push(null);
@@ -246,6 +356,22 @@ export class Match implements ModeHost, PlayerHost {
     }
     // Each boat gets a list of everyone EXCEPT itself (for aim assist), built once.
     for (let i = 0; i < total; i++) this.others.push(this.boats.filter((b) => b !== this.boats[i]));
+  }
+
+  /**
+   * Who drives human `i`: this device's own controls (the input manager numbers the players here 0 and 1), or, for a
+   * human at another device, a RemoteController that the net code feeds.
+   */
+  private humanDriver(i: number): Controller {
+    const vp = this.viewportOf(i);
+    if (vp < 0) {
+      const remote = new RemoteController();
+      this.remotes[i] = remote;
+      return remote;
+    }
+    this.remotes[i] = null;
+    const count = this.localSlots.length as 1 | 2;
+    return buildOrFallback('humanController', () => this.input.humanController(vp as 0 | 1, count), () => idleController('human'));
   }
 
   /** Ask the world for spawn points; if it hands back nonsense, lay them out ourselves. */
@@ -302,6 +428,11 @@ export class Match implements ModeHost, PlayerHost {
       sharkTargets = this.sharks.targets;
     } catch (e) {
       reportError('sharks.targets', e);
+    }
+
+    // Taps that came in from other devices while the boats could not be driven (the countdown) are forgotten.
+    if (!controlsOn && this.isOnline) {
+      for (let i = 0; i < this.humanCount; i++) this.remotes[i]?.discard();
     }
 
     // 1. Controllers decide, boats move.
@@ -371,8 +502,12 @@ export class Match implements ModeHost, PlayerHost {
         if (spawns.length > 0) {
           // Players keep full aim assist; computer boats get a small random aim error.
           if (!boats[i].isHuman) this.wobbleBotAim(spawns);
-          for (let k = 0; k < spawns.length; k++) this.darts.spawn(spawns[k]);
-          this.onFired(boats[i], spawns.length);
+          const ids = this.fireIds;
+          for (let k = 0; k < spawns.length; k++) {
+            const id = this.darts.spawn(spawns[k]);
+            ids[k] = typeof id === 'number' ? id : -1;
+          }
+          this.onFired(boats[i], spawns, ids);
         }
       } catch (e) {
         reportError(`boat[${i}].tryFire`, e);
@@ -386,6 +521,10 @@ export class Match implements ModeHost, PlayerHost {
     } catch (e) {
       reportError('darts.update', e);
     }
+    // A dart that popped a balloon or scared a shark is used up: the guests' copy of it goes away too.
+    if (this.tap) {
+      for (let k = 0; k < flight.targetHits.length; k++) this.tap.push({ k: 'kill', id: flight.targetHits[k].dartId });
+    }
     this.onHits(flight.hits, rulesOn);
     this.onSharkHits(flight.targetHits, rulesOn);
     if (this.balloons) this.updateBalloons(flight.targetHits, t, dt, rulesOn);
@@ -393,7 +532,7 @@ export class Match implements ModeHost, PlayerHost {
     for (let k = 0; k < flight.waterSplashes.length && splashSounds < 2; k++) {
       const p = flight.waterSplashes[k];
       if (this.nearHuman(p.x, p.z, 70)) {
-        this.sfx.splash(0.35);
+        this.sfxAt(p.x, p.z).splash(0.35);
         splashSounds++;
       }
     }
@@ -418,8 +557,8 @@ export class Match implements ModeHost, PlayerHost {
 
     // 7. Visuals: victory confetti, wakes, particles, water and sky.
     if (this.confetti > 0) this.sprinkleConfetti(dt);
-    for (let i = 0; i < n; i++) this.fx.wake(boats[i]);
-    this.fx.update(dt, t, this.world);
+    for (let i = 0; i < n; i++) this.rawFx.wake(boats[i]);
+    this.rawFx.update(dt, t, this.world);
     try {
       this.world.update(t, dt);
     } catch (e) {
@@ -453,9 +592,10 @@ export class Match implements ModeHost, PlayerHost {
     }
   }
 
-  /** Move the chase cameras. Runs once per rendered frame with real frame time. */
+  /** Move the chase cameras of the players at THIS device. Runs once per rendered frame with real frame time. */
   updateCameras(dt: number): void {
-    for (let i = 0; i < this.cams.length; i++) {
+    for (let k = 0; k < this.localSlots.length; k++) {
+      const i = this.localSlots[k];
       try {
         this.cams[i].update(dt, this.boats[i], this.world, this.t);
       } catch (e) {
@@ -467,8 +607,8 @@ export class Match implements ModeHost, PlayerHost {
   // ───────────────────────────── event handlers ─────────────────────────────
 
   private controllerFor(i: number): Controller {
-    // Autopilot (a test hook): human boats are driven by an ordinary bot brain.
-    if (foam.autopilot && this.boats[i].isHuman) {
+    // Autopilot (a test hook): the human boats at THIS device are driven by an ordinary bot brain.
+    if (foam.autopilot && this.viewportOf(i) >= 0) {
       let pilot = this.autopilots[i];
       if (!pilot) {
         pilot = buildOrFallback('createBotController', () => createBotController('normal', 100 + i), () => idleController('bot'));
@@ -479,7 +619,10 @@ export class Match implements ModeHost, PlayerHost {
     return this.ctrls[i];
   }
 
-  /** Is any human boat within `range` meters of this spot? (Used so we only play sounds you could hear.) */
+  /**
+   * Is any human boat (at any device) within `range` meters of this spot? Used so we only make sounds somebody could
+   * hear; online, each device then keeps only the ones near ITS boat (see nearLocal).
+   */
   private nearHuman(x: number, z: number, range: number): boolean {
     const r2 = range * range;
     for (let i = 0; i < this.humanCount; i++) {
@@ -491,8 +634,11 @@ export class Match implements ModeHost, PlayerHost {
     return false;
   }
 
+  /** Buzz the gamepad of human `slot`: here if they play at this device, otherwise on theirs (as an event). */
   private rumble(slot: number, strength: number, ms: number): void {
-    this.input.rumble(slot as 0 | 1, this.setup.humans, strength, ms);
+    const vp = this.viewportOf(slot);
+    if (vp >= 0) this.input.rumble(vp as 0 | 1, this.localSlots.length as 1 | 2, strength, ms);
+    else if (this.tap && this.isHumanBoat(slot)) this.tap.push({ k: 'rumble', strength, ms, to: slot });
   }
 
   private onBump(b: BumpEvent): void {
@@ -500,7 +646,7 @@ export class Match implements ModeHost, PlayerHost {
     const c = this.boats[b.bId];
     const slotA = a ? this.slotOf(a.id) : -1;
     const slotC = c ? this.slotOf(c.id) : -1;
-    if (slotA >= 0 || slotC >= 0 || this.nearHuman(b.point.x, b.point.z, 40)) this.sfx.bump(b.strength);
+    if (slotA >= 0 || slotC >= 0 || this.nearHuman(b.point.x, b.point.z, 40)) this.sfxAt(b.point.x, b.point.z).bump(b.strength);
     this.fx.splash(b.point, clamp(0.5 + b.strength * 0.06, 0.5, 1.6));
     const shake = clamp(b.strength / 16, 0.1, 0.4);
     if (slotA >= 0) {
@@ -513,14 +659,25 @@ export class Match implements ModeHost, PlayerHost {
     }
   }
 
-  private onFired(boat: Boat, dartCount: number): void {
+  private onFired(boat: Boat, spawns: readonly DartSpawn[], ids: readonly number[]): void {
+    const dartCount = spawns.length;
     const slot = this.slotOf(boat.id);
     if (slot >= 0) {
-      this.sfx.fire();
+      this.sfxAt(boat.position.x, boat.position.z).fire();
       this.cams[slot].kick(dartCount > 1 ? 0.4 : 0.25);
     } else if (this.botFireGate <= 0 && this.nearHuman(boat.position.x, boat.position.z, 45)) {
-      this.sfx.fire();
+      this.sfxAt(boat.position.x, boat.position.z).fire();
       this.botFireGate = 0.08; // keep a crowd of bots from turning into one long buzz
+    }
+    if (this.tap) {
+      // Guests fly their own copies of the darts: each with its network id, where it starts and how it goes.
+      const darts: number[][] = [];
+      for (let k = 0; k < dartCount; k++) {
+        const o = spawns[k].origin;
+        const d = spawns[k].direction;
+        darts.push([ids[k], o.x, o.y, o.z, d.x, d.y, d.z, spawns[k].speed]);
+      }
+      this.tap.push({ k: 'fire', boat: boat.id, darts });
     }
   }
 
@@ -528,6 +685,7 @@ export class Match implements ModeHost, PlayerHost {
     const mode = this.mode;
     for (let k = 0; k < hits.length; k++) {
       const h = hits[k];
+      if (this.tap) this.recordHit(h);
       const shooter = this.boats[h.ownerId];
       const target = this.boats[h.targetId];
       if (!shooter || !target) continue;
@@ -537,7 +695,7 @@ export class Match implements ModeHost, PlayerHost {
       const audible = shooterSlot >= 0 || targetSlot >= 0 || this.nearHuman(h.point.x, h.point.z, 45);
 
       if (h.blocked) {
-        if (audible) this.sfx.shieldBlock();
+        if (audible) this.sfxAt(h.point.x, h.point.z).shieldBlock();
         if (targetSlot >= 0) {
           this.cams[targetSlot].shake(0.2);
           if (rulesOn) this.hud.feed(`${target.name}'s shield blocked it!`, target.color);
@@ -546,7 +704,7 @@ export class Match implements ModeHost, PlayerHost {
       }
 
       if (!this.attract) this.hits++;
-      if (audible) this.sfx.hit();
+      if (audible) this.sfxAt(h.point.x, h.point.z).hit();
       if (targetSlot >= 0) {
         this.cams[targetSlot].shake(0.55);
         this.rumble(targetSlot, 0.9, 240);
@@ -581,7 +739,7 @@ export class Match implements ModeHost, PlayerHost {
       }
       this.fx.sparkle(e.position, GOLD);
       const slot = this.slotOf(boat.id);
-      if (slot >= 0 || this.nearHuman(e.position.x, e.position.z, 40)) this.sfx.pickup();
+      if (slot >= 0 || this.nearHuman(e.position.x, e.position.z, 40)) this.sfxAt(e.position.x, e.position.z).pickup();
       if (slot >= 0 && rulesOn) {
         this.players[slot].pickups++;
         const label = POWER_NAMES[e.kind] ?? String(e.kind);
@@ -617,16 +775,19 @@ export class Match implements ModeHost, PlayerHost {
 
   /** A shark bumped a boat. The Sharks module already wobbled the boat; here are the sounds, the splash and the rules. */
   private onSharkBump(b: SharkBump, rulesOn: boolean): void {
+    // Sharks.update already called boat.onHit on this side (whatever the rules say): the guests' copy of the boat
+    // needs the same paint flash and wobble, or the shield pop, which only a `hit` event gives it.
+    if (this.tap) this.tap.push({ k: 'hit', boat: b.boatId, blocked: b.blocked, stun: b.blocked ? 0 : CONFIG.sharks.bumpStun });
     if (!rulesOn) return;
     const boat = this.boats[b.boatId];
     if (!boat) return;
     const slot = this.slotOf(boat.id);
     const audible = slot >= 0 || this.nearHuman(b.point.x, b.point.z, 45);
-    if (audible) this.sfx.sharkBump();
+    if (audible) this.sfxAt(b.point.x, b.point.z).sharkBump();
     this.fx.splash(b.point, b.mega ? 2.4 : 1.3);
     if (b.blocked) {
       // A shield soaked it up: boing, and nobody loses anything.
-      if (audible) this.sfx.shieldBlock();
+      if (audible) this.sfxAt(b.point.x, b.point.z).shieldBlock();
       if (slot >= 0) this.cams[slot].shake(0.2);
       this.hud.feed(`${boat.name}'s shield bounced a shark!`, boat.color);
       return;
@@ -674,8 +835,8 @@ export class Match implements ModeHost, PlayerHost {
     const finalBlow = tag.mega && tag.defeated;
     if (slot >= 0 || this.nearHuman(tag.point.x, tag.point.z, 60)) {
       // A normal shark (and the MEGA SHARK's last hit) dives away; the MEGA SHARK shrugs off the others with a bonk.
-      if (!tag.mega || finalBlow) this.sfx.sharkDive();
-      else this.sfx.hit();
+      if (!tag.mega || finalBlow) this.sfxAt(tag.point.x, tag.point.z).sharkDive();
+      else this.sfxAt(tag.point.x, tag.point.z).hit();
     }
     if (slot >= 0) {
       this.cams[slot].kick(0.3);
@@ -734,7 +895,7 @@ export class Match implements ModeHost, PlayerHost {
     const boat = this.boats[pop.boatId];
     const slot = boat ? this.slotOf(boat.id) : -1;
     this.fx.pop(pop.position, pop.color);
-    if (slot >= 0 || this.nearHuman(pop.position.x, pop.position.z, 60)) this.sfx.pop();
+    if (slot >= 0 || this.nearHuman(pop.position.x, pop.position.z, 60)) this.sfxAt(pop.position.x, pop.position.z).pop();
     if (slot >= 0) {
       this.players[slot].balloons += pop.value;
       this.cams[slot].kick(0.15);
@@ -752,19 +913,28 @@ export class Match implements ModeHost, PlayerHost {
   /**
    * The full results: the mode's table and headline, plus each human's stats and any trophies they earned
    * for the first time. Built once (awarding a trophy saves it, so asking twice would hand out nothing).
+   *
+   * Online, `stats` holds EVERY human's numbers (see statsFor), but trophies go only to the humans at THIS device:
+   * each guest awards its own player's trophies on its own device.
    */
   result(): MatchResult {
     if (this.cachedResult) return this.cachedResult;
     const base = this.mode.result();
     const stats = this.buildStats();
+    const mine = this.isOnline ? this.localSlots.map((slot) => stats[slot]).filter((st) => st !== undefined) : stats;
     let awards: TrophyAward[] = [];
     try {
-      awards = awardTrophies(stats);
+      awards = awardTrophies(mine);
     } catch (e) {
       reportError('awardTrophies', e);
     }
     this.cachedResult = { ...base, stats, awards };
     return this.cachedResult;
+  }
+
+  /** What human `slot` did this match (the numbers behind their trophies), or null if there is no such human. */
+  statsFor(slot: number): PlayerMatchStats | null {
+    return this.result().stats[slot] ?? null;
   }
 
   private buildStats(): PlayerMatchStats[] {
@@ -794,7 +964,7 @@ export class Match implements ModeHost, PlayerHost {
         sharkTags: p.sharkTags,
         sharkBumps: p.sharkBumps,
         megaDefeated: outcome.megaDefeated === true,
-        hull: sanitizeLook(this.setup.players[i]?.look, i).hull,
+        hull: sanitizeLook(rosterOf(this.setup)[i]?.look, i).hull,
       });
     }
     return stats;
@@ -841,6 +1011,112 @@ export class Match implements ModeHost, PlayerHost {
     };
   }
 
+  // ───────────────────────────── online host ─────────────────────────────
+
+  /**
+   * Everything the match said out loud since the last call, oldest first (see NetEvent): sounds, effects,
+   * announcements, feed lines, camera kicks, rumble, hints, darts leaving and landing. Call it after every step and
+   * send the events to the guests (`to` says which one an event is for; no `to` = everybody). Empty for local
+   * play. Do not change the returned array.
+   */
+  drainEvents(): readonly NetEvent[] {
+    return this.tap ? this.tap.take() : NO_EVENTS;
+  }
+
+  /** A dart landed: the guests' copy sticks to the boat, bounces off the shield, or (no pose to show) just ends. */
+  private recordHit(h: DartHit): void {
+    const tap = this.tap;
+    if (!tap) return;
+    if (h.blocked) {
+      tap.push({ k: 'deflect', id: h.dartId, p: [h.point.x, h.point.y, h.point.z] });
+      tap.push({ k: 'hit', boat: h.targetId, blocked: true, stun: 0 });
+      return;
+    }
+    if (h.tip && h.quat) {
+      tap.push({
+        k: 'stick', id: h.dartId, boat: h.targetId,
+        tip: [h.tip[0], h.tip[1], h.tip[2]], quat: [h.quat[0], h.quat[1], h.quat[2], h.quat[3]],
+      });
+    } else {
+      tap.push({ k: 'kill', id: h.dartId });
+    }
+    tap.push({ k: 'hit', boat: h.targetId, blocked: false, stun: this.mode.stunSeconds });
+  }
+
+  /**
+   * Everything a guest needs to draw the match right now: every boat, the sharks, the crates, the balloons and the
+   * mode's numbers (scores, clock, race progress, teams, shark rules). Plain data, built fresh each call.
+   */
+  netSnapshot(seq: number): NetSnapshot {
+    const boats: BoatNetState[] = [];
+    for (let i = 0; i < this.boats.length; i++) boats.push(this.boatNet(this.boats[i]));
+    let sharks: SharkNetState = [];
+    try {
+      sharks = this.sharks.netState();
+    } catch (e) {
+      reportError('sharks.netState', e);
+    }
+    let crates = 0;
+    try {
+      crates = this.pickups.netState();
+    } catch (e) {
+      reportError('pickups.netState', e);
+    }
+    let balloons: number[] | null = null;
+    if (this.balloons) {
+      try {
+        balloons = this.balloons.netState();
+      } catch (e) {
+        reportError('balloons.netState', e);
+      }
+    }
+    return { seq, t: this.t, boats, sharks, crates, balloons, hud: this.netHud() };
+  }
+
+  /** One boat's state for the snapshot (if the boat cannot say, a stand-in made from what every boat shows). */
+  private boatNet(b: Boat): BoatNetState {
+    try {
+      return b.netState();
+    } catch (e) {
+      reportError(`boat[${b.id}].netState`, e);
+    }
+    return {
+      x: b.position.x, z: b.position.z, heading: b.heading, vx: b.velocity.x, vz: b.velocity.z, steer: 0,
+      boosting: b.boosting, shielded: b.shielded, stunned: b.stunned,
+      powerUp: b.powerUp ? b.powerUp.kind : null, powerUpLeft: b.powerUp ? b.powerUp.timeLeft : 0,
+      ammo: b.ammo, reloading: b.reloading, reloadProgress: b.reloadProgress, boost: b.boost,
+      aimTargetId: b.aimTargetId, epoch: 0,
+    };
+  }
+
+  /** What the mode shows on every HUD: scores, ranking, clocks, race progress, teams, balloons, shark rules. */
+  private netHud(): NetHudState {
+    const mode = this.mode;
+    const scores: number[] = [];
+    const nextGate: (number | null)[] = [];
+    const race: (RaceHudInfo | null)[] | null = mode.id === 'race' ? [] : null;
+    const ranking: number[] = [];
+    const hud: NetHudState = {
+      timeLeft: null, raceTime: null, ranking, scores, race, nextGate, teams: null, balloons: null, sharks: null,
+    };
+    try {
+      for (let i = 0; i < this.boats.length; i++) {
+        scores.push(mode.scoreOf(i));
+        nextGate.push(mode.nextGate(i));
+        if (race) race.push(mode.raceInfo(i));
+      }
+      for (let k = 0; k < mode.ranking.length; k++) ranking.push(mode.ranking[k].id);
+      hud.timeLeft = mode.timeLeft();
+      hud.raceTime = mode.raceTime();
+      hud.teams = mode.teams();
+      hud.balloons = mode.balloonCount();
+      hud.sharks = mode.sharkHud();
+    } catch (e) {
+      reportError('netHud', e);
+    }
+    return hud;
+  }
+
   // ───────────────────────────── cleanup ─────────────────────────────
 
   /** Release everything this match created. Safe to call twice. */
@@ -860,12 +1136,13 @@ export class Match implements ModeHost, PlayerHost {
     safely('balloons', () => this.balloons?.dispose());
     safely('sharks', () => this.sharks.dispose());
     for (const boat of this.boats) safely('boat', () => boat.dispose());
-    safely('fx', () => this.fx.dispose());
+    safely('fx', () => this.rawFx.dispose());
     safely('world', () => this.world.dispose());
     safely('scene', () => disposeSceneResources(this.scene));
     this.boats.length = 0;
     this.cams.length = 0;
     this.players.length = 0;
+    this.remotes.length = 0;
   }
 }
 

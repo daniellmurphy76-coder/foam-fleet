@@ -1,7 +1,8 @@
 /** Match setup helpers: defaults, cleaning up whatever the menu hands us, and ?quick= URL parsing. */
 import { CONFIG } from '../config';
+import { MAX_ONLINE_PLAYERS } from '../net/protocol';
 import type {
-  BotDifficulty, BoatLook, FlagId, HatId, HornId, MatchSetup, ModeId, PatternId, PlayerSetup,
+  BotDifficulty, BoatLook, FlagId, HatId, HornId, MatchSetup, ModeId, OnlineRoster, PatternId, PlayerSetup,
 } from '../types';
 import { clamp } from './util';
 
@@ -81,34 +82,29 @@ export function defaultSetup(mode: ModeId = 'battle'): MatchSetup {
  * Easy Driving switch, even from an old save), names trimmed, bots capped so humans + bots <= maxBoats,
  * no bots in Balloon Pop, at least one bot in Team Up (so there is another team to play against), and
  * 0 to 3 helper boats in Boats vs. Sharks.
+ *
+ * Online (`s.online`): every human on every device counts toward the boat limit, `humans` is 1 and `players` is just
+ * the player on THIS device (the contract in types.ts). A local setup comes back with no `online` key at all.
  */
 export function sanitizeSetup(s: MatchSetup): MatchSetup {
   const mode: ModeId = MODES.includes(s.mode) ? s.mode : 'battle';
-  const humans: 1 | 2 = s.humans === 2 ? 2 : 1;
-  const maxBots = Math.max(0, CONFIG.match.maxBoats - humans);
+  const roster = Array.isArray(s.online?.players) && s.online.players.length > 0
+    ? sanitizePlayers(s.online.players.slice(0, MAX_ONLINE_PLAYERS), Math.min(s.online.players.length, MAX_ONLINE_PLAYERS))
+    : null;
+  const online: OnlineRoster | null = roster
+    ? { players: roster, localSlot: clamp(Math.round(Number(s.online?.localSlot) || 0), 0, roster.length - 1) }
+    : null;
+  const humans: 1 | 2 = online ? 1 : s.humans === 2 ? 2 : 1;
+  const everyone = online ? online.players.length : humans;
+  const maxBots = Math.max(0, CONFIG.match.maxBoats - everyone);
   let bots = clamp(Math.round(Number(s.bots) || 0), 0, maxBots);
   if (mode === 'practice') bots = 0;
   else if (mode === 'team') bots = clamp(bots, 1, Math.max(1, maxBots));
   else if (mode === 'sharks') bots = clamp(bots, 0, Math.min(MAX_HELPERS, maxBots));
-  const players: PlayerSetup[] = [];
-  for (let i = 0; i < humans; i++) {
-    const p = s.players?.[i] as Partial<PlayerSetup> | undefined;
-    const name = (typeof p?.name === 'string' ? p.name.trim() : '').slice(0, 16) || `Player ${i + 1}`;
-    let color = typeof p?.color === 'number' && Number.isFinite(p.color) ? p.color : CONFIG.colors[i % CONFIG.colors.length];
-    // Two players can't share a paint color: the second one takes the first free swatch.
-    if (i === 1 && color === players[0].color) {
-      color = CONFIG.colors.find((c) => c !== players[0].color) ?? color;
-    }
-    players.push({
-      name,
-      color,
-      look: sanitizeLook(p?.look, i),
-      easyDriving: typeof p?.easyDriving === 'boolean' ? p.easyDriving : true,
-    });
-  }
+  const players = online ? [online.players[online.localSlot]] : sanitizePlayers(s.players, humans);
   const duration = Number(s.durationSec);
   const laps = Math.round(Number(s.laps));
-  return {
+  const out: MatchSetup = {
     mode,
     humans,
     bots,
@@ -117,6 +113,34 @@ export function sanitizeSetup(s: MatchSetup): MatchSetup {
     durationSec: duration > 0 ? duration : CONFIG.battle.durationSec,
     laps: laps >= 1 ? laps : CONFIG.race.laps,
   };
+  if (online) out.online = online;
+  return out;
+}
+
+/** One clean PlayerSetup per human: a name, a paint color nobody else has, a look and the Easy Driving switch. */
+function sanitizePlayers(list: readonly Partial<PlayerSetup>[] | undefined, count: number): PlayerSetup[] {
+  const players: PlayerSetup[] = [];
+  for (let i = 0; i < count; i++) {
+    const p = list?.[i];
+    const name = (typeof p?.name === 'string' ? p.name.trim() : '').slice(0, 16) || `Player ${i + 1}`;
+    let color = typeof p?.color === 'number' && Number.isFinite(p.color) ? p.color : CONFIG.colors[i % CONFIG.colors.length];
+    // Two players can't share a paint color: the later one takes the first free swatch.
+    if (i > 0 && players.some((q) => q.color === color)) {
+      color = CONFIG.colors.find((c) => !players.some((q) => q.color === c)) ?? color;
+    }
+    players.push({
+      name,
+      color,
+      look: sanitizeLook(p?.look, i),
+      easyDriving: typeof p?.easyDriving === 'boolean' ? p.easyDriving : true,
+    });
+  }
+  return players;
+}
+
+/** Everyone playing the match, in boat-id order: the whole online roster, or the local players. */
+export function rosterOf(s: MatchSetup): readonly PlayerSetup[] {
+  return s.online?.players ?? s.players;
 }
 
 /**

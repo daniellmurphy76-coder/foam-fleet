@@ -23,7 +23,7 @@ import * as THREE from 'three';
 import { CONFIG } from '../config';
 import { SHARK_ID_BASE } from '../types';
 import type {
-  ActivePowerUp, AimTarget, Boat, BoatControls, BoatInit, BumpEvent, DartSpawn, PowerUpKind, SpawnPoint, WorldQuery,
+  ActivePowerUp, AimTarget, Boat, BoatControls, BoatInit, BoatNetState, BumpEvent, DartSpawn, PowerUpKind, SpawnPoint, WorldQuery,
 } from '../types';
 import { buildBoatRig, FLAG_YAW, MARKER_HEIGHT, SHIELD_SIZE, type BoatRig } from './boatModel';
 
@@ -32,6 +32,8 @@ import { buildBoatRig, FLAG_YAW, MARKER_HEIGHT, SHIELD_SIZE, type BoatRig } from
 
 const SUBSTEP = 1 / 60; // physics never takes a bigger step than this, even if a frame is slow or fast-forwarded
 const MAX_SUBSTEPS = 15;
+/** Online puppets: no real boat goes faster than this (boost is 34 m/s), so anything faster is a glitch. */
+const PUPPET_MAX_SPEED = 60;
 const MAX_FRAME_DT = SUBSTEP * MAX_SUBSTEPS;
 
 // Throttle and speed
@@ -96,6 +98,7 @@ const ROLL_K = 60;
 const ROLL_C = 9;
 const FLASH_TIME = 0.28; // seconds the white hit flash lasts
 const SHIELD_POP_TIME = 0.3;
+const NET_STUN_GUESS = 0.6; // online puppets: wobble this long if a stun shows up in a snapshot before its hit event
 
 // ───────────────────────────── small helpers ─────────────────────────────
 
@@ -131,6 +134,17 @@ function findBoat(list: readonly Boat[], id: number): Boat | null {
   for (let i = 0; i < list.length; i++) if (list[i].id === id) return list[i];
   return null;
 }
+
+/** How much of the full turn rate a boat gets (speedRatio = speed / top speed): a slow pivot, full turn, a touch wider when flying. */
+function turnShapeFor(speedRatio: number): number {
+  return lerp(PIVOT_TURN, 1, smoothstep(0, FULL_TURN_AT, speedRatio)) * (1 - 0.22 * clamp01((speedRatio - 0.7) / 0.8));
+}
+
+/**
+ * Online guests: the puppet boats that share one world, so a puppet's turret can find the boat it is locked onto
+ * (applyNetState gets no `others` list). Keyed by the world object, so a host Match or a Garage boat never mixes in.
+ */
+const PUPPET_GROUPS = new WeakMap<object, Boat[]>();
 
 // ───────────────────────────── the boat ─────────────────────────────
 
@@ -206,6 +220,14 @@ class FoamBoat implements Boat {
   private shieldAppear = 0;
   private shieldPop = 0;
 
+  // online: the host bumps `epoch` on every respawn/teleport; a puppet remembers the one it last showed
+  private epoch = 0;
+  private netSeenEpoch = -1;
+  private netStunned = false;
+  private readonly netPowerUp: ActivePowerUp = { kind: 'triple', timeLeft: 0 };
+  /** Set by the first applyNetState: the puppets of this world (this boat included). null = a real, simulated boat. */
+  private peers: Boat[] | null = null;
+
   constructor(init: BoatInit) {
     this.id = init.id;
     this.name = init.name;
@@ -233,7 +255,7 @@ class FoamBoat implements Boat {
   get boosting(): boolean { return this._boosting; }
   get powerUp(): ActivePowerUp | null { return this._powerUp; }
   get shielded(): boolean { return this._shielded; }
-  get stunned(): boolean { return this.stunTimer > 0; }
+  get stunned(): boolean { return this.peers !== null ? this.netStunned : this.stunTimer > 0; }
   get aimTargetId(): number | null { return this._aimTargetId; }
 
   // Handling numbers, scaled for Easy Driving (read from CONFIG each time so live tweaks work).
@@ -363,9 +385,7 @@ class FoamBoat implements Boat {
     this.refreshAxes();
     let vf = vel.x * this.sinH + vel.z * this.cosH;
     const speedRatio = Math.abs(vf) / maxSpeed;
-    const turnShape =
-      lerp(PIVOT_TURN, 1, smoothstep(0, FULL_TURN_AT, speedRatio)) *
-      (1 - 0.22 * clamp01((speedRatio - 0.7) / 0.8)); // a touch wider when really flying
+    const turnShape = turnShapeFor(speedRatio);
     const targetYaw = -this.inSteer * this.turnBase * turnShape; // steer +1 = right = heading goes DOWN
     // Easy Driving eases into the turn more slowly, so a jab at the key never makes the boat twitch.
     this.yawRate += (targetYaw - this.yawRate) * (1 - Math.exp(-(easy ? EASY_YAW_RESPONSE : YAW_RESPONSE) * h));
@@ -942,6 +962,7 @@ class FoamBoat implements Boat {
   }
 
   respawn(spawn: SpawnPoint): void {
+    this.epoch++;
     this.position.set(spawn.x, 0, spawn.z);
     this.heading = spawn.heading;
     this.axesHeading = Number.NaN;
@@ -1003,6 +1024,7 @@ class FoamBoat implements Boat {
 
   teleport(spot: SpawnPoint): void {
     // Rescue: new spot, standing still, calm. Ammo, boost, shield and power-ups stay exactly as they were.
+    this.epoch++;
     this.position.set(spot.x, this.position.y, spot.z); // y follows the waves on the next update
     this.heading = spot.heading;
     this.axesHeading = Number.NaN;
@@ -1025,9 +1047,153 @@ class FoamBoat implements Boat {
     this.rig.root.rotation.set(this.pitch, this.heading, this.roll);
   }
 
+  // ───────────────────────────── online ─────────────────────────────
+
+  /** Host: everything a guest needs to draw this boat (and the owner's HUD). Read straight off the real state. */
+  netState(): BoatNetState {
+    const p = this._powerUp;
+    return {
+      x: this.position.x,
+      z: this.position.z,
+      heading: this.heading,
+      vx: this.velocity.x,
+      vz: this.velocity.z,
+      steer: this.inSteer,
+      boosting: this._boosting,
+      shielded: this._shielded,
+      stunned: this.stunTimer > 0,
+      powerUp: p ? p.kind : null,
+      powerUpLeft: p ? Math.max(0, p.timeLeft) : 0,
+      ammo: this._ammo,
+      reloading: this._reloading,
+      reloadProgress: this.reloadProgress,
+      boost: this._boost,
+      aimTargetId: this._aimTargetId,
+      epoch: this.epoch,
+    };
+  }
+
+  /**
+   * Guest: be a puppet. The pose and flags come from the host's snapshot (already interpolated by the caller);
+   * then ONLY the looks run (wave bob and tilt, flames, shield, turret, flag, propeller, wobble): no physics,
+   * no aim picking, no ammo or timers of our own. The same sampleWaves/animate as a real boat, so it looks identical.
+   */
+  applyNetState(s: BoatNetState, dt: number, t: number, world: WorldQuery, aimTargets?: readonly AimTarget[]): void {
+    if (this.disposed) return;
+    if (!(dt > 0)) dt = 1e-4; // paused or garbage: nothing moves, but the pose is still placed
+    else if (dt > MAX_FRAME_DT) dt = MAX_FRAME_DT;
+    if (this.peers === null) {
+      let group = PUPPET_GROUPS.get(world);
+      if (!group) PUPPET_GROUPS.set(world, (group = []));
+      group.push(this);
+      this.peers = group;
+    }
+
+    // A garbled network value must never reach the physics-free animation below (or the wake effects).
+    if (!Number.isFinite(s.x + s.z + s.heading + s.vx + s.vz)) return;
+
+    // Pose and velocity (the caller supplies the velocity every frame, so the nose pitch below stays smooth).
+    this.position.x = s.x;
+    this.position.z = s.z;
+    this.heading = s.heading;
+    this.velocity.set(s.vx, 0, s.vz);
+    const vMag = Math.hypot(s.vx, s.vz);
+    if (vMag > PUPPET_MAX_SPEED) this.velocity.multiplyScalar(PUPPET_MAX_SPEED / vMag);
+    this.inSteer = clamp(s.steer, -1, 1);
+    this.refreshAxes();
+    const vf = this.velocity.x * this.sinH + this.velocity.z * this.cosH;
+
+    // A respawn or rescue on the host: snap, never glide. (The first snapshot counts too.)
+    if (s.epoch !== this.netSeenEpoch) {
+      this.netSeenEpoch = s.epoch;
+      this.yawRate = 0;
+      this.prevForward = vf;
+      this.accel = 0;
+      this.pitchVel = 0;
+      this.rollVel = 0;
+      this.stunTimer = 0;
+      this.flash = 0;
+      this.wobblePhase = 0;
+      this.turretYawA = 0;
+      this.turretPitchA = AIM_UP;
+      this.recoil = 0;
+      this.muzzleFlashT = 0;
+      this.setFlash(0);
+    }
+
+    // Flags and meters, exactly as the host has them.
+    this._boosting = s.boosting;
+    this._boost = s.boost;
+    this._ammo = s.ammo;
+    this._reloading = s.reloading;
+    this.reloadElapsed = s.reloadProgress * Math.max(0.01, CONFIG.blaster.reloadTime);
+    this._aimTargetId = s.aimTargetId;
+    if (s.powerUp !== null) {
+      const p = this.netPowerUp; // one object, reused: the HUD reads kind/timeLeft each frame
+      p.kind = s.powerUp;
+      p.timeLeft = s.powerUpLeft;
+      this._powerUp = p;
+    } else {
+      this._powerUp = null;
+    }
+
+    // Shield: pops in on a fresh pickup. (A hit's own pop animation, started by netHit, is never cut short.)
+    if (!s.shielded) {
+      this._shielded = false;
+    } else if (!this._shielded && this.shieldPop <= 0) {
+      this._shielded = true;
+      this.shieldAppear = 0;
+    }
+
+    // Stun: the wobble runs on a local timer (started by netHit); the flag itself follows the host.
+    if (s.stunned && !this.netStunned && this.stunTimer <= 0) {
+      this.stunTimer = this.stunDuration = NET_STUN_GUESS; // the hit event is late or was lost
+    } else if (!s.stunned && this.netStunned) {
+      this.stunTimer = 0; // the host says it is over
+    }
+    this.netStunned = s.stunned;
+    if (this.stunTimer > 0) this.stunTimer = Math.max(0, this.stunTimer - dt);
+    if (this.flash > 0) this.flash = Math.max(0, this.flash - dt / FLASH_TIME);
+    if (this.shieldPop > 0) this.shieldPop = Math.max(0, this.shieldPop - dt);
+
+    // The turn rate the host's boat would have (same recipe as stepPhysics), so banking and the flag look right.
+    const targetYaw = -this.inSteer * this.turnBase * turnShapeFor(Math.abs(vf) / this.topSpeed);
+    this.yawRate += (targetYaw - this.yawRate) * (1 - Math.exp(-(this.easyDriving ? EASY_YAW_RESPONSE : YAW_RESPONSE) * dt));
+
+    this.sampleWaves(dt, t, world);
+    this.animate(dt, t, this.peers, aimTargets);
+  }
+
+  /** Guest: a shot was fired (the darts come from their own event). Recoil and a muzzle puff. */
+  netFire(): void {
+    if (this.disposed) return;
+    this.recoil = 1;
+    this.muzzleFlashT = 1;
+  }
+
+  /** Guest: this boat was hit. A shield pops, or the paint flashes and the boat wobbles. Looks only. */
+  netHit(blocked: boolean, stunSeconds: number): void {
+    if (this.disposed) return;
+    if (blocked) {
+      this._shielded = false;
+      this.shieldPop = SHIELD_POP_TIME;
+      return;
+    }
+    this.flash = 1;
+    if (stunSeconds > 0) {
+      this.stunTimer = Math.max(this.stunTimer, stunSeconds);
+      this.stunDuration = this.stunTimer;
+    }
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    if (this.peers) {
+      const i = this.peers.indexOf(this);
+      if (i >= 0) this.peers.splice(i, 1);
+      this.peers = null;
+    }
     this.rig.dispose();
     IMPLEMENTATIONS.delete(this);
   }
