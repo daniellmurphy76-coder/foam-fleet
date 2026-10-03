@@ -269,3 +269,155 @@ multiplies simulation speed (e.g. 8 to fast-forward), `autopilot = true` makes h
 bot controllers, and `snapshot()` returns `{ state, t, fps, mode, boats: [{id, name, x, z, heading,
 speed, score, ammo, stunned}], darts: number, hits: number, errors: string[] }` (collect
 `window.onerror`/unhandled rejections into `errors`). A small FPS readout appears when `?fps=1`.
+
+---
+
+# v2: Easy Driving + five upgrades
+
+Playtest feedback: **the kid had a hard time driving the boat.** v2 fixes that first, then adds five
+upgrades: Team Up mode, Balloon Pop practice mode, a mini-map, the Boat Garage (with a honk button), and
+a Trophy Shelf. Contracts in `src/types.ts` and knobs in `src/config.ts` are already updated; the stubs
+`src/world/balloons.ts` and `src/ui/trophies.ts` are new. `npx tsc --noEmit` currently fails in every
+module on purpose: each error sits in the module that must adapt to the new contracts.
+
+## Easy Driving (the fix)
+
+A per-player toggle in setup, **default ON**. Three layers:
+
+1. **Boat physics** (`src/entities`, when `init.easyDriving`): top speed and boost speed x
+   `CONFIG.easyDriving.speedScale`, acceleration x0.85; turn rate x `turnScale` and the yaw rate eases toward
+   its target over ~0.25 s (no twitch); no drift (very high grip); dart knockback x `knockbackScale`, stun
+   wobble/spin x0.3 and stun thrust x0.6 (instead of x0.35). **Shore sliding:** hitting an island or the arena
+   edge never bounces the boat backward. Remove the inward part of the velocity, keep ~85% of the sideways
+   part, and gently turn the nose toward whichever shoreline tangent is closest to the current heading, so the
+   boat glides along the coast and never gets wedged nose-in.
+2. **Driving assist** (`src/input`, inside the human controller, when `ctx.self.easyDriving`):
+   - **Auto-cruise:** with no throttle input the boat cruises at `cruiseThrottle`. Go = full speed. Back =
+     brake, then reverse.
+   - **Steering:** the keyboard steering ramp lengthens to 0.22 s.
+   - **Bumper rails:** probe ahead along the velocity/forward direction for max(12 m, speed x 1.2 s) against
+     `world.obstacles` (+3 m margin) and the arena edge (radius - 6 m). The probe functions in
+     `src/ai/steering.ts` already do this for bots, so reuse them. When a hit is predicted, add a steering
+     correction toward the side with more clearance: `assist = bumperStrength x urgency` (urgency 0..1 rises
+     as the predicted impact gets closer). Combine as `clamp(player x (1 - 0.5 x urgency) + assist)`. If
+     urgency > 0.8 and the obstacle is under 6 m away, cap throttle at 0.4.
+   - **Gamepad:** apply a squared response curve to stick steering for fine control near center (all players).
+3. **Game core** (`src/game`):
+   - **Rescue:** applies to every human. Act on the press of `controls.rescue`, with `CONFIG.rescue.cooldownSec`
+     between uses: `spot = world.safeSpot(x, z, heading)` → `boat.teleport(spot)` → big `fx.splash` + `fx.sparkle`
+     + `sfx.rescue()` + `hud.announce('RESCUED!', {viewport})`. Race progress is kept.
+   - **Auto-rescue:** for Easy Driving humans stuck for `autoRescueSec`. Stuck = |speed| < 1.5 m/s while the
+     throttle intent is > 0.3, or touching an obstacle.
+   - **Stuck hint:** normal-driving humans stuck for 2 s get `hud.hint('Stuck? Press R!')`, worded for their
+     scheme via `input.schemeOf`.
+   - **Camera:** Easy Driving players use `CONFIG.camera.easy` and smoother yaw follow.
+   - **Coach hints:** at GO, a scheme-aware "Steer with A and D, Space to shoot!" ("Left stick to steer, A to
+     shoot!" on a gamepad). After 12 s with no shots: "Press SPACE to shoot!". After 3 s parked without
+     Easy Driving: "Hold W to go!". At most one hint per player per 8 s, and each hint at most twice per match.
+
+**New buttons:**
+
+| Action | Player 1 | Player 2 | Gamepad |
+|---|---|---|---|
+| Rescue | R | `/` (Slash) | Y |
+| Honk | Q | ` ' ` (next to Enter) | X |
+
+Gamepad boost is now B or LB only (X became honk). In a 1-player game every scheme merges, as before.
+
+## Team Up (`mode: 'team'`)
+
+- **Teams:** `total = humans + bots`. Team 0 = the humans plus `allies = max(0, ceil(total / 2) - humans)`
+  helper bots. Team 1 = the remaining bots.
+- **Spawns:** `world.teamSpawnPoints(a, b)`. Team names and colors come from `CONFIG.team`. Each boat gets
+  `marker` = its team color, so a small diamond floats above it.
+- **Darts** pass through teammates. Aim assist and bots never target teammates. Teammates still bump.
+- **Scoring:** each boat scores its own hits; the team score is the sum. The timer is `durationSec`.
+- **Results:** "Splash Squad wins!" or "It's a tie!"; rows ranked by own hits; `result.teams` filled.
+- **Bots:** allies prefer opponents near a human (protect your buddy). Nobody fires when a teammate is in the
+  line of fire within 25 m.
+
+## Balloon Pop (`mode: 'practice'`)
+
+- **Setup:** no bots (`bots` forced to 0). `CONFIG.practice.balloons` balloons float around the lagoon, and
+  every `goldEvery`-th one is gold (worth 3).
+- **Popping:** pop one with a dart (`darts.update(..., balloons.targets)` → `targetHits` →
+  `balloons.pop(id, ownerId)`) or by driving through it (`balloons.update` returns ram pops). Ramming is the
+  point: a kid who can't aim yet still pops balloons.
+- **Clock:** counts up (`raceTime`). The match ends when every balloon is popped. Results show each player's
+  points and the time; with 2 players the most points wins (ties allowed). Pickups stay on.
+- **Feedback:** each pop triggers `fx.pop` + `sfx.pop()`, plus a feed line for gold balloons.
+- **Balloons** (`src/world/balloons.ts`): deterministic spots in open water (>= 6 m from obstacles, inside
+  arena - 15 m), in clusters of 1–3 along driving lanes.
+  - Look: shiny bright spheres (gold = metallic gold) with a knot and a curly string down to a small float.
+  - Motion: they bob on `waveHeight` and sway.
+  - Size: the balloon center sits ~1.6 m above the water, so darts AND passing boats hit it. Dart radius ~0.9.
+  - Ram rule: popped when a boat's XZ distance < boat.radius + 1.0.
+  - Popped balloons hide (`alive = false`); they don't respawn.
+
+## Mini-map (HUD)
+
+- **Placement:** one circular radar per viewport, bottom-right of that viewport. Diameter = min(22% of viewport
+  height, 180 px), minimum 110 px.
+- **Orientation:** heading-up, rotated by `players[i].viewHeading`.
+- **Contents** (from `HudState.map`):
+  - the arena edge ring and sand-colored islands;
+  - the player's own boat as a big arrow in their color with a white outline;
+  - other boats as small arrows (humans larger, teammates ringed in the team color);
+  - power-up crates as yellow dots;
+  - race gates as short bars, with `players[i].nextGate` pulsing;
+  - balloons as dots (gold larger).
+- **Drawing:** Canvas 2D at <= 20 Hz. Cache the static island layer by the `obstacles` array identity.
+
+## Boat Garage
+
+- **Where:** reached from each player's card in setup.
+- **Preview:** a live 3D preview in its own small `WebGLRenderer` and scene: `createBoat({... look})` from
+  `src/entities/boat.ts`, spinning slowly on a calm turntable. Dispose it all on close.
+- **Pickers:**
+  - Boat: Zippy / Tuggy / Twin = hull 0 / 1 / 2
+  - Paint: solid / stripes / flames / dots / shark teeth
+  - Hat: captain / pirate / crown / cowboy / propeller beanie / none
+  - Flag on a little mast: none / star / heart / skull / lightning / smile
+  - Horn: beep / duck / foghorn / clown, with a "Test horn" button
+  - Color swatches
+- **Boat module:** must render every option clearly: the pattern on the hull, the hat on the captain, the flag
+  on a mast at the stern. In Team Up, the flag cloth takes the team color.
+- **Bots** get deterministic looks seeded by id.
+
+## Trophy Shelf
+
+- **Data:** `src/ui/trophies.ts` exports `TROPHIES` (about 12; kid-readable name, how-to sentence, one emoji)
+  and `awardTrophies(stats)`. It saves per player name in localStorage (key `foamfleet.trophies`, in
+  try/catch) and returns only first-time awards.
+- **Who calls what:** the core builds `PlayerMatchStats` for each human, calls `awardTrophies`, and puts the
+  awards in `MatchResult.awards`. The results screen celebrates them (bounce-in + `sfx.trophy()`).
+- **Shelf screen:** on the title screen, it shows every trophy per saved player: earned ones in color, missing
+  ones as grey silhouettes with the how-to sentence.
+- **Suggested set:**
+  - First Splat (tag any boat)
+  - Sharpshooter (10 hits in one Dart Battle)
+  - Gotcha! (tag the other player)
+  - Champion (win a Dart Battle)
+  - Finish Line (finish a race)
+  - Race Winner (win a race)
+  - Teamwork (win Team Up)
+  - Balloon Buster (10 balloon points in one game)
+  - Pop Star (pop every balloon)
+  - Rocket Boat (10 s of boost in one match)
+  - Honk Honk (honk 10 times in one match)
+  - Treasure Hunter (3 power-ups in one match)
+
+## Ownership for the v2 wave (same rules as before: stay in your lane)
+
+| Builder | Owns | v2 work |
+|---|---|---|
+| Boat | `src/entities/**` | Easy Driving physics + shore sliding, `team`/`easyDriving`/`teleport`, `BoatLook` rendering (hulls, patterns, hats, flag mast, team flag color), team marker diamond, aim assist skips teammates |
+| World | `src/world/**` | `safeSpot`, `teamSpawnPoints`, `balloons.ts`, `'team'`/`'practice'` behave like battle for world + pickups |
+| Combat & FX | `src/combat/**`, `src/fx/**` | darts skip teammates, `targets` → `targetHits`, `fx.pop`, `fx.notes` |
+| Input & AI | `src/input/**`, `src/ai/**` | rescue/honk buttons, `schemeOf`, Easy Driving assist, gamepad curve, team-aware bots |
+| Menu | `src/ui/menu.ts`, `src/ui/garage.ts` (new), `src/ui/trophies.ts`, `src/ui/styles.css`, `src/ui/dom.ts` | 4 modes, Easy Driving toggle, Garage, Trophy Shelf screen, trophy logic, setup persistence with defaults for old saves |
+| HUD & Audio | `src/ui/hud.ts`, `src/ui/minimap.ts` (new), `src/ui/hud.css` (new, imported by hud.ts), `src/audio/**` | mini-map, team banner, balloon counters, `hint`, Easy badge, trophy celebration on results; new sounds (pop, 4 horns, rescue, trophy) |
+| Game core | `src/main.ts`, `src/game/**` | Team Up + Balloon Pop modes, rescue/auto-rescue/hints/honk, easy camera, stats + `awardTrophies`, new `HudState`/`MatchResult` fields, `sanitizeSetup` for new modes/fields, quick params `?quick=team|practice&easy=0|1`, snapshot adds `balloons` + `teams` |
+
+The HUD builder must not edit `styles.css` or `dom.ts` (the Menu builder owns them); put new HUD styles in
+`hud.css`. Only the Game core edits `src/game/**`, including fallbacks and debug.

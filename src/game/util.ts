@@ -1,4 +1,10 @@
 /** Small math and text helpers shared by the game-core files. */
+import { CONFIG } from '../config';
+
+/** A boat's top (non-boost) speed in m/s. Easy Driving boats are a little slower. */
+export function topSpeedOf(easyDriving: boolean): number {
+  return CONFIG.boat.maxSpeed * (easyDriving ? CONFIG.easyDriving.speedScale : 1);
+}
 
 export function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;

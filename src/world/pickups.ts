@@ -51,9 +51,12 @@ const easeOutBack = (p: number): number => {
   return 1 + c3 * Math.pow(p - 1, 3) + c1 * Math.pow(p - 1, 2);
 };
 
-/** Where crates live. Battle: hand-placed spread around the lagoon. Race: just off the racing line between gates. */
+/**
+ * Where crates live. Race: just off the racing line between gates. Every other mode (battle,
+ * Team Up, Balloon Pop): hand-placed spread around the lagoon.
+ */
 function crateSpots(world: World, mode: ModeId, wanted: number): { x: number; z: number }[] {
-  if (mode === 'battle') {
+  if (mode !== 'race') {
     return buildLayout(world.arenaRadius).battleCrates.slice(0, wanted);
   }
   const gates = world.checkpoints;

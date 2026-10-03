@@ -88,6 +88,122 @@ export function storeSet(key: string, value: string): void {
   }
 }
 
+// ───────────── setup-screen building blocks (menu + garage) ─────────────
+
+export interface SegItem<T> {
+  value: T;
+  label: string;
+  sub?: string;
+  /** A little emoji (text) or a prebuilt static SVG node, shown above the label. */
+  icon?: string | Node;
+}
+export interface Seg<T> {
+  row: HTMLElement;
+  buttons: HTMLButtonElement[];
+  select(v: T): void;
+}
+
+/**
+ * A row of big toggle buttons where exactly one is selected.
+ * `quiet` skips the click sound, for rows that play a sound of their own (like the horn picker).
+ */
+export function makeSeg<T>(
+  sfx: Sfx,
+  ariaLabel: string,
+  items: SegItem<T>[],
+  onPick: (v: T) => void,
+  quiet = false,
+): Seg<T> {
+  const row = el('div', 'ff-row ff-seg');
+  row.setAttribute('role', 'group');
+  row.setAttribute('aria-label', ariaLabel);
+  const buttons = items.map((it) => {
+    const b = button(it.label, 'ff-btn ff-seg-btn');
+    if (it.icon !== undefined) {
+      const ico = el('span', 'ff-seg-ico');
+      if (typeof it.icon === 'string') {
+        ico.textContent = it.icon;
+        ico.setAttribute('aria-hidden', 'true');
+      } else {
+        ico.append(it.icon);
+      }
+      b.prepend(ico);
+    }
+    if (it.sub) b.append(el('span', 'ff-seg-sub', it.sub));
+    b.addEventListener('click', () => {
+      if (!quiet) sfx.uiSelect();
+      onPick(it.value);
+    });
+    row.append(b);
+    return b;
+  });
+  return {
+    row,
+    buttons,
+    select(v: T) {
+      items.forEach((it, i) => buttons[i].setAttribute('aria-pressed', String(it.value === v)));
+    },
+  };
+}
+
+/** A labelled group of controls. */
+export function field(title: string, ...content: HTMLElement[]): { box: HTMLElement; label: HTMLElement } {
+  const box = el('div', 'ff-field');
+  const label = el('div', 'ff-label', title);
+  box.append(label, ...content);
+  return { box, label };
+}
+
+export interface Swatches {
+  row: HTMLElement;
+  buttons: HTMLButtonElement[];
+  /** Show which color is picked; `takenBy` returns a tag like "P2" for a color the other player has, else null. */
+  sync(selected: number, takenBy: (c: number) => string | null): void;
+}
+
+/** A row of round paint-color buttons. */
+export function makeSwatches(
+  sfx: Sfx,
+  ariaLabel: string,
+  colors: readonly number[],
+  onPick: (c: number) => void,
+): Swatches {
+  const row = el('div', 'ff-row ff-swatches');
+  row.setAttribute('role', 'group');
+  row.setAttribute('aria-label', ariaLabel);
+  const buttons = colors.map((c) => {
+    const s = el('button', 'ff-swatch');
+    s.type = 'button';
+    s.setAttribute('data-nav', '');
+    s.style.setProperty('--c', cssColor(c));
+    const nm = colorName(c);
+    s.setAttribute('aria-label', nm);
+    s.title = nm;
+    s.addEventListener('click', () => {
+      if (s.disabled) return;
+      sfx.uiSelect();
+      onPick(c);
+    });
+    row.append(s);
+    return s;
+  });
+  return {
+    row,
+    buttons,
+    sync(selected, takenBy) {
+      buttons.forEach((s, j) => {
+        const c = colors[j];
+        const mine = selected === c;
+        const taken = takenBy(c);
+        s.setAttribute('aria-pressed', String(mine));
+        s.disabled = taken !== null && !mine;
+        if (taken !== null) s.dataset.taken = taken;
+        else delete s.dataset.taken;
+      });
+    },
+  };
+}
+
 // ───────────── audio unlock ─────────────
 // Browsers only allow sound after a click or key press, so listen for the first one.
 const unlockInstalled = new WeakSet<Sfx>();

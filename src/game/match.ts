@@ -8,22 +8,29 @@
 import * as THREE from 'three';
 import { CONFIG } from '../config';
 import type {
-  Boat, BoatControls, BoatInit, BumpEvent, Controller, ControllerContext, DartHit, DartSystem,
-  DartSpawn, DartUpdateResult, Effects, Hud, InputManager, MatchSetup, PickupEvent, Pickups, PowerUpKind, Sfx,
-  SpawnPoint, World,
+  Balloons, BalloonPop, Boat, BoatControls, BoatInit, BumpEvent, Controller, ControllerContext, DartHit,
+  DartSystem, DartSpawn, DartTargetHit, DartUpdateResult, Effects, Hud, InputManager, MapBoat, MapState,
+  MatchResult, MatchSetup, ModeId, Obstacle, PickupEvent, Pickups, PlayerMatchStats, PowerUpKind, Sfx, SpawnPoint,
+  TrophyAward, World,
 } from '../types';
 import { ChaseCamera } from './cameras';
 import { foam, reportError } from './debug';
 import {
-  ZERO_CONTROLS, fallbackBoat, fallbackDarts, fallbackPickups, fallbackSpawns, fallbackWorld, idleController, quietFx,
+  ZERO_CONTROLS, fallbackBalloons, fallbackBoat, fallbackDarts, fallbackPickups, fallbackSpawns,
+  fallbackTeamSpawns, fallbackWorld, idleController, quietFx,
 } from './fallbacks';
-import { buildOrFallback, guard } from './guard';
+import { V2_METHODS, buildOrFallback, guard } from './guard';
 import {
-  createBoat, createBotController, createDartSystem, createEffects, createPickups, createWorld, resolveBoatCollisions,
+  awardTrophies, createBalloons, createBoat, createBotController, createDartSystem, createEffects, createPickups,
+  createWorld, resolveBoatCollisions,
 } from './modules';
 import { BattleMode } from './modes/battle';
 import type { GameMode, GateTargets, ModeHost } from './modes/mode';
+import { PracticeMode } from './modes/practice';
 import { RaceMode } from './modes/race';
+import { TeamMode } from './modes/team';
+import { HumanPlayer, type PlayerHost } from './players';
+import { botLook, sanitizeLook } from './setup';
 import { clamp } from './util';
 
 /** The simulation always advances in slices of this many seconds. */
@@ -36,9 +43,10 @@ export interface MatchServices {
 }
 
 const NO_POSITIONS: readonly THREE.Vector3[] = [];
+const NO_BOATS: readonly Boat[] = [];
 const NO_BUMPS: BumpEvent[] = [];
 const NO_PICKUPS: PickupEvent[] = [];
-const NO_DARTS: DartUpdateResult = { hits: [], waterSplashes: [] };
+const NO_DARTS: DartUpdateResult = { hits: [], targetHits: [], waterSplashes: [] };
 
 const GOLD = 0xffd23f;
 
@@ -55,7 +63,16 @@ const POWER_NAMES: Record<PowerUpKind, string> = {
   turbo: 'Turbo',
 };
 
-export class Match implements ModeHost {
+function makeMode(id: ModeId, host: ModeHost): GameMode {
+  switch (id) {
+    case 'race': return new RaceMode(host);
+    case 'team': return new TeamMode(host);
+    case 'practice': return new PracticeMode(host);
+    default: return new BattleMode(host);
+  }
+}
+
+export class Match implements ModeHost, PlayerHost {
   readonly scene = new THREE.Scene();
   readonly world: World;
   readonly pickups: Pickups;
@@ -63,11 +80,16 @@ export class Match implements ModeHost {
   readonly fx: Effects;
   readonly hud: Hud;
   readonly sfx: Sfx;
+  readonly input: InputManager;
   readonly mode: GameMode;
+  /** Balloon Pop's balloons; null in every other mode. */
+  readonly balloons: Balloons | null;
   /** Humans are boats 0..humanCount-1; computer boats follow. */
   readonly boats: Boat[] = [];
   /** One chase camera per human, same order as the boats. */
   readonly cams: ChaseCamera[] = [];
+  /** One per human: rescue, honk, hints and trophy stats. */
+  readonly players: HumanPlayer[] = [];
   readonly humanCount: number;
 
   /** Match time in seconds. Runs during the countdown too (so the water moves); frozen while paused. */
@@ -75,7 +97,8 @@ export class Match implements ModeHost {
   /** Total dart hits that landed (not counting shield blocks). */
   hits = 0;
 
-  private readonly input: InputManager;
+  private readonly obstacles: readonly Obstacle[];
+  private cachedResult: MatchResult | null = null;
   private readonly ctrls: Controller[] = [];
   private readonly autopilots: (Controller | null)[] = [];
   private readonly ctxs: ControllerContext[] = [];
@@ -104,17 +127,23 @@ export class Match implements ModeHost {
     const modeId = setup.mode;
     // Each module is built behind buildOrFallback so one broken builder cannot stop the match from starting.
     this.world = buildOrFallback('createWorld', () => createWorld(scene, modeId), () => fallbackWorld(scene, modeId));
+    this.obstacles = this.world.obstacles;
     this.pickups = buildOrFallback('createPickups', () => createPickups(scene, this.world, modeId), fallbackPickups);
-    this.fx = guard('fx', buildOrFallback('createEffects', () => createEffects(scene), quietFx));
+    this.fx = guard('fx', buildOrFallback('createEffects', () => createEffects(scene), quietFx), {}, V2_METHODS.fx);
     this.darts = buildOrFallback('createDartSystem', () => createDartSystem(scene, this.fx), fallbackDarts);
+    this.balloons = modeId === 'practice'
+      ? buildOrFallback('createBalloons', () => createBalloons(scene, this.world), () => fallbackBalloons(scene, this.world))
+      : null;
 
     this.createBoats();
-    this.mode = modeId === 'race' ? new RaceMode(this) : new BattleMode(this);
+    this.mode = makeMode(modeId, this);
 
     for (let i = 0; i < this.humanCount; i++) {
-      const cam = new ChaseCamera();
-      cam.snap(this.boats[i], this.world, 0);
+      const boat = this.boats[i];
+      const cam = new ChaseCamera(boat.easyDriving);
+      cam.snap(boat, this.world, 0);
       this.cams.push(cam);
+      this.players.push(new HumanPlayer(i, boat, sanitizeLook(setup.players[i]?.look, i).horn, this));
     }
   }
 
@@ -127,9 +156,15 @@ export class Match implements ModeHost {
   private createBoats(): void {
     const { setup } = this;
     const humans = this.humanCount;
-    const bots = clamp(Math.round(setup.bots), 0, Math.max(0, CONFIG.match.maxBoats - humans));
+    // Balloon Pop has no computer boats.
+    const bots = setup.mode === 'practice' ? 0 : clamp(Math.round(setup.bots), 0, Math.max(0, CONFIG.match.maxBoats - humans));
     const total = humans + bots;
-    const spawns = this.pickSpawns(total);
+    // Team Up: team 0 = the humans plus enough helper bots to even the sides; team 1 = the other bots.
+    // Boats are numbered humans, then helpers, then opponents, so each side is one run of ids.
+    const teamMode = setup.mode === 'team';
+    const allies = teamMode ? Math.min(bots, Math.max(0, Math.ceil(total / 2) - humans)) : 0;
+    const sideA = humans + allies;
+    const spawns = teamMode ? this.pickTeamSpawns(sideA, total - sideA) : this.pickSpawns(total);
 
     // Computer boats get paint colors the humans did not pick.
     const used = new Set<number>();
@@ -140,6 +175,7 @@ export class Match implements ModeHost {
       const isHuman = i < humans;
       const botIndex = i - humans;
       const player = setup.players[i];
+      const team = teamMode ? (i < sideA ? 0 : 1) : i;
       const init: BoatInit = {
         id: i,
         name: isHuman ? player?.name || `Player ${i + 1}` : CONFIG.botNames[botIndex % CONFIG.botNames.length],
@@ -148,7 +184,11 @@ export class Match implements ModeHost {
           : freeColors.length > 0 ? freeColors[botIndex % freeColors.length] : CONFIG.colors[i % CONFIG.colors.length],
         isHuman,
         spawn: spawns[i],
-        style: i % 3,
+        look: isHuman ? sanitizeLook(player?.look, i) : botLook(i),
+        team,
+        marker: teamMode ? CONFIG.team.colors[team] : null,
+        // Easy Driving is for the kids at the controls; computer boats always drive normally.
+        easyDriving: isHuman && (player?.easyDriving ?? true),
       };
       const boat = buildOrFallback('createBoat', () => createBoat(init), () => fallbackBoat(init));
       this.scene.add(boat.object);
@@ -185,6 +225,21 @@ export class Match implements ModeHost {
       reportError('world.spawnPoints', e);
     }
     return fallbackSpawns(count, this.setup.mode, this.world.checkpoints);
+  }
+
+  /** Team Up spawns: side A's points first, then side B's. Same safety net as pickSpawns. */
+  private pickTeamSpawns(countA: number, countB: number): SpawnPoint[] {
+    const usable = (pts: readonly SpawnPoint[] | undefined, n: number): boolean =>
+      !!pts && pts.length >= n && pts.slice(0, n).every((p) => Number.isFinite(p.x + p.z + p.heading));
+    try {
+      const [a, b] = this.world.teamSpawnPoints(countA, countB);
+      if (usable(a, countA) && usable(b, countB)) return [...a.slice(0, countA), ...b.slice(0, countB)];
+      reportError('world.teamSpawnPoints', `gave ${a?.length}+${b?.length} usable points, needed ${countA}+${countB}`);
+    } catch (e) {
+      reportError('world.teamSpawnPoints', e);
+    }
+    const [a, b] = fallbackTeamSpawns(countA, countB);
+    return [...a, ...b];
   }
 
   // ───────────────────────────── the simulation ─────────────────────────────
@@ -229,12 +284,23 @@ export class Match implements ModeHost {
         }
       }
       // Copy the fire flag right now: some controllers reuse one output object.
+      // (Computer boats hold their own fire while a teammate is in the way: that lives in ai/bot.ts.)
       this.firing[i] = driven && c.fire === true;
+      // Humans: rescue, honk and hints. (Before boat.update, so a rescued boat carries on from its new spot.)
+      const human = i < this.humanCount ? this.players[i] : null;
+      if (human && driven) {
+        try {
+          human.update(dt, t, c, mode.isFinished(i));
+        } catch (e) {
+          reportError(`player[${i}].update`, e);
+        }
+      }
       try {
         boat.update(c, dt, t, this.world, this.others[i]);
       } catch (e) {
         reportError(`boat[${i}].update`, e);
       }
+      if (human && driven && boat.boosting) human.boostSeconds += dt;
     }
 
     // 2. Boats bump into each other.
@@ -262,14 +328,15 @@ export class Match implements ModeHost {
       }
     }
 
-    // 4. Darts fly; apply what they hit.
+    // 4. Darts fly; apply what they hit (boats, and in Balloon Pop the balloons).
     let flight = NO_DARTS;
     try {
-      flight = this.darts.update(dt, t, boats, this.world, mode.stunSeconds);
+      flight = this.darts.update(dt, t, boats, this.world, mode.stunSeconds, this.balloons?.targets);
     } catch (e) {
       reportError('darts.update', e);
     }
     this.onHits(flight.hits, rulesOn);
+    if (this.balloons) this.updateBalloons(flight.targetHits, t, dt, rulesOn);
     let splashSounds = 0;
     for (let k = 0; k < flight.waterSplashes.length && splashSounds < 2; k++) {
       const p = flight.waterSplashes[k];
@@ -411,6 +478,7 @@ export class Match implements ModeHost {
       const shooter = this.boats[h.ownerId];
       const target = this.boats[h.targetId];
       if (!shooter || !target) continue;
+      if (shooter.team === target.team) continue; // teammates never tag each other (the darts skip them already)
       const shooterSlot = this.slotOf(shooter.id);
       const targetSlot = this.slotOf(target.id);
       const audible = shooterSlot >= 0 || targetSlot >= 0 || this.nearHuman(h.point.x, h.point.z, 45);
@@ -434,9 +502,15 @@ export class Match implements ModeHost {
       if (!rulesOn) continue;
 
       mode.onTag(shooter, target);
+      if (shooterSlot >= 0) {
+        const p = this.players[shooterSlot];
+        p.hits++;
+        if (targetSlot >= 0 && targetSlot !== shooterSlot) p.tagsOnOtherHuman++;
+      }
+      if (targetSlot >= 0) this.players[targetSlot].timesTagged++;
       const verb = TAG_VERBS[this.tagCount++ % TAG_VERBS.length];
       this.hud.feed(`${shooter.name} ${verb} ${target.name}!`, shooter.color);
-      if (shooterSlot >= 0 && mode.id === 'battle') {
+      if (shooterSlot >= 0 && (mode.id === 'battle' || mode.id === 'team')) {
         this.hud.announce('SPLAT!', { sub: `+${CONFIG.battle.pointsPerHit}`, ms: 700, viewport: shooterSlot });
       }
     }
@@ -456,11 +530,133 @@ export class Match implements ModeHost {
       const slot = this.slotOf(boat.id);
       if (slot >= 0 || this.nearHuman(e.position.x, e.position.z, 40)) this.sfx.pickup();
       if (slot >= 0 && rulesOn) {
+        this.players[slot].pickups++;
         const label = POWER_NAMES[e.kind] ?? String(e.kind);
         this.hud.feed(`${boat.name} grabbed ${label}!`, boat.color);
         this.hud.announce(`${label.toUpperCase()}!`, { ms: 900, viewport: slot });
       }
     }
+  }
+
+  // ───────────────────────────── balloons ─────────────────────────────
+
+  /** Balloon Pop: pop what the darts hit, then whatever a boat drove through. Nothing pops outside the rules. */
+  private updateBalloons(dartHits: readonly DartTargetHit[], t: number, dt: number, rulesOn: boolean): void {
+    const balloons = this.balloons;
+    if (!balloons) return;
+    try {
+      if (rulesOn) {
+        for (let k = 0; k < dartHits.length; k++) {
+          const pop = balloons.pop(dartHits[k].targetId, dartHits[k].ownerId);
+          if (pop) this.onBalloonPop(pop);
+        }
+      }
+      // With the rules off (countdown, results) the balloons still bob, but no boat can pop them.
+      const rams = balloons.update(t, dt, rulesOn ? this.boats : NO_BOATS);
+      for (let k = 0; k < rams.length; k++) this.onBalloonPop(rams[k]);
+    } catch (e) {
+      reportError('balloons.update', e);
+    }
+  }
+
+  private onBalloonPop(pop: BalloonPop): void {
+    const boat = this.boats[pop.boatId];
+    const slot = boat ? this.slotOf(boat.id) : -1;
+    this.fx.pop(pop.position, pop.color);
+    if (slot >= 0 || this.nearHuman(pop.position.x, pop.position.z, 60)) this.sfx.pop();
+    if (slot >= 0) {
+      this.players[slot].balloons += pop.value;
+      this.cams[slot].kick(0.15);
+      this.rumble(slot, 0.25, 80);
+    }
+    this.mode.onBalloon(pop);
+    if (pop.value > 1 && boat) {
+      this.hud.feed(`${boat.name} popped a GOLD balloon! +${pop.value}`, GOLD);
+      if (slot >= 0) this.hud.announce('GOLD!', { sub: `+${pop.value}`, ms: 800, viewport: slot });
+    }
+  }
+
+  // ───────────────────────────── results and HUD data ─────────────────────────────
+
+  /**
+   * The full results: the mode's table and headline, plus each human's stats and any trophies they earned
+   * for the first time. Built once (awarding a trophy saves it, so asking twice would hand out nothing).
+   */
+  result(): MatchResult {
+    if (this.cachedResult) return this.cachedResult;
+    const base = this.mode.result();
+    const stats = this.buildStats();
+    let awards: TrophyAward[] = [];
+    try {
+      awards = awardTrophies(stats);
+    } catch (e) {
+      reportError('awardTrophies', e);
+    }
+    this.cachedResult = { ...base, stats, awards };
+    return this.cachedResult;
+  }
+
+  private buildStats(): PlayerMatchStats[] {
+    const stats: PlayerMatchStats[] = [];
+    for (let i = 0; i < this.humanCount; i++) {
+      const p = this.players[i];
+      const boat = p.boat;
+      const outcome = this.mode.outcome(boat.id);
+      stats.push({
+        name: boat.name,
+        color: boat.color,
+        slot: i,
+        mode: this.mode.id,
+        place: this.mode.rankOf(boat.id),
+        won: outcome.won,
+        finished: outcome.finished,
+        hits: p.hits,
+        tagsOnOtherHuman: p.tagsOnOtherHuman,
+        timesTagged: p.timesTagged,
+        balloons: p.balloons,
+        boostSeconds: Math.round(p.boostSeconds * 10) / 10,
+        pickups: p.pickups,
+        honks: p.honks,
+        rescues: p.rescues,
+        finishTime: outcome.finishTime,
+        easyDriving: boat.easyDriving,
+      });
+    }
+    return stats;
+  }
+
+  /** Everything the mini-map draws, fresh every call (the obstacle list keeps its identity all match). */
+  mapState(): MapState {
+    const boats: MapBoat[] = [];
+    for (let i = 0; i < this.boats.length; i++) {
+      const b = this.boats[i];
+      boats.push({ id: b.id, x: b.position.x, z: b.position.z, heading: b.heading, color: b.color, isHuman: b.isHuman, team: b.team });
+    }
+    const balloons: { x: number; z: number; gold: boolean }[] = [];
+    const bl = this.balloons;
+    if (bl) {
+      // Same rule as the balloons themselves: every goldEvery-th one (counting from 1) is gold.
+      const goldEvery = Math.floor(CONFIG.practice.goldEvery);
+      const targets = bl.targets;
+      for (let k = 0; k < targets.length; k++) {
+        const target = targets[k];
+        if (target.alive) balloons.push({ x: target.position.x, z: target.position.z, gold: goldEvery > 0 && (k + 1) % goldEvery === 0 });
+      }
+    }
+    let pickups: readonly THREE.Vector3[] = NO_POSITIONS;
+    try {
+      pickups = this.pickups.positions;
+    } catch (e) {
+      reportError('pickups.positions', e);
+    }
+    return {
+      arenaRadius: this.world.arenaRadius,
+      obstacles: this.obstacles,
+      boats,
+      pickups,
+      balloons,
+      gates: this.mode.gateList,
+    };
   }
 
   // ───────────────────────────── cleanup ─────────────────────────────
@@ -479,12 +675,14 @@ export class Match implements ModeHost {
     // Darts first: stuck darts are children of the boats.
     safely('darts', () => { this.darts.clear(); this.darts.dispose(); });
     safely('pickups', () => this.pickups.dispose());
+    safely('balloons', () => this.balloons?.dispose());
     for (const boat of this.boats) safely('boat', () => boat.dispose());
     safely('fx', () => this.fx.dispose());
     safely('world', () => this.world.dispose());
     safely('scene', () => disposeSceneResources(this.scene));
     this.boats.length = 0;
     this.cams.length = 0;
+    this.players.length = 0;
   }
 }
 

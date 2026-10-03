@@ -111,6 +111,18 @@
   font-size: clamp(30px, 6.4vmin, 60px);
   border-radius: 34px;
 }
+.ff-btn--lg {
+  flex-direction: row;
+  gap: 0.4em;
+  padding: 0.2em 1.6em;
+  font-size: clamp(20px, 3.8vmin, 34px);
+}
+.ff-btn--wide {
+  flex-direction: row;
+  width: 100%;
+  min-height: clamp(44px, 6.4vmin, 60px);
+  font-size: clamp(16px, 2.6vmin, 24px);
+}
 .ff-btn--xl {
   min-height: clamp(60px, 10vmin, 96px);
   padding: 0.2em 1.6em;
@@ -275,6 +287,14 @@
 .ff-title .ff-btn--hero {
   margin: clamp(2px, 1vmin, 10px) 0;
 }
+@media (max-height: 820px) {
+  .ff-logo {
+    font-size: clamp(48px, 12vmin, 120px);
+  }
+  .ff-boat-art {
+    width: clamp(110px, 17vmin, 180px);
+  }
+}
 
 .ff-controls {
   display: flex;
@@ -289,7 +309,7 @@
   border-radius: 20px;
   background: rgba(255, 255, 255, 0.95);
   color: var(--ff-navy);
-  font-size: clamp(14px, 2.3vmin, 20px);
+  font-size: clamp(13px, 2.1vmin, 19px);
   box-shadow: 0 5px 0 rgba(11, 42, 91, 0.3);
 }
 .ff-keys-head {
@@ -301,7 +321,7 @@
   display: flex;
   align-items: center;
   gap: 0.6em;
-  margin: 0.25em 0;
+  margin: 0.15em 0;
   line-height: 1.5;
 }
 .ff-keys-caps {
@@ -378,23 +398,25 @@
   color: var(--ff-navy);
   box-shadow: 0 8px 0 rgba(11, 42, 91, 0.28), 0 22px 40px rgba(0, 0, 0, 0.22);
 }
-.ff-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: clamp(10px, 2.4vmin, 28px);
+.ff-setup-card {
+  display: flex;
+  flex-direction: column;
+  gap: clamp(10px, 2vmin, 22px);
   width: min(1100px, 100%);
   padding: clamp(12px, 2.4vmin, 26px);
+}
+/* Options, then one card per player: three across when there is room, wrapping on narrow windows. */
+.ff-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+  align-items: start;
+  gap: clamp(10px, 2.4vmin, 28px);
 }
 .ff-col {
   display: flex;
   flex-direction: column;
   gap: clamp(8px, 1.8vmin, 18px);
   min-width: 0;
-}
-@media (max-width: 860px) {
-  .ff-grid {
-    grid-template-columns: 1fr;
-  }
 }
 .ff-field {
   display: flex;
@@ -407,10 +429,22 @@
   font-weight: 700;
   color: var(--ff-navy);
 }
-.ff-hint {
+/* Not ".ff-hint": hud.css uses that name for the in-match coaching strip. */
+.ff-help {
   font-size: clamp(13px, 2vmin, 18px);
   font-weight: 500;
+  line-height: 1.3;
   color: var(--ff-navy);
+}
+.ff-note {
+  padding: clamp(8px, 1.6vmin, 16px);
+  border: 3px solid var(--ff-sun);
+  border-radius: 16px;
+  background: #fff6cf;
+  color: var(--ff-navy);
+  font-size: clamp(15px, 2.4vmin, 22px);
+  font-weight: 600;
+  line-height: 1.3;
 }
 .ff-seg {
   display: flex;
@@ -429,6 +463,40 @@
   font-size: 0.62em;
   font-weight: 500;
   line-height: 1.2;
+}
+.ff-seg-ico {
+  display: block;
+  font-size: 1.6em;
+  line-height: 1.1;
+}
+.ff-seg-ico svg {
+  display: block;
+  width: 2.3em;
+  height: 1.25em;
+  overflow: visible;
+}
+.ff-seg-ico .base {
+  fill: var(--boat, #ff3b30);
+}
+
+/* The four game cards: one row of big cards, two by two on narrow windows. */
+.ff-modes {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+.ff-modes .ff-seg-btn {
+  min-height: clamp(96px, 17vmin, 150px);
+  padding: 0.35em 0.5em 0.5em;
+  font-size: clamp(17px, 2.8vmin, 26px);
+  gap: 0.1em;
+}
+.ff-modes .ff-seg-sub {
+  font-size: max(13px, 0.6em);
+}
+@media (max-width: 860px) {
+  .ff-modes {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 /* Selected = sunny face + navy border + check badge (never color alone). */
 .ff-seg-btn[aria-pressed="true"] {
@@ -529,14 +597,314 @@
   font-weight: 700;
   line-height: 1.4;
 }
+/* Easy Driving: a big switch. ON/OFF is written out and the knob moves, so it is never color alone. */
+.ff-toggle {
+  flex-direction: row;
+  justify-content: space-between;
+  gap: 0.6em;
+  width: 100%;
+  min-height: clamp(48px, 7.4vmin, 66px);
+  padding: 0.2em 0.8em;
+  border: 4px solid var(--ff-navy);
+  background: #fff;
+  font-size: clamp(17px, 2.8vmin, 26px);
+}
+.ff-toggle[aria-pressed="true"] {
+  background: var(--ff-sun);
+}
+.ff-toggle-name {
+  flex: 1;
+  text-align: left;
+}
+.ff-toggle-state {
+  min-width: 2.1em;
+  text-align: right;
+}
+.ff-switch {
+  position: relative;
+  flex: none;
+  width: 2.6em;
+  height: 1.4em;
+  border: 3px solid var(--ff-navy);
+  border-radius: 999px;
+  background: #aebcd2;
+  transition: background 0.12s ease-out;
+}
+.ff-switch i {
+  position: absolute;
+  top: 50%;
+  left: 0.12em;
+  width: 1em;
+  height: 1em;
+  margin-top: -0.5em;
+  border: 3px solid var(--ff-navy);
+  border-radius: 50%;
+  background: #fff;
+  transition: left 0.12s ease-out;
+}
+.ff-toggle[aria-pressed="true"] .ff-switch {
+  background: #2fbf6b;
+}
+.ff-toggle[aria-pressed="true"] .ff-switch i {
+  left: calc(100% - 1.12em);
+}
+.ff-garage-btn {
+  width: 100%;
+  border: 4px solid transparent;
+  background: #fff;
+  font-size: clamp(17px, 2.8vmin, 26px);
+}
+/* Start / All done stays in reach while a tall screen scrolls. */
 .ff-start-wrap {
+  position: sticky;
+  bottom: clamp(6px, 1.4vmin, 14px);
+  z-index: 2;
   width: min(1100px, 100%);
   padding-bottom: 8px;
 }
 .ff-start-wrap .ff-btn {
   width: 100%;
   flex-direction: row;
+  /* Shorter than the title's hero button so the whole setup card fits on a laptop or iPad screen. */
+  min-height: clamp(56px, 8vmin, 84px);
+  font-size: clamp(28px, 4.6vmin, 46px);
 }
+.ff-setup {
+  padding-bottom: clamp(4px, 1vmin, 12px);
+}
+
+/* ───────────────────────── Boat Garage ───────────────────────── */
+
+.ff-garage,
+.ff-shelf {
+  gap: clamp(8px, 1.6vmin, 16px);
+  justify-content: flex-start;
+}
+.ff-gbody {
+  display: grid;
+  grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
+  align-items: start;
+  gap: clamp(10px, 2.4vmin, 28px);
+  width: min(1100px, 100%);
+  padding: clamp(12px, 2.4vmin, 26px);
+}
+@media (max-width: 860px) {
+  .ff-gbody {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+/* The preview stays put while the pickers scroll past. */
+.ff-gleft {
+  position: sticky;
+  top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: clamp(6px, 1.2vmin, 12px);
+  min-width: 0;
+}
+@media (max-width: 860px) {
+  .ff-gleft {
+    position: static;
+  }
+}
+.ff-gstage {
+  position: relative;
+  aspect-ratio: 4 / 3;
+  overflow: hidden;
+  border: 4px solid var(--ff-navy);
+  border-radius: 22px;
+  background: linear-gradient(180deg, #8fd3ff 0%, #d5f1ff 58%, #7fdcec 100%);
+}
+.ff-gview,
+.ff-gcanvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.ff-gfallback {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  margin: 0;
+  padding: 1em;
+  background: rgba(255, 255, 255, 0.75);
+  color: var(--ff-navy);
+  font-size: clamp(15px, 2.4vmin, 22px);
+  text-align: center;
+}
+.ff-gname {
+  color: var(--ff-navy);
+  font-size: clamp(20px, 3.4vmin, 32px);
+  font-weight: 700;
+  line-height: 1.1;
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ff-gsummary {
+  min-height: 2.6em;
+  color: var(--ff-navy);
+  font-size: clamp(14px, 2.2vmin, 20px);
+  font-weight: 500;
+  line-height: 1.3;
+  text-align: center;
+}
+.ff-gright {
+  display: flex;
+  flex-direction: column;
+  gap: clamp(8px, 1.6vmin, 16px);
+  min-width: 0;
+}
+/* Picker rows are grids: garage.ts sets --n (buttons per row). Short words fit six across. */
+.ff-garage .ff-seg {
+  display: grid;
+  grid-template-columns: repeat(var(--n, 3), minmax(0, 1fr));
+}
+.ff-garage .ff-seg-btn {
+  min-height: clamp(54px, 9vmin, 74px);
+  padding: 0.25em 0.15em;
+  font-size: clamp(12px, 1.9vmin, 15px);
+  overflow-wrap: anywhere;
+}
+.ff-garage .ff-seg--roomy .ff-seg-btn {
+  font-size: clamp(15px, 2.4vmin, 21px);
+}
+.ff-garage .ff-seg-btn[aria-pressed="true"]::after {
+  top: -7px;
+  right: -7px;
+  width: 20px;
+  height: 20px;
+  background-size: 11px 11px;
+}
+
+/* ───────────────────────── Trophy Shelf ───────────────────────── */
+
+.ff-shelf-body {
+  display: flex;
+  flex-direction: column;
+  gap: clamp(10px, 2vmin, 22px);
+  width: min(1100px, 100%);
+}
+.ff-shelf-empty {
+  margin: 0;
+  font-size: clamp(20px, 3.6vmin, 34px);
+  text-align: center;
+}
+.ff-shelf-card {
+  padding: clamp(12px, 2.2vmin, 22px);
+  border-top: 12px solid var(--c, var(--ff-navy));
+}
+.ff-shelf-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  margin-bottom: clamp(8px, 1.4vmin, 14px);
+  font-size: clamp(20px, 3.4vmin, 32px);
+}
+.ff-shelf-dot {
+  flex: none;
+  width: 0.9em;
+  height: 0.9em;
+  border: 3px solid #fff;
+  border-radius: 50%;
+  background: var(--c, var(--ff-navy));
+  box-shadow: 0 0 0 3px var(--ff-navy);
+}
+.ff-shelf-name {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  font-size: 1em;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ff-shelf-count {
+  flex: none;
+  padding: 0.05em 0.7em 0.12em;
+  border-radius: 999px;
+  background: var(--ff-navy);
+  color: #fff;
+  font-size: 0.7em;
+  font-weight: 700;
+}
+.ff-trophy-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, clamp(220px, 30vmin, 300px)), 1fr));
+  gap: clamp(8px, 1.4vmin, 14px);
+}
+.ff-trophy {
+  display: flex;
+  align-items: center;
+  gap: 0.7em;
+  min-width: 0;
+  padding: 0.5em 0.8em 0.5em 0.5em;
+  border: 4px solid transparent;
+  border-radius: 22px;
+  color: var(--ff-navy);
+  font-size: clamp(14px, 2.2vmin, 19px);
+  line-height: 1.2;
+}
+.ff-trophy.is-earned {
+  border-color: var(--ff-sun);
+  background: #fff3b8;
+}
+.ff-trophy.is-locked {
+  background: #e9eef6;
+}
+.ff-trophy-icon {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 2em;
+  height: 2em;
+  border: 3px solid var(--ff-navy);
+  border-radius: 50%;
+  background: #fff;
+  font-size: 1.7em;
+  line-height: 1;
+}
+.ff-trophy.is-locked .ff-trophy-icon {
+  border-color: #9fb0c8;
+  background: #dbe3ef;
+}
+/* Not earned yet: a flat grey silhouette of the emoji. */
+.ff-trophy.is-locked .ff-trophy-emoji {
+  filter: brightness(0);
+  opacity: 0.3;
+}
+.ff-trophy-text {
+  min-width: 0;
+}
+.ff-trophy-name {
+  font-size: 1.1em;
+  font-weight: 700;
+}
+.ff-trophy-desc {
+  font-weight: 500;
+}
+.ff-trophy.is-locked .ff-trophy-desc {
+  color: #3d4d6b;
+}
+.ff-trophy-tag {
+  display: inline-block;
+  margin-top: 0.2em;
+  padding: 0 0.6em 0.08em;
+  border: 2px solid var(--ff-navy);
+  border-radius: 999px;
+  font-size: 0.8em;
+  font-weight: 700;
+}
+.ff-trophy.is-earned .ff-trophy-tag {
+  background: var(--ff-navy);
+  color: #fff;
+}
+
 
 /* ───────────────────────── HUD: live layer ───────────────────────── */
 
@@ -1363,7 +1731,9 @@
   .ff-pod {
     animation: none;
   }
-  .ff-btn {
+  .ff-btn,
+  .ff-switch,
+  .ff-switch i {
     transition: none;
   }
 }

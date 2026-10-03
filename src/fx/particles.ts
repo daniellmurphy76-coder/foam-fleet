@@ -39,6 +39,8 @@ export const P = {
   GLINT: 8, // tiny twinkling dot
   FLASH: 9, // bright soft pop at the moment of a hit
   MIST: 10, // faint soft cloud off a fast boat (low priority)
+  NOTE: 11, // cartoon music note (one head with a flag), floats up
+  NOTE2: 12, // cartoon music notes (two heads joined by a beam), floats up
 } as const;
 
 /** Kinds of flat foam on the water. */
@@ -59,11 +61,14 @@ const SHAPE_RING = 3;
 const SHAPE_RECT = 4;
 const SHAPE_SOFT = 5;
 const SHAPE_FLASH = 6; // like SOFT, but drawn in front of whatever it overlaps
+const SHAPE_NOTE = 7; // music note with a dark outline
+const SHAPE_NOTE2 = 8; // beamed pair of music notes with a dark outline
 
 // How a particle's size changes over its life.
 const SIZE_LERP = 0; // ease from size0 to size1
 const SIZE_POP = 1; // pop up with a little overshoot, then shrink to nothing (size0 = peak)
 const SIZE_TWINKLE = 2; // grow then shrink with a flicker (size0 = peak)
+const SIZE_HOLD = 3; // pop up with a little overshoot, then stay that size (size0); alpha does the fading
 
 interface KindDef {
   shape: number;
@@ -94,6 +99,8 @@ const KINDS: KindDef[] = [
   /* GLINT    */ { shape: SHAPE_DISC, sizeMode: SIZE_TWINKLE, gravity: -1.4, drag: 1.6, spin: 0, fade: 0.4, water: false, soft: false },
   /* FLASH    */ { shape: SHAPE_FLASH, sizeMode: SIZE_LERP, gravity: 0, drag: 0, spin: 0, fade: 1.0, water: false, soft: false },
   /* MIST     */ { shape: SHAPE_SOFT, sizeMode: SIZE_LERP, gravity: 0.4, drag: 3.0, spin: 0, fade: 0.7, water: false, soft: true },
+  /* NOTE     */ { shape: SHAPE_NOTE, sizeMode: SIZE_HOLD, gravity: -2.2, drag: 1.4, spin: 0.35, fade: 0.4, water: false, soft: false },
+  /* NOTE2    */ { shape: SHAPE_NOTE2, sizeMode: SIZE_HOLD, gravity: -2.2, drag: 1.4, spin: 0.35, fade: 0.4, water: false, soft: false },
 ];
 
 // Layout of one particle inside the `sim` Float32Array.
@@ -164,7 +171,7 @@ void main() {
   mvPosition.xy += r * aSizeRot.x * 0.5;   // build the quad in view space = always faces the camera
   // Nudge toward the camera so particles are never buried in a hull or the sea.
   // Flashes and rings (shapes 3 and 6) get a big nudge so they show in full even when centred on a hull.
-  mvPosition.z += (aShape > 5.5 || (aShape > 2.5 && aShape < 3.5)) ? uBias * 4.5 : uBias;
+  mvPosition.z += ((aShape > 5.5 && aShape < 6.5) || (aShape > 2.5 && aShape < 3.5)) ? uBias * 4.5 : uBias;
   vCorner = q;
   vColor = aColor;
   vShape = aShape;
@@ -194,10 +201,48 @@ float starShape(vec2 p) {
   return 1.0 - smoothstep(-0.03, 0.05, sd);
 }
 
+// Capsule: distance to the segment a-b, minus its radius.
+float sdSeg(vec2 p, vec2 a, vec2 b, float r) {
+  vec2 pa = p - a;
+  vec2 ba = b - a;
+  float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+  return length(pa - ba * h) - r;
+}
+
+// Oval tilted counter-clockwise by ang (a note head). The distance is an approximation, plenty for soft edges.
+float sdHead(vec2 p, vec2 c, vec2 rad, float ang) {
+  vec2 q = p - c;
+  float cs = cos(ang);
+  float sn = sin(ang);
+  q = vec2(cs * q.x + sn * q.y, -sn * q.x + cs * q.y);
+  float k0 = length(q / rad);
+  float k1 = length(q / (rad * rad));
+  return k0 * (k0 - 1.0) / max(k1, 1e-4);
+}
+
+// A music note (one head and a flag) or a pair of heads joined by a beam. Negative inside.
+float noteShape(vec2 p, bool pair) {
+  float sd;
+  if (pair) {
+    sd = sdHead(p, vec2(-0.52, -0.58), vec2(0.30, 0.22), 0.5);
+    sd = min(sd, sdHead(p, vec2(0.20, -0.38), vec2(0.30, 0.22), 0.5));
+    sd = min(sd, sdSeg(p, vec2(-0.25, -0.50), vec2(-0.25, 0.56), 0.065));
+    sd = min(sd, sdSeg(p, vec2(0.47, -0.30), vec2(0.47, 0.72), 0.065));
+    sd = min(sd, sdSeg(p, vec2(-0.25, 0.56), vec2(0.47, 0.72), 0.09));
+  } else {
+    sd = sdHead(p, vec2(-0.22, -0.52), vec2(0.34, 0.25), 0.5);
+    sd = min(sd, sdSeg(p, vec2(0.08, -0.45), vec2(0.08, 0.72), 0.065));
+    sd = min(sd, sdSeg(p, vec2(0.08, 0.72), vec2(0.50, 0.40), 0.09));
+    sd = min(sd, sdSeg(p, vec2(0.50, 0.40), vec2(0.42, 0.02), 0.08));
+  }
+  return sd;
+}
+
 void main() {
   vec2 p = vCorner;
   float d = length(p);
   float a;
+  vec3 rgb = vColor.rgb;
   if (vShape < 0.5) {            // crisp disc (droplets, foam bits)
     a = 1.0 - smoothstep(0.76, 1.0, d);
   } else if (vShape < 1.5) {     // star
@@ -211,12 +256,16 @@ void main() {
     vec2 q = abs(p) - vec2(0.62, 0.34);
     float sd = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - 0.12;
     a = 1.0 - smoothstep(-0.04, 0.04, sd);
-  } else {                       // soft puff / flash
+  } else if (vShape < 6.5) {     // soft puff / flash
     a = 1.0 - smoothstep(0.35, 1.0, d);
+  } else {                       // music note: the particle's color with a dark outline so it reads on sky and sea
+    float sd = noteShape(p, vShape > 7.5);
+    a = 1.0 - smoothstep(0.06, 0.11, sd);
+    rgb = mix(vec3(0.01, 0.02, 0.07), rgb, 1.0 - smoothstep(-0.03, 0.03, sd));
   }
   a *= vColor.a;
   if (a < 0.01) discard;
-  gl_FragColor = vec4(vColor.rgb, a);
+  gl_FragColor = vec4(rgb, a);
   #include <colorspace_fragment>
   #include <fog_fragment>
 }
@@ -285,6 +334,7 @@ export class BillboardLayer {
 
   /**
    * Spawn one particle. Position/velocity in world space, sizes are diameters in meters.
+   * `rot` is the starting spin angle (random when omitted; music notes pass a small tilt so they stay upright).
    * Returns quietly when the pool is full (a missing droplet is never worth a crash).
    */
   emit(
@@ -293,6 +343,7 @@ export class BillboardLayer {
     vx: number, vy: number, vz: number,
     life: number, size0: number, size1: number,
     color: THREE.Color,
+    rot?: number,
   ): void {
     const kd = KINDS[kind];
     if (this.count >= (kd.soft ? this.softCap : this.capacity)) return;
@@ -304,7 +355,7 @@ export class BillboardLayer {
     s[o + AGE] = 0; s[o + LIFE] = life;
     s[o + S0] = size0; s[o + S1] = size1;
     s[o + SPIN] = (Math.random() * 2 - 1) * kd.spin;
-    s[o + ROT] = Math.random() * TAU;
+    s[o + ROT] = rot ?? Math.random() * TAU;
     s[o + KIND] = kind;
     s[o + GRAV] = kd.gravity;
     s[o + DRAG] = kd.drag;
@@ -372,6 +423,8 @@ export class BillboardLayer {
         size = s[o + S0] + (s[o + S1] - s[o + S0]) * e;
       } else if (kd.sizeMode === SIZE_POP) {
         size = s[o + S0] * pop(u);
+      } else if (kd.sizeMode === SIZE_HOLD) {
+        size = s[o + S0] * pop(u < 0.15 ? u : 0.15); // pop(0.15) = 1: full size from then on
       } else {
         size = s[o + S0] * Math.sin(Math.PI * u) * (0.8 + 0.2 * Math.sin(age * 30 + rot * 5));
       }

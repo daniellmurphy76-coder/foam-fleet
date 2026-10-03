@@ -4,7 +4,7 @@ import type { Boat, Effects, WorldQuery } from '../types';
 import { BillboardLayer, FoamLayer, F, P } from './particles';
 
 /**
- * Splashes, hit bursts, sparkles and boat wakes.
+ * Splashes, hit bursts, sparkles, balloon pops, honk notes and boat wakes.
  *
  * Everything here is drawn by two pooled particle layers (see particles.ts), so the whole
  * effects system costs two draw calls however busy the lagoon gets.
@@ -20,6 +20,17 @@ const WHITE = new THREE.Color(0xffffff);
 const FOAM_BLUE = new THREE.Color(0xd9f4ff);
 const GOLD = new THREE.Color(0xffd23f);
 const SOFT_GOLD = new THREE.Color(0xfff2a8);
+const DART_BLUE = new THREE.Color(0x2f7bff); // the colors of a foam dart, for the little puff when one is used up
+const DART_ORANGE = new THREE.Color(0xff8a00);
+
+// Honk notes: module-private numbers a kid would not normally touch.
+/** How many notes one honk sends up. They leave a beat apart ("pa-pa-paaa"). */
+const NOTE_COUNT = 5;
+const NOTE_GAP = 0.1;
+/** Notes start this far above the boat's waterline point, about at the captain's hat. */
+const NOTE_LIFT = 2.3;
+/** Notes still waiting for their turn. Mashing the horn can't queue more than this. */
+const NOTE_QUEUE = 24;
 
 // Wake tuning: module-private numbers a kid would not normally touch.
 /** Distance from the boat's waterline point back to the end of its hull. */
@@ -53,6 +64,16 @@ interface WakeState {
   lane: number; // foam step counter, 0..2*CENTER_EVERY-1 (even = left arm, odd = right arm)
 }
 
+/** A honk note waiting for its turn to float up. */
+interface QueuedNote {
+  wait: number; // seconds until it launches
+  x: number;
+  y: number;
+  z: number;
+  color: THREE.Color;
+  pair: boolean; // two beamed notes instead of one
+}
+
 export function createEffects(scene: THREE.Scene): Effects {
   const sparks = new BillboardLayer(BILLBOARD_CAPACITY);
   const foam = new FoamLayer(FOAM_CAPACITY, WAKE_CAP);
@@ -68,6 +89,13 @@ export function createEffects(scene: THREE.Scene): Effects {
   const light = new THREE.Color();
   const pick = new THREE.Color();
   const dir = { x: 0, y: 0, z: 0 };
+
+  // Honk notes waiting to launch (pooled, so a honk allocates nothing).
+  const notesIdle: QueuedNote[] = [];
+  const notesWaiting: QueuedNote[] = [];
+  for (let i = 0; i < NOTE_QUEUE; i++) {
+    notesIdle.push({ wait: 0, x: 0, y: 0, z: 0, color: new THREE.Color(), pair: false });
+  }
 
   /** Random direction on a sphere, pushed upward a bit so bursts pop up and out. */
   function randomDir(upBias: number): void {
@@ -196,6 +224,146 @@ export function createEffects(scene: THREE.Scene): Effects {
         rand(0.7, 1.2), shape === P.GLINT ? rand(0.12, 0.2) : rand(0.4, 0.8), 0,
         pick,
       );
+    }
+  }
+
+  // ───────────────────────────── pop ─────────────────────────────
+
+  /**
+   * A balloon bursts: a quick flash and ring, big rubbery shreds in the balloon's color flying off
+   * its skin and fluttering down, round confetti, a few stars and a puff of let-out air.
+   * `p` is the balloon's center (a balloon is about 1.8 m across).
+   */
+  function pop(p: THREE.Vector3, color: number): void {
+    target.setHex(color);
+    light.copy(target).lerp(WHITE, 0.45);
+
+    // 1. Flash and ring.
+    sparks.emit(P.FLASH, p.x, p.y, p.z, 0, 0, 0, 0.14, 1.8, 3.8, WHITE);
+    sparks.emit(P.RING, p.x, p.y, p.z, 0, 0, 0, 0.34, 1.2, 5.6, light);
+
+    // 2. Shreds of rubber: they start out on the balloon's skin and linger, so it reads as "the balloon burst".
+    for (let i = 0; i < 16; i++) {
+      randomDir(0.3);
+      const v = rand(3, 8);
+      sparks.emit(
+        P.CONFETTI,
+        p.x + dir.x * 0.45, p.y + dir.y * 0.45, p.z + dir.z * 0.45,
+        dir.x * v, dir.y * v, dir.z * v,
+        rand(0.8, 1.15), rand(0.3, 0.5), 0,
+        i % 4 === 3 ? light : target,
+      );
+    }
+
+    // 3. Small round confetti, mostly in the balloon's color.
+    for (let i = 0; i < 14; i++) {
+      randomDir(0.35);
+      const v = rand(4, 10);
+      const r = Math.random();
+      pick.copy(r < 0.45 ? target : r < 0.7 ? light : r < 0.9 ? WHITE : GOLD);
+      sparks.emit(
+        P.BIT,
+        p.x, p.y, p.z,
+        dir.x * v, dir.y * v, dir.z * v,
+        rand(0.55, 0.85), rand(0.14, 0.26), 0,
+        pick,
+      );
+    }
+
+    // 4. A few stars for the "POP!".
+    for (let i = 0; i < 4; i++) {
+      randomDir(0.3);
+      const v = rand(3, 6);
+      const k = i % 3;
+      sparks.emit(
+        P.STAR, p.x, p.y, p.z,
+        dir.x * v, dir.y * v, dir.z * v,
+        rand(0.6, 0.8), rand(0.5, 0.8), 0,
+        k === 0 ? GOLD : k === 1 ? WHITE : light,
+      );
+    }
+
+    // 5. The air whooshing out.
+    for (let i = 0; i < 3; i++) {
+      randomDir(0);
+      const v = rand(1.2, 2.6);
+      sparks.emit(
+        P.PUFF, p.x, p.y, p.z,
+        dir.x * v, dir.y * v, dir.z * v,
+        rand(0.4, 0.5), 0.9, rand(1.8, 2.4),
+        i & 1 ? WHITE : light,
+      );
+    }
+  }
+
+  // ───────────────────────────── puff ─────────────────────────────
+
+  /**
+   * A tiny poof where a foam dart is used up (it popped something and is gone): three soft puffs and a
+   * few blue and orange foam bits. Not part of the shared Effects contract; the dart system looks for it.
+   */
+  function puff(p: THREE.Vector3): void {
+    for (let i = 0; i < 3; i++) {
+      randomDir(0.1);
+      const v = rand(0.8, 1.8);
+      sparks.emit(
+        P.PUFF, p.x, p.y, p.z,
+        dir.x * v, dir.y * v, dir.z * v,
+        rand(0.22, 0.32), 0.22, rand(0.6, 0.8),
+        WHITE,
+      );
+    }
+    for (let i = 0; i < 4; i++) {
+      randomDir(0.3);
+      const v = rand(2, 4.5);
+      sparks.emit(
+        P.BIT, p.x, p.y, p.z,
+        dir.x * v, dir.y * v, dir.z * v,
+        rand(0.3, 0.45), rand(0.08, 0.13), 0,
+        i & 1 ? DART_ORANGE : DART_BLUE,
+      );
+    }
+  }
+
+  // ───────────────────────────── notes ─────────────────────────────
+
+  /**
+   * Honk! A few cartoon music notes pop out above the boat one after another, then drift up and fade.
+   * `p` is the boat's waterline point; the notes start NOTE_LIFT above it, in `color` with a dark outline.
+   */
+  function notes(p: THREE.Vector3, color: number): void {
+    for (let k = 0; k < NOTE_COUNT; k++) {
+      const n = notesIdle.pop();
+      if (!n) return; // the horn is being mashed and the queue is full: skip the extras
+      n.wait = k * NOTE_GAP;
+      n.x = p.x + rand(-0.9, 0.9);
+      n.y = p.y + NOTE_LIFT + rand(-0.1, 0.3);
+      n.z = p.z + rand(-0.9, 0.9);
+      n.color.setHex(color);
+      n.pair = k % 2 === 1; // single, pair, single, pair, single
+      notesWaiting.push(n);
+    }
+  }
+
+  /** Launch every queued note whose turn has come. */
+  function launchNotes(dt: number): void {
+    for (let i = notesWaiting.length - 1; i >= 0; i--) {
+      const n = notesWaiting[i];
+      n.wait -= dt;
+      if (n.wait > 0) continue;
+      // Pop up, drift a little sideways and keep floating up while fading; tilted a touch so they look hand-drawn.
+      sparks.emit(
+        n.pair ? P.NOTE2 : P.NOTE,
+        n.x, n.y, n.z,
+        rand(-1.2, 1.2), rand(2.2, 3.4), rand(-1.2, 1.2),
+        rand(1.3, 1.7), rand(1.0, 1.4), 0,
+        n.color,
+        rand(-0.3, 0.3),
+      );
+      // Swap-remove: the last one was already handled this pass (we walk backwards).
+      notesWaiting[i] = notesWaiting[notesWaiting.length - 1];
+      notesWaiting.pop();
+      notesIdle.push(n);
     }
   }
 
@@ -337,6 +505,7 @@ export function createEffects(scene: THREE.Scene): Effects {
 
   function update(dt: number, t: number, world: WorldQuery): void {
     lastDt = clamp(dt, 0, 0.05);
+    launchNotes(lastDt);
     sparks.update(lastDt, t, world);
     foam.update(lastDt, t, world);
   }
@@ -345,6 +514,7 @@ export function createEffects(scene: THREE.Scene): Effects {
     sparks.clear();
     foam.clear();
     wakeStates.clear();
+    while (notesWaiting.length > 0) notesIdle.push(notesWaiting.pop() as QueuedNote);
   }
 
   function dispose(): void {
@@ -353,5 +523,7 @@ export function createEffects(scene: THREE.Scene): Effects {
     foam.dispose();
   }
 
-  return { splash, hitBurst, sparkle, wake, update, clear, dispose };
+  // `puff` is an extra beyond the Effects contract (see its comment); typed as Effects on the way out.
+  const effects = { splash, hitBurst, sparkle, pop, notes, puff, wake, update, clear, dispose };
+  return effects;
 }

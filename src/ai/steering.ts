@@ -79,6 +79,59 @@ export function nearSolid(px: number, pz: number, boatRadius: number, world: Wor
   return px * px + pz * pz > edge * edge;
 }
 
+/**
+ * One straight probe for the player's "bumper rails" (Easy Driving). How many meters can a boat
+ * at (px, pz) travel along the unit direction (ux, uz) before it gets within `margin` meters of
+ * an island or rock (the boat's own radius counts too), or crosses the safety ring `edgeInset`
+ * meters inside the lagoon edge? Gives back `maxMeters` when the way is clear.
+ *
+ * Only solid things count (not other boats). Standing inside a danger zone only blocks the
+ * directions that point further into it, so a boat hugging a shore can still slide along it.
+ * No allocations: it is called a handful of times per frame.
+ */
+export function probeSolid(
+  px: number,
+  pz: number,
+  ux: number,
+  uz: number,
+  boatRadius: number,
+  world: WorldQuery,
+  margin: number,
+  edgeInset: number,
+  maxMeters: number,
+): number {
+  let best = maxMeters;
+  const obstacles = world.obstacles;
+  for (let i = 0; i < obstacles.length; i++) {
+    const o = obstacles[i];
+    const dx = o.x - px;
+    const dz = o.z - pz;
+    const proj = dx * ux + dz * uz; // how far along the probe the thing's center is
+    if (proj <= 0) continue; // it is behind us
+    const r = o.radius + boatRadius + margin;
+    const d2 = dx * dx + dz * dz;
+    let t: number;
+    if (d2 <= r * r) {
+      t = 0; // already inside the zone and heading deeper in
+    } else {
+      const perp2 = d2 - proj * proj; // squared sideways miss distance
+      if (perp2 >= r * r) continue; // the probe passes by
+      t = proj - Math.sqrt(r * r - perp2);
+    }
+    if (t < best) best = t;
+  }
+
+  // The lagoon edge is a big circle around the origin: find where the probe leaves the safe ring.
+  const ring = world.arenaRadius - edgeInset;
+  const along = px * ux + pz * uz; // positive = pointing outward
+  const dist2 = px * px + pz * pz;
+  let tEdge: number;
+  if (dist2 >= ring * ring) tEdge = along > 0 ? 0 : Infinity;
+  else tEdge = -along + Math.sqrt(along * along - dist2 + ring * ring);
+  if (tEdge < best) best = tEdge;
+  return best < 0 ? 0 : best;
+}
+
 // ───────────────────────────── Feeler-ray avoidance ─────────────────────────────
 
 /**

@@ -1,4 +1,5 @@
 import './styles.css';
+import './hud.css'; // v2 additions; must come after styles.css so it can refine it
 import type {
   Hud,
   HudState,
@@ -9,12 +10,15 @@ import type {
   PowerUpKind,
   ResultRow,
   Sfx,
+  TeamScore,
   Viewport,
 } from '../types';
 import { CONFIG } from '../config';
 import { button, clamp, cssColor, el, guardActivationKeys, installUnlock, ordinal, svgNode } from './dom';
+import { createMinimap } from './minimap';
+import type { Minimap } from './minimap';
 
-/** In-match overlay: per-player panels, timer, feed, pause and results screens. */
+/** In-match overlay: per-player panels, mini-map, timer, team banner, feed, pause and results screens. */
 
 /** Event-feed lines on screen at once (newest on top, right under the timer). */
 const FEED_MAX = 3;
@@ -23,6 +27,14 @@ const FEED_MAX_1P_RACE = 2;
 /** Ignore "confirm" for a moment after an overlay opens, so a kid mashing Fire can't skip the results. */
 const RESULTS_ARM_MS = 900;
 const PAUSE_ARM_MS = 250;
+/** Trophy cards pop in this long after the results open (after the victory fanfare gets going), 0.3 s apart. */
+const TROPHY_DELAY_MS = 1100;
+const TROPHY_STAGGER_MS = 300;
+/** Mini-map: a circle this tall as a share of the viewport, but never bigger / smaller than this (CSS px). */
+const MAP_SHARE = 0.22;
+const MAP_MAX_PX = 180;
+const MAP_MIN_PX = 110;
+const HINT_DEFAULT_MS = 4200;
 
 // ───────────── little pieces of art (all our own static markup) ─────────────
 
@@ -59,6 +71,29 @@ const STAR_SVG = `<svg class="ff-trow-star" viewBox="0 0 24 24" aria-hidden="tru
 
 const CROWN_SVG = `<svg class="ff-crown" viewBox="0 0 40 28" aria-hidden="true">
   <path d="M4 24 L2 6 L12 14 L20 3 L28 14 L38 6 L36 24 Z" fill="#ffd23f" stroke="#0b2a5b" stroke-width="3" stroke-linejoin="round"/>
+</svg>`;
+
+/** The shape that floats above every boat in Team Up; its color comes from `--tc` (see hud.css). */
+const DIAMOND_SVG = `<svg class="ff-diamond" viewBox="0 0 20 20" aria-hidden="true">
+  <path d="M10 1.5 L18.5 10 L10 18.5 L1.5 10 Z"/>
+</svg>`;
+
+const CROWN_MINI_SVG = `<svg class="ff-team-crown" viewBox="0 0 40 28" aria-hidden="true">
+  <path d="M4 24 L2 6 L12 14 L20 3 L28 14 L38 6 L36 24 Z" fill="#ffd23f" stroke="#ffffff" stroke-width="3" stroke-linejoin="round"/>
+</svg>`;
+
+/** A little ship's wheel for the Easy Driving badge. */
+const WHEEL_SVG = `<svg viewBox="0 0 32 32" aria-hidden="true">
+  <path d="M16 3 V29 M3 16 H29 M7 7 L25 25 M25 7 L7 25" fill="none" stroke="#06173d" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="16" cy="16" r="9.5" fill="none" stroke="#06173d" stroke-width="4"/>
+  <circle cx="16" cy="16" r="3.6" fill="#ffffff" stroke="#06173d" stroke-width="2.4"/>
+</svg>`;
+
+const BALLOON_SVG = `<svg class="ff-bl-icon" viewBox="0 0 34 44" aria-hidden="true">
+  <path d="M17 36 C15 39 19 41 17 43" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>
+  <path d="M17 31 L13.5 36.5 H20.5 Z" fill="#ff5d73" stroke="#06173d" stroke-width="2" stroke-linejoin="round"/>
+  <path d="M17 2 C26 2 31 9 31 16.5 C31 25 23 31 17 31 C11 31 3 25 3 16.5 C3 9 8 2 17 2 Z" fill="#ff5d73" stroke="#06173d" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M9.5 12 Q10.5 7.5 14.5 6.5" fill="none" stroke="#ffffff" stroke-width="2.6" stroke-linecap="round"/>
 </svg>`;
 
 const BOAT_MINI_SVG = `<svg viewBox="0 0 48 32" aria-hidden="true">
@@ -106,6 +141,14 @@ function clockTenths(tenths: number): string {
   const t = Math.max(0, tenths);
   const sec = Math.floor(t / 10);
   return Math.floor(sec / 60) + ':' + String(sec % 60).padStart(2, '0') + '.' + (t % 10);
+}
+
+/** A team's color: from the live standings if they are there, else from the config. */
+function teamColor(team: number, teams: readonly TeamScore[] | null): number {
+  if (teams) {
+    for (let i = 0; i < teams.length; i++) if (teams[i].team === team) return teams[i].color;
+  }
+  return CONFIG.team.colors[team] ?? 0xffffff;
 }
 
 /** Longer announcements get smaller text so they always fit on screen. */
@@ -161,10 +204,20 @@ function panelScale(v: Viewport): number {
 interface Panel {
   root: HTMLElement;
   setRect(v: Viewport): void;
-  apply(p: PlayerHud, mode: ModeId): void;
+  apply(p: PlayerHud, state: HudState, nowMs: number): void;
+  /** Coaching line near the bottom of this player's view. */
+  showHint(text: string, ms: number): void;
   reset(): void;
   announcer: Announcer;
 }
+
+/** Score box caption per mode (race shows the place instead of a score). */
+const SCORE_LABEL: Record<ModeId, string> = {
+  battle: 'SCORE',
+  race: 'SCORE',
+  team: 'MY SCORE',
+  practice: 'POINTS',
+};
 
 /**
  * Builds the DOM for one player's corner of the screen once, then `apply()` only writes
@@ -178,7 +231,8 @@ function createPanel(): Panel {
   const nameEl = el('div', 'ff-name');
   const scoreBox = el('div', 'ff-scorebox');
   const scoreNum = el('span', 'ff-scorenum', '0');
-  scoreBox.append(el('span', 'ff-scorelbl', 'SCORE'), scoreNum);
+  const scoreLbl = el('span', 'ff-scorelbl', 'SCORE');
+  scoreBox.append(scoreLbl, scoreNum);
   const raceBox = el('div', 'ff-racebox');
   const placeEl = el('span', 'ff-place', '');
   const lapEl = el('span', 'ff-raceline', '');
@@ -228,14 +282,28 @@ function createPanel(): Panel {
   boostTrack.append(boostFill);
   boostEl.append(el('span', 'ff-boost-lbl', 'BOOST'), boostTrack);
 
-  cluster.append(powerEl, shieldEl, ammoEl, boostEl);
+  // Easy Driving reminder, on top of the bottom-left stack
+  const easyEl = el('div', 'ff-easy');
+  easyEl.append(svgNode(WHEEL_SVG), el('span', '', 'EASY DRIVING'));
+  easyEl.hidden = true;
+
+  cluster.append(easyEl, powerEl, shieldEl, ammoEl, boostEl);
+
+  // coaching hint: bottom-center, in the gap between the cluster and the mini-map
+  const hintZone = el('div', 'ff-hintzone');
+  const hintEl = el('div', 'ff-hint');
+  hintZone.append(hintEl);
+
+  // round radar, bottom-right
+  const map: Minimap = createMinimap();
 
   const announcer = createAnnouncer('');
-  root.append(tag, arrowEl, reticle, cluster, announcer.root);
+  root.append(tag, arrowEl, reticle, cluster, hintZone, map.canvas, announcer.root);
 
   // what is currently on screen (NaN / sentinel values force the first write)
   let cx = NaN, cy = NaN, cw = NaN, ch = NaN;
   let cMode: ModeId | '' = '';
+  let cEasy: boolean | null = null;
   let cName: string | null = null;
   let cColor = -1;
   let cScore = NaN;
@@ -275,13 +343,33 @@ function createPanel(): Panel {
       root.style.height = v.height + 'px';
       // --u scales every size in this panel: smaller viewport (split screen) = smaller HUD
       root.style.setProperty('--u', panelScale(v).toFixed(3));
+      // the mini-map is a circle sized from the viewport; the hint strip needs to know where it starts
+      const d = Math.round(Math.max(MAP_MIN_PX, Math.min(v.height * MAP_SHARE, MAP_MAX_PX)));
+      root.style.setProperty('--mapd', d + 'px');
+      map.resize(d);
     }
   }
 
-  function apply(p: PlayerHud, mode: ModeId): void {
+  function showHint(text: string, ms: number): void {
+    hintEl.textContent = text;
+    hintEl.style.setProperty('--ms', ms + 'ms');
+    // Restart the CSS animation (same trick as the announcer).
+    hintEl.classList.remove('on');
+    void hintEl.offsetWidth;
+    hintEl.classList.add('on');
+  }
+
+  function apply(p: PlayerHud, state: HudState, nowMs: number): void {
+    const mode = state.mode;
     if (mode !== cMode) {
       cMode = mode;
       root.classList.toggle('is-race', mode === 'race');
+      scoreLbl.textContent = SCORE_LABEL[mode];
+      cScore = NaN; // the score box may have been showing another mode's number
+    }
+    if (p.easyDriving !== cEasy) {
+      cEasy = p.easyDriving;
+      easyEl.hidden = !p.easyDriving;
     }
     if (p.name !== cName) {
       cName = p.name;
@@ -292,8 +380,8 @@ function createPanel(): Panel {
       root.style.setProperty('--pc', cssColor(p.color));
     }
 
-    // score or race standing
-    if (mode === 'battle') {
+    // score (battle, Team Up, Balloon Pop) or race standing
+    if (mode !== 'race') {
       if (p.score !== cScore) {
         const grew = p.score > cScore;
         cScore = p.score;
@@ -418,11 +506,17 @@ function createPanel(): Panel {
       arrowEl.hidden = deg === null;
       if (deg !== null) arrowSvg.style.transform = 'rotate(' + deg + 'deg)';
     }
+
+    // mini-map (it keeps itself to ~20 redraws a second)
+    if (state.map) map.draw(state.map, p, mode, nowMs);
   }
 
   function reset(): void {
     cx = cy = cw = ch = NaN;
     cMode = '';
+    cEasy = null;
+    hintEl.classList.remove('on');
+    map.invalidate();
     cName = null;
     cColor = -1;
     cScore = NaN;
@@ -443,7 +537,7 @@ function createPanel(): Panel {
     announcer.clear();
   }
 
-  return { root, setRect, apply, reset, announcer };
+  return { root, setRect, apply, showHint, reset, announcer };
 }
 
 // ───────────── the HUD ─────────────
@@ -473,26 +567,72 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
   interface SbRow {
     row: HTMLElement;
     dot: HTMLElement;
+    teamMark: SVGSVGElement;
     name: HTMLElement;
     score: HTMLElement;
     nameText: string | null;
     color: number;
+    teamCol: number;
     scoreVal: number;
     human: boolean | null;
   }
   const sbRows: SbRow[] = [];
   let sbCount = -1;
   let cSbRace: boolean | null = null;
+  let cSbTeam: boolean | null = null;
 
   function addSbRow(rank: number): SbRow {
     const row = el('div', 'ff-sbrow');
     const dot = el('span', 'ff-sb-dot');
+    const teamMark = svgNode(DIAMOND_SVG); // only shown in Team Up (CSS: .ff-sb.is-team)
+    teamMark.classList.add('ff-sb-team');
     const name = el('span', 'ff-sb-name');
     const score = el('span', 'ff-sb-score');
-    row.append(el('span', 'ff-sb-rank', String(rank)), dot, name, score);
+    row.append(el('span', 'ff-sb-rank', String(rank)), dot, teamMark, name, score);
     sbEl.append(row);
-    return { row, dot, name, score, nameText: null, color: -1, scoreVal: NaN, human: null };
+    return { row, dot, teamMark, name, score, nameText: null, color: -1, teamCol: -1, scoreVal: NaN, human: null };
   }
+
+  // Team Up banner: one pill each side of the timer, humans' team on the left
+  interface TeamPill {
+    root: HTMLElement;
+    name: HTMLElement;
+    score: HTMLElement;
+    num: HTMLElement;
+    crown: SVGSVGElement;
+    nameText: string | null;
+    color: number;
+    scoreVal: number;
+    lead: boolean | null;
+  }
+  function createTeamPill(side: 'l' | 'r'): TeamPill {
+    const root = el('div', 'ff-team ff-team--' + side);
+    root.hidden = true;
+    const head = el('div', 'ff-team-head');
+    const name = el('span', 'ff-team-name');
+    head.append(svgNode(DIAMOND_SVG), name);
+    const score = el('div', 'ff-team-score');
+    const crown = svgNode(CROWN_MINI_SVG);
+    crown.toggleAttribute('hidden', true); // SVG nodes have no .hidden property; the [hidden] attribute still works
+    const num = el('span', '', '0');
+    score.append(crown, num);
+    root.append(head, score);
+    return { root, name, score, num, crown, nameText: null, color: -1, scoreVal: NaN, lead: null };
+  }
+  const teamPills = [createTeamPill('l'), createTeamPill('r')];
+  let cTeamsOn: boolean | null = null;
+
+  // Balloon Pop counter: sits to the right of the clock
+  const balloonsEl = el('div', 'ff-balloons');
+  balloonsEl.hidden = true;
+  const blNum = el('span', 'ff-bl-num', '0');
+  const blBar = el('div', 'ff-bl-bar');
+  const blFill = el('div', 'ff-bl-fill');
+  blBar.append(blFill);
+  balloonsEl.append(svgNode(BALLOON_SVG), blNum, el('span', 'ff-bl-lbl', 'left'), blBar);
+  let cBlOn: boolean | null = null;
+  let cBlRemaining = NaN;
+  let cBlQ = NaN;
 
   // feed + global announcer
   const feedEl = el('div', 'ff-feed');
@@ -500,7 +640,7 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
   let cLiveRace: boolean | null = null;
   let cFeedU = NaN;
   const globalAnn = createAnnouncer('ff-ann--global');
-  live.append(timerEl, sbEl, feedEl, globalAnn.root);
+  live.append(timerEl, teamPills[0].root, teamPills[1].root, balloonsEl, sbEl, feedEl, globalAnn.root);
   root.append(live);
 
   function rescale(): void {
@@ -541,19 +681,25 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
   }
   const resCard = el('div', 'ff-card ff-card--dark ff-card--results');
   const resTitle = el('h2', 'ff-res-title ff-ol');
+  const resTeams = el('div', 'ff-res-teams'); // Team Up standings
+  const awardsEl = el('div', 'ff-awards'); // trophy celebration
   const podium = el('div', 'ff-podium');
   const table = el('div', 'ff-table');
   const resBody = el('div', 'ff-res-body');
   resBody.append(podium, table);
+  // title and buttons stay in view; everything between them scrolls on a short window
+  const resMid = el('div', 'ff-res-mid');
+  resMid.append(resTeams, awardsEl, resBody);
   const rematchBtn = button('Rematch', 'ff-btn ff-btn--primary ff-btn--xl');
   const menuBtn = button('Menu', 'ff-btn ff-btn--xl');
   const resActions = el('div', 'ff-row ff-res-actions');
   resActions.append(rematchBtn, menuBtn);
-  resCard.append(resTitle, resBody, resActions);
+  resCard.append(resTitle, resMid, resActions);
   resultsEl.append(confetti, resCard);
   const resultBtns = [rematchBtn, menuBtn];
   let resultsCb: { onRematch: () => void; onMenu: () => void } | null = null;
   let resultsArmedAt = 0;
+  let trophyTimer = 0; // pending "play the trophy fanfare" (cleared when the results close)
 
   root.append(pauseEl, resultsEl);
 
@@ -609,12 +755,24 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
     cUrgent = null;
     sbCount = -1;
     cSbRace = null;
+    cSbTeam = null;
     for (const r of sbRows) {
       r.nameText = null;
       r.color = -1;
+      r.teamCol = -1;
       r.scoreVal = NaN;
       r.human = null;
     }
+    cTeamsOn = null;
+    for (const t of teamPills) {
+      t.nameText = null;
+      t.color = -1;
+      t.scoreVal = NaN;
+      t.lead = null;
+    }
+    cBlOn = null;
+    cBlRemaining = NaN;
+    cBlQ = NaN;
   }
 
   function show(): void {
@@ -629,9 +787,10 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
   }
 
   function updateTimer(s: HudState): void {
+    // 'battle' = counts down (Dart Battle, Team Up); 'race' = counts up (Buoy Race, Balloon Pop)
     let kind: 'battle' | 'race' | '' = '';
     let key = NaN;
-    if (s.mode === 'battle' && s.timeLeft !== null) {
+    if (s.timeLeft !== null) {
       kind = 'battle';
       key = Math.max(0, Math.ceil(s.timeLeft));
     } else if (s.raceTime !== null) {
@@ -673,6 +832,11 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
       cSbRace = race;
       sbEl.classList.toggle('is-race', race); // race standings show place only, no score column
     }
+    const teamUp = !!s.teams;
+    if (teamUp !== cSbTeam) {
+      cSbTeam = teamUp;
+      sbEl.classList.toggle('is-team', teamUp); // Team Up rows carry a team-colored diamond
+    }
     for (let i = 0; i < n; i++) {
       const d = rows[i];
       const r = sbRows[i];
@@ -683,6 +847,13 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
       if (d.color !== r.color) {
         r.color = d.color;
         r.dot.style.setProperty('--c', cssColor(d.color));
+      }
+      if (teamUp) {
+        const tc = teamColor(d.team, s.teams);
+        if (tc !== r.teamCol) {
+          r.teamCol = tc;
+          r.teamMark.style.setProperty('--tc', cssColor(tc));
+        }
       }
       if (d.score !== r.scoreVal) {
         r.scoreVal = d.score;
@@ -695,7 +866,75 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
     }
   }
 
+  /** Team Up: the two score pills beside the timer. Leader gets a crown and a yellow ring; a tie gets neither. */
+  function updateTeams(s: HudState): void {
+    const teams = s.teams;
+    const on = !!teams && teams.length >= 2;
+    if (on !== cTeamsOn) {
+      cTeamsOn = on;
+      for (const t of teamPills) t.root.hidden = !on;
+    }
+    if (!teams || !on) return;
+    const best = Math.max(teams[0].score, teams[1].score);
+    const tied = teams[0].score === teams[1].score;
+    for (let i = 0; i < 2; i++) {
+      const d = teams[i];
+      const t = teamPills[i];
+      if (d.name !== t.nameText) {
+        t.nameText = d.name;
+        t.name.textContent = d.name;
+      }
+      if (d.color !== t.color) {
+        t.color = d.color;
+        t.root.style.setProperty('--tc', cssColor(d.color));
+      }
+      if (d.score !== t.scoreVal) {
+        const grew = d.score > t.scoreVal;
+        t.scoreVal = d.score;
+        t.num.textContent = String(d.score);
+        if (grew) {
+          t.score.classList.remove('pop');
+          void t.score.offsetWidth;
+          t.score.classList.add('pop');
+        }
+      }
+      const lead = !tied && d.score === best;
+      if (lead !== t.lead) {
+        t.lead = lead;
+        t.root.classList.toggle('is-lead', lead);
+        t.crown.toggleAttribute('hidden', !lead);
+      }
+    }
+  }
+
+  /** Balloon Pop: "12 left" plus a bar that fills as balloons get popped. */
+  function updateBalloons(s: HudState): void {
+    const b = s.balloons;
+    const on = !!b;
+    if (on !== cBlOn) {
+      cBlOn = on;
+      balloonsEl.hidden = !on;
+    }
+    if (!b) return;
+    if (b.remaining !== cBlRemaining) {
+      const popped = b.remaining < cBlRemaining;
+      cBlRemaining = b.remaining;
+      blNum.textContent = String(b.remaining);
+      if (popped) {
+        blNum.classList.remove('pop');
+        void blNum.offsetWidth;
+        blNum.classList.add('pop');
+      }
+    }
+    const q = Math.round(clamp(b.total > 0 ? 1 - b.remaining / b.total : 0, 0, 1) * 50);
+    if (q !== cBlQ) {
+      cBlQ = q;
+      blFill.style.transform = 'scaleX(' + q / 50 + ')';
+    }
+  }
+
   function update(state: HudState): void {
+    const nowMs = performance.now();
     const n = Math.min(state.viewports.length, state.players.length);
     while (panels.length < n) {
       const p = createPanel();
@@ -708,7 +947,7 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
       if (panel.root.hidden === on) panel.root.hidden = !on;
       if (on) {
         panel.setRect(state.viewports[i]);
-        panel.apply(state.players[i], state.mode);
+        panel.apply(state.players[i], state, nowMs);
       }
     }
     if (n !== panelsOn) {
@@ -731,6 +970,8 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
     }
     feedMax = race && n < 2 ? FEED_MAX_1P_RACE : FEED_MAX;
     updateTimer(state);
+    updateTeams(state);
+    updateBalloons(state);
     updateScoreboard(state);
   }
 
@@ -739,6 +980,11 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
     const v = opts?.viewport;
     const target = v !== undefined && v >= 0 && v < panels.length ? panels[v].announcer : globalAnn;
     target.show(text, opts?.sub, ms);
+  }
+
+  function hint(text: string, viewport: number, ms = HINT_DEFAULT_MS): void {
+    if (viewport < 0 || viewport >= panels.length) return; // that player's panel doesn't exist (yet)
+    panels[viewport].showHint(text, ms);
   }
 
   function feed(text: string, color?: number): void {
@@ -762,10 +1008,64 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
     pauseCb = null;
   }
 
+  /** A diamond in the team's color (Team Up only). */
+  function teamDiamond(className: string, color: number): SVGSVGElement {
+    const d = svgNode(DIAMOND_SVG);
+    d.classList.add(className);
+    d.style.setProperty('--tc', cssColor(color));
+    return d;
+  }
+
+  /** Team Up standings: both teams side by side, a crown and ring on the winner (none on a tie). */
+  function buildTeams(teams: readonly TeamScore[] | null): void {
+    resTeams.textContent = '';
+    resTeams.hidden = !teams || teams.length < 2;
+    if (!teams || teams.length < 2) return;
+    let best = -Infinity;
+    for (const t of teams) best = Math.max(best, t.score);
+    const tied = teams.every((t) => t.score === teams[0].score);
+    for (const t of teams) {
+      const win = !tied && t.score === best;
+      const card = el('div', 'ff-res-team' + (win ? ' is-win' : ''));
+      card.style.setProperty('--tc', cssColor(t.color));
+      card.append(svgNode(DIAMOND_SVG), el('span', 'ff-res-team-name', t.name), el('span', 'ff-res-team-score', String(t.score)));
+      if (win) card.append(svgNode(CROWN_MINI_SVG));
+      resTeams.append(card);
+    }
+  }
+
+  /** Trophy celebration: a card per first-time trophy, bouncing in one after another. */
+  function buildAwards(result: MatchResult): void {
+    awardsEl.textContent = '';
+    const awards = result.awards ?? []; // (an older game core may not send any)
+    awardsEl.hidden = awards.length === 0;
+    if (awards.length === 0) return;
+    awardsEl.append(el('h3', 'ff-awards-head ff-ol', awards.length > 1 ? 'NEW TROPHIES!' : 'NEW TROPHY!'));
+    const rowEl = el('div', 'ff-awards-row');
+    awards.forEach((a, i) => {
+      const card = el('div', 'ff-award');
+      card.style.setProperty('--dl', (TROPHY_DELAY_MS + i * TROPHY_STAGGER_MS) / 1000 + 's');
+      card.style.setProperty('--c', cssColor(a.color));
+      const icon = el('div', 'ff-award-icon', a.trophy.icon); // an emoji
+      const text = el('div', 'ff-award-text');
+      text.append(
+        el('div', 'ff-award-name', a.trophy.name),
+        el('div', 'ff-award-who', a.playerName),
+        el('div', 'ff-award-desc', a.trophy.description),
+      );
+      card.append(icon, text);
+      rowEl.append(card);
+    });
+    awardsEl.append(rowEl);
+  }
+
   function buildResults(result: MatchResult): void {
     resTitle.textContent = result.title;
     podium.textContent = '';
     table.textContent = '';
+    buildTeams(result.teams);
+    buildAwards(result);
+    resMid.scrollTop = 0;
 
     const rows = [...result.rows].sort((a, b) => a.place - b.place);
     // podium order on screen: 2nd, 1st, 3rd (winner in the middle, tallest)
@@ -779,6 +1079,7 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
       disc.style.setProperty('--c', cssColor(r.color));
       disc.append(svgNode(BOAT_MINI_SVG));
       if (r.place === 1) disc.append(svgNode(CROWN_SVG));
+      if (result.teams) disc.append(teamDiamond('ff-pod-team', teamColor(r.team, result.teams)));
       pod.append(
         disc,
         el('div', 'ff-pod-name', r.name),
@@ -793,7 +1094,9 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
       const row = el('div', 'ff-trow' + (r.isHuman ? ' is-human' : ''));
       const dot = el('span', 'ff-trow-dot');
       dot.style.setProperty('--c', cssColor(r.color));
-      row.append(el('span', 'ff-trow-place', ordinal(r.place)), dot, el('span', 'ff-trow-name', r.name));
+      row.append(el('span', 'ff-trow-place', ordinal(r.place)), dot);
+      if (result.teams) row.append(teamDiamond('ff-trow-team', teamColor(r.team, result.teams)));
+      row.append(el('span', 'ff-trow-name', r.name));
       if (r.isHuman) row.append(svgNode(STAR_SVG));
       row.append(el('span', 'ff-trow-detail', r.detail));
       table.append(row);
@@ -804,14 +1107,24 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
     hidePause();
     resultsCb = { onRematch, onMenu };
     resultsArmedAt = performance.now() + RESULTS_ARM_MS;
+    window.clearTimeout(trophyTimer);
     buildResults(result);
     resultsEl.hidden = false;
     resultsEl.classList.add('ff-nav');
     rematchBtn.focus({ preventScroll: true });
     sfx.victory(); // rate-limited inside Sfx, so it is harmless if the game also calls it
+    if ((result.awards ?? []).length > 0) {
+      // one fanfare as the first trophy card pops in (the cards' CSS delay is the same TROPHY_DELAY_MS)
+      trophyTimer = window.setTimeout(() => {
+        trophyTimer = 0;
+        if (!resultsEl.hidden) sfx.trophy();
+      }, TROPHY_DELAY_MS);
+    }
   }
 
   function hideResults(): void {
+    window.clearTimeout(trophyTimer);
+    trophyTimer = 0;
     resultsEl.hidden = true;
     resultsCb = null;
   }
@@ -844,6 +1157,7 @@ export function createHud(root: HTMLElement, sfx: Sfx): Hud {
     hide,
     update,
     announce,
+    hint,
     feed,
     showPause,
     hidePause,

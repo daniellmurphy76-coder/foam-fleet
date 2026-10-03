@@ -9,10 +9,10 @@
  */
 import { CONFIG } from '../../config';
 import type * as THREE from 'three';
-import type { Boat, Checkpoint, MatchResult, RaceHudInfo, ResultRow } from '../../types';
+import type { Boat, Checkpoint, RaceHudInfo, ResultRow, TeamScore } from '../../types';
 import { fallbackCheckpoints } from '../fallbacks';
 import { formatTime, ordinal } from '../util';
-import type { GameMode, GateTargets, ModeHost } from './mode';
+import type { GameMode, GateTargets, ModeHost, ModeOutcome, ModeResult } from './mode';
 
 /*
  * When does the race end? Whichever comes first:
@@ -35,6 +35,8 @@ export class RaceMode implements GameMode {
   readonly id = 'race' as const;
   readonly stunSeconds = CONFIG.race.stunSeconds;
   readonly ranking: Boat[];
+  /** The gates this race really uses (the mini-map draws these). */
+  readonly gateList: readonly Checkpoint[];
   over = false;
 
   private readonly cps: readonly Checkpoint[];
@@ -57,6 +59,7 @@ export class RaceMode implements GameMode {
     const n = host.boats.length;
     const real = host.world.checkpoints;
     this.cps = real.length >= 2 ? real : fallbackCheckpoints();
+    this.gateList = this.cps;
     this.laps = Math.max(1, Math.round(host.setup.laps || CONFIG.race.laps));
     this.lap = new Array<number>(n).fill(0);
     this.next = new Array<number>(n).fill(0);
@@ -102,6 +105,7 @@ export class RaceMode implements GameMode {
 
   /** Darts only stun in a race (the dart system does that); no points to hand out. */
   onTag(): void {}
+  onBalloon(): void {}
 
   gates(boatId: number, out: GateTargets): void {
     if (this.finished[boatId]) {
@@ -120,12 +124,18 @@ export class RaceMode implements GameMode {
     return this.finished[boatId] ? null : this.cps[this.next[boatId]].position;
   }
 
+  nextGate(boatId: number): number | null {
+    return this.finished[boatId] ? null : this.next[boatId];
+  }
+
   isFinished(boatId: number): boolean { return this.finished[boatId]; }
 
   timeLeft(): number | null { return null; }
   raceTime(): number { return this.elapsed; }
   scoreOf(boatId: number): number { return this.finished[boatId] ? this.laps : Math.max(0, this.lap[boatId] - 1); }
   rankOf(boatId: number): number { return this.rank[boatId] || 1; }
+  teams(): TeamScore[] | null { return null; }
+  balloonCount(): { remaining: number; total: number } | null { return null; }
 
   raceInfo(boatId: number): RaceHudInfo {
     return {
@@ -139,16 +149,21 @@ export class RaceMode implements GameMode {
     };
   }
 
-  result(): MatchResult {
+  outcome(boatId: number): ModeOutcome {
+    const done = this.finished[boatId] === true;
+    return { won: done && this.ranking[0]?.id === boatId, finished: done, finishTime: done ? this.finishTime[boatId] : null };
+  }
+
+  result(): ModeResult {
     const rows: ResultRow[] = this.ranking.map((b, i) => ({
-      id: b.id, name: b.name, color: b.color, score: this.scoreOf(b.id), isHuman: b.isHuman,
+      id: b.id, name: b.name, color: b.color, score: this.scoreOf(b.id), isHuman: b.isHuman, team: b.team,
       place: i + 1,
       // Boats still racing when the race ends show how far they got (never "DNF"), e.g. "Lap 2 · Gate 5/9".
       detail: this.finished[b.id] ? formatTime(this.finishTime[b.id]) : this.progressText(b.id),
     }));
     const winner = this.ranking[0];
     const title = this.finished[winner.id] ? `${winner.name} wins!` : "Time's up!";
-    return { mode: 'race', rows, title };
+    return { mode: 'race', rows, title, teams: null };
   }
 
   // ───────────── internals ─────────────

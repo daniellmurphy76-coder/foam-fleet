@@ -8,8 +8,8 @@
  *   __foam.errors             everything that threw, collected instead of crashing the game
  *
  * Extra helpers: start(setup?), menu(), pause(), resume().
- * URL params that start a match with no menu: ?quick=battle|race&humans=1|2&bots=N&difficulty=easy|normal|hard
- * (also &duration=SECONDS, &laps=N, &autopilot=1, &timescale=N, &nopause=1, &fps=1).
+ * URL params that start a match with no menu: ?quick=battle|race|team|practice&humans=1|2&bots=N&difficulty=easy|normal|hard
+ * (also &easy=0|1 for Easy Driving, &duration=SECONDS, &laps=N, &autopilot=1, &timescale=N, &nopause=1, &fps=1).
  */
 import type { MatchSetup, ModeId } from '../types';
 
@@ -25,11 +25,28 @@ export interface FoamBoatSnapshot {
   stunned: boolean;
   boost: number;
   shielded: boolean;
+  /** Team Up: 0 = the humans' side. Otherwise the boat id. */
+  team: number;
+  /** Easy Driving handling on? */
+  easy: boolean;
   powerUp: string | null;
   /** Race only. */
   lap: number | null;
   gate: number | null;
   finished: boolean | null;
+}
+
+/** What one human has done so far this match (the numbers behind the trophies). */
+export interface FoamHumanSnapshot {
+  slot: number;
+  hits: number;
+  tagsOnOtherHuman: number;
+  timesTagged: number;
+  balloons: number;
+  boostSeconds: number;
+  pickups: number;
+  honks: number;
+  rescues: number;
 }
 
 export interface FoamSnapshot {
@@ -43,8 +60,14 @@ export interface FoamSnapshot {
   errors: string[];
   /** Battle: seconds left. */
   timeLeft: number | null;
-  /** Race: elapsed seconds. */
+  /** Race and Balloon Pop: elapsed seconds. */
   raceTime: number | null;
+  /** Balloon Pop: balloons left and in total. */
+  balloons: { remaining: number; total: number } | null;
+  /** Team Up: both teams' scores (humans' team first). */
+  teams: { team: number; name: string; color: number; score: number }[] | null;
+  /** One entry per human. */
+  humans: FoamHumanSnapshot[];
   /** Modules whose real implementation threw at creation and were replaced by a stand-in. */
   fallbacks: string[];
   /** Renderer stats, handy for spotting leaks (these should not climb across rematches). */
@@ -75,7 +98,8 @@ declare global {
 function emptySnapshot(): FoamSnapshot {
   return {
     state: foam.state, t: 0, fps: 0, mode: null, boats: [], darts: 0, hits: 0,
-    errors: foam.errors.slice(), timeLeft: null, raceTime: null, fallbacks: foam.fallbacks.slice(), render: null,
+    errors: foam.errors.slice(), timeLeft: null, raceTime: null, balloons: null, teams: null, humans: [],
+    fallbacks: foam.fallbacks.slice(), render: null,
   };
 }
 

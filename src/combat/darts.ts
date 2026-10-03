@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import { CONFIG } from '../config';
-import type { Boat, DartHit, DartSpawn, DartSystem, DartUpdateResult, Effects, WorldQuery } from '../types';
+import type {
+  Boat, DartHit, DartSpawn, DartSystem, DartTarget, DartTargetHit, DartUpdateResult, Effects, WorldQuery,
+} from '../types';
 import { DartTrails } from './trails';
 
 /**
@@ -9,6 +11,8 @@ import { DartTrails } from './trails';
  * Life of a dart:
  *   FLYING    -> flies in an arc. Each step we sweep a line from its old spot to its new spot and
  *                test it against every boat's hit sphere, so even a fast dart can't skip through.
+ *                It never hits its owner, and it flies straight through the owner's teammates.
+ *      hits a balloon (or other extra target) -> used up with a tiny puff, reported in targetHits
  *      hits a boat  -> boat.onHit() decides:
  *           true  -> STUCK     the dart sticks into the boat's real surface and rides along with it
  *           false -> DEFLECTED shield! it boings away, spinning, and falls
@@ -104,7 +108,11 @@ const _wobbleAxis = new THREE.Vector3();
 const raycaster = new THREE.Raycaster();
 const rayHits: THREE.Intersection[] = [];
 
-const EMPTY_RESULT: DartUpdateResult = { hits: [], waterSplashes: [] };
+const EMPTY_RESULT: DartUpdateResult = { hits: [], targetHits: [], waterSplashes: [] };
+const NO_TARGETS: readonly DartTarget[] = [];
+
+/** createEffects() also has a tiny `puff` beyond the shared Effects contract; use it when it is there. */
+type PuffEffects = Effects & { puff?: (position: THREE.Vector3) => void };
 
 const rand = (a: number, b: number): number => a + Math.random() * (b - a);
 const byDistance = (a: THREE.Intersection, b: THREE.Intersection): number => a.distance - b.distance;
@@ -293,12 +301,17 @@ export function createDartSystem(scene: THREE.Scene, fx: Effects): DartSystem {
   const radii: number[] = [];
   let boatList: readonly Boat[] = [];
   let boatCount = 0;
+  // Extra targets (balloons) for the current update(): only the alive ones can be hit.
+  let targetList: readonly DartTarget[] = NO_TARGETS;
+  let targetCount = 0;
 
   // Events from the current update(). Allocated lazily: a quiet frame allocates nothing.
   let pendingHits = null as DartHit[] | null;
+  let pendingTargetHits = null as DartTargetHit[] | null;
   let pendingSplashes = null as THREE.Vector3[] | null;
   function resetEvents(): void {
     pendingHits = null;
+    pendingTargetHits = null;
     pendingSplashes = null;
   }
 
@@ -432,6 +445,18 @@ export function createDartSystem(scene: THREE.Scene, fx: Effects): DartSystem {
     (pendingHits ??= []).push(hit);
   }
 
+  /** The dart reached an extra target (a balloon) at (ex, ey, ez): report it and use the dart up. */
+  function hitTarget(d: Dart, target: DartTarget, ex: number, ey: number, ez: number): void {
+    (pendingTargetHits ??= []).push({
+      ownerId: d.ownerId,
+      targetId: target.id,
+      point: new THREE.Vector3(ex, ey, ez),
+    });
+    _burst.set(ex, ey, ez);
+    (fx as PuffEffects).puff?.(_burst);
+    d.life = 0; // all used up: stepDart sees nothing left and sends it back to the pool
+  }
+
   /** The dart reached the water at height `wy`: splash, report it, then let it float. */
   function hitWater(d: Dart, wy: number): void {
     const m = d.mesh;
@@ -465,13 +490,30 @@ export function createDartSystem(scene: THREE.Scene, fx: Effects): DartSystem {
     const dx = v.x * dt, dy = v.y * dt, dz = v.z * dt;
     const x0 = pos.x, y0 = pos.y, z0 = pos.z;
 
-    // 1. Boats: sweep the whole path of this step against every hit sphere (never the owner's).
+    // 1. Boats and extra targets: sweep the whole path of this step against every hit sphere and
+    //    take the nearest. Never the owner, and never the owner's teammates: the dart flies straight through.
+    let ownerTeam = -1; // stays -1 if the owner is not in the list: then only the owner itself is skipped
+    for (let i = 0; i < boatCount; i++) {
+      if (boatList[i].id === d.ownerId) { ownerTeam = boatList[i].team; break; }
+    }
     let best = 2;
     let bi = -1;
+    let ti = -1;
     for (let i = 0; i < boatCount; i++) {
-      if (boatList[i].id === d.ownerId) continue;
+      const b = boatList[i];
+      if (b.id === d.ownerId || b.team === ownerTeam) continue;
       const s = segmentSphere(x0, y0, z0, dx, dy, dz, centers[i], radii[i]);
       if (s >= 0 && s < best) { best = s; bi = i; }
+    }
+    for (let i = 0; i < targetCount; i++) {
+      const tg = targetList[i];
+      if (!tg.alive) continue;
+      const s = segmentSphere(x0, y0, z0, dx, dy, dz, tg.position, tg.radius);
+      if (s >= 0 && s < best) { best = s; ti = i; bi = -1; }
+    }
+    if (ti >= 0) {
+      hitTarget(d, targetList[ti], x0 + dx * best, y0 + dy * best, z0 + dz * best);
+      return;
     }
     if (bi >= 0) {
       hitBoat(d, boatList[bi], centers[bi], radii[bi], x0 + dx * best, y0 + dy * best, z0 + dz * best, stun);
@@ -619,10 +661,19 @@ export function createDartSystem(scene: THREE.Scene, fx: Effects): DartSystem {
     live.push(d);
   }
 
-  function update(dt: number, t: number, boats: readonly Boat[], world: WorldQuery, stunSeconds: number): DartUpdateResult {
+  function update(
+    dt: number,
+    t: number,
+    boats: readonly Boat[],
+    world: WorldQuery,
+    stunSeconds: number,
+    targets?: readonly DartTarget[],
+  ): DartUpdateResult {
     if (live.length === 0) return EMPTY_RESULT;
     const step = dt > MAX_STEP ? MAX_STEP : dt < 0 ? 0 : dt;
     cacheBoats(boats);
+    targetList = targets ?? NO_TARGETS;
+    targetCount = targetList.length;
     resetEvents();
     trails.begin();
 
@@ -633,15 +684,17 @@ export function createDartSystem(scene: THREE.Scene, fx: Effects): DartSystem {
     }
 
     trails.end();
-    if (!pendingHits && !pendingSplashes) return EMPTY_RESULT;
+    if (!pendingHits && !pendingTargetHits && !pendingSplashes) return EMPTY_RESULT;
     // Fresh arrays whenever something happened, so the caller may keep them.
-    return { hits: pendingHits ?? [], waterSplashes: pendingSplashes ?? [] };
+    return { hits: pendingHits ?? [], targetHits: pendingTargetHits ?? [], waterSplashes: pendingSplashes ?? [] };
   }
 
   function clear(): void {
     while (live.length > 0) release(live[live.length - 1]);
     trails.clear();
     resetEvents();
+    targetList = NO_TARGETS;
+    targetCount = 0;
   }
 
   function dispose(): void {

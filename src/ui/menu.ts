@@ -1,27 +1,39 @@
 import './styles.css';
-import type { BotDifficulty, MatchSetup, Menu, MenuInput, ModeId, Sfx } from '../types';
+import type { BoatLook, BotDifficulty, MatchSetup, Menu, MenuInput, ModeId, Sfx, TrophyDef } from '../types';
 import { CONFIG } from '../config';
 import {
   button,
   collectRows,
-  colorName,
   cssColor,
   el,
+  field,
   guardActivationKeys,
   installUnlock,
+  makeSeg,
+  makeSwatches,
   stepFocus,
   storeGet,
   storeSet,
   svgNode,
 } from './dom';
+import { createGarage, defaultLook, describeLook, sanitizeLook } from './garage';
+import { TROPHIES, loadShelf, loadShelfColors } from './trophies';
 
-/** Title and match-setup screens. */
+/** Title, match-setup, Boat Garage and Trophy Shelf screens. */
 
+// Same key as v1: old saves still load, and anything they lack (looks, Easy Driving) gets a default.
 const STORAGE_KEY = 'foamfleet.setup.v1';
 const NAME_MAX = 12;
 const MAX_BOTS = 5; // the setup screen offers 0..5 bots
 const BATTLE_SECONDS = [120, 180, 300]; // 2 / 3 / 5 minutes
 const RACE_LAPS = [1, 3, 5];
+
+const MODES: ReadonlyArray<{ id: ModeId; label: string; icon: string; sub: string }> = [
+  { id: 'battle', label: 'Dart Battle', icon: '🎯', sub: 'Tag boats with foam darts. Most tags wins!' },
+  { id: 'race', label: 'Buoy Race', icon: '🏁', sub: 'Zip through the gates. First across wins!' },
+  { id: 'team', label: 'Team Up', icon: '🤝', sub: `Your team vs. the ${CONFIG.team.names[1]}. Most tags wins!` },
+  { id: 'practice', label: 'Balloon Pop', icon: '🎈', sub: 'Pop all the balloons! Dart them or just drive through.' },
+];
 
 /** Everything the setup screen edits. (Both players are kept so switching 1 <-> 2 players remembers them.) */
 interface Form {
@@ -31,6 +43,8 @@ interface Form {
   skill: BotDifficulty;
   names: [string, string];
   colors: [number, number];
+  looks: [BoatLook, BoatLook];
+  easy: [boolean, boolean];
   durationSec: number;
   laps: number;
 }
@@ -51,18 +65,40 @@ function defaultForm(): Form {
     skill: 'normal',
     names: ['Player 1', 'Player 2'],
     colors: [CONFIG.colors[0], CONFIG.colors[1] ?? CONFIG.colors[0]],
+    looks: [defaultLook(0), defaultLook(1)],
+    easy: [true, true], // Easy Driving starts ON: it is the friendly way in
     durationSec: nearest(BATTLE_SECONDS, CONFIG.battle.durationSec),
     laps: nearest(RACE_LAPS, CONFIG.race.laps),
   };
 }
 
+function isMode(v: unknown): v is ModeId {
+  return MODES.some((m) => m.id === v);
+}
+
+/** Read one player (the shape of `PlayerSetup`, but any field may be missing) into the form. */
+function applyPlayer(f: Form, i: number, p: unknown): void {
+  if (!p || typeof p !== 'object') return;
+  const r = p as Record<string, unknown>;
+  if (typeof r.name === 'string') f.names[i] = r.name.slice(0, NAME_MAX);
+  if (typeof r.color === 'number' && CONFIG.colors.includes(r.color)) f.colors[i] = r.color;
+  f.looks[i] = sanitizeLook(r.look, f.looks[i]);
+  if (typeof r.easyDriving === 'boolean') f.easy[i] = r.easyDriving;
+}
+
 /** Never trust saved data: copy over only the fields that look right. */
 function sanitize(raw: unknown, base: Form): Form {
-  const f: Form = { ...base, names: [...base.names], colors: [...base.colors] };
+  const f: Form = {
+    ...base,
+    names: [...base.names],
+    colors: [...base.colors],
+    looks: [{ ...base.looks[0] }, { ...base.looks[1] }],
+    easy: [...base.easy],
+  };
   if (!raw || typeof raw !== 'object') return f;
   const r = raw as Record<string, unknown>;
   if (r.humans === 1 || r.humans === 2) f.humans = r.humans;
-  if (r.mode === 'battle' || r.mode === 'race') f.mode = r.mode;
+  if (isMode(r.mode)) f.mode = r.mode;
   if (typeof r.bots === 'number' && Number.isFinite(r.bots)) {
     f.bots = Math.max(0, Math.min(MAX_BOTS, Math.round(r.bots)));
   }
@@ -78,6 +114,19 @@ function sanitize(raw: unknown, base: Form): Form {
       const c = r.colors[i];
       if (typeof c === 'number' && CONFIG.colors.includes(c)) f.colors[i] = c;
     }
+  }
+  if (Array.isArray(r.looks)) {
+    for (let i = 0; i < 2; i++) f.looks[i] = sanitizeLook(r.looks[i], f.looks[i]);
+  }
+  if (Array.isArray(r.easy)) {
+    for (let i = 0; i < 2; i++) {
+      const e = r.easy[i];
+      if (typeof e === 'boolean') f.easy[i] = e;
+    }
+  }
+  // A saved MatchSetup-style `players` list (name / color / look / easyDriving) works too.
+  if (Array.isArray(r.players)) {
+    for (let i = 0; i < 2; i++) applyPlayer(f, i, r.players[i]);
   }
   if (typeof r.durationSec === 'number') f.durationSec = nearest(BATTLE_SECONDS, r.durationSec);
   if (typeof r.laps === 'number') f.laps = nearest(RACE_LAPS, r.laps);
@@ -124,7 +173,46 @@ const SPEAKER_SVG = `
   <path class="slash" d="M3 3 L21 21" stroke="#d9261c" stroke-width="2.8" stroke-linecap="round"/>
 </svg>`;
 
+// ───────────── Trophy Shelf pieces ─────────────
+
+function trophyTile(t: TrophyDef, earned: boolean): HTMLElement {
+  const tile = el('div', 'ff-trophy ' + (earned ? 'is-earned' : 'is-locked'));
+  tile.setAttribute('role', 'listitem');
+  const icon = el('span', 'ff-trophy-icon');
+  icon.setAttribute('aria-hidden', 'true');
+  icon.append(el('span', 'ff-trophy-emoji', t.icon));
+  const text = el('div', 'ff-trophy-text');
+  // Earned = full color; not yet = grey silhouette. The tag says so in words too.
+  text.append(
+    el('div', 'ff-trophy-name', t.name),
+    el('div', 'ff-trophy-desc', t.description),
+    el('div', 'ff-trophy-tag', earned ? 'Earned!' : 'Not yet'),
+  );
+  tile.append(icon, text);
+  return tile;
+}
+
+/** One player's shelf: every trophy in the game, earned ones lit up. */
+function shelfCard(name: string, earned: ReadonlySet<string>, color: number | null): HTMLElement {
+  const card = el('div', 'ff-card ff-shelf-card');
+  if (color !== null) card.style.setProperty('--c', cssColor(color));
+  const head = el('div', 'ff-shelf-head');
+  const count = TROPHIES.filter((t) => earned.has(t.id)).length;
+  head.append(
+    el('span', 'ff-shelf-dot'),
+    el('h3', 'ff-shelf-name', name),
+    el('span', 'ff-shelf-count', `${count} of ${TROPHIES.length}`),
+  );
+  const grid = el('div', 'ff-trophy-grid');
+  grid.setAttribute('role', 'list');
+  for (const t of TROPHIES) grid.append(trophyTile(t, earned.has(t.id)));
+  card.append(head, grid);
+  return card;
+}
+
 // ───────────── the menu ─────────────
+
+type Screen = 'title' | 'setup' | 'garage' | 'shelf';
 
 export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
   root.classList.add('ff-ui');
@@ -132,7 +220,8 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
 
   let visible = false;
   let started = false; // stops a double-click from starting the match twice
-  let screen: 'title' | 'setup' = 'title';
+  let screen: Screen = 'title';
+  let garageFor: 0 | 1 = 0; // whose boat the garage is showing
   let onStart: ((setup: MatchSetup) => void) | null = null;
   let form: Form = loadForm();
 
@@ -146,6 +235,15 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
 
   function maxBots(): number {
     return Math.max(0, Math.min(MAX_BOTS, CONFIG.match.maxBoats - form.humans));
+  }
+  /** Team Up needs someone to play against; Balloon Pop has no computer boats at all. */
+  function minBots(): number {
+    return form.mode === 'team' ? 1 : 0;
+  }
+  /** The computer boats this setup really gets (the saved number is kept for the other modes). */
+  function botCount(): number {
+    if (form.mode === 'practice') return 0;
+    return Math.max(minBots(), Math.min(form.bots, maxBots()));
   }
 
   // ───── backdrop: sky, sun, bubbles and rolling waves (pure CSS, no images) ─────
@@ -185,6 +283,9 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
   const playBtn = button('Play', 'ff-btn ff-btn--primary ff-btn--hero');
   const playRow = el('div', 'ff-row');
   playRow.append(playBtn);
+  const shelfBtn = button('🏆 Trophy Shelf', 'ff-btn ff-btn--lg');
+  const shelfRow = el('div', 'ff-row');
+  shelfRow.append(shelfBtn);
 
   function keysCard(heading: string, lines: Array<{ keys: string[]; text: string }>): HTMLElement {
     const card = el('div', 'ff-keys');
@@ -204,20 +305,26 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
       { keys: ['W', 'A', 'S', 'D'], text: 'Drive' },
       { keys: ['Space'], text: 'Fire' },
       { keys: ['Shift'], text: 'Boost' },
+      { keys: ['R'], text: 'Rescue' },
+      { keys: ['Q'], text: 'Honk' },
     ]),
     keysCard('Player 2 keys', [
       { keys: ['↑', '←', '↓', '→'], text: 'Drive' },
       { keys: ['Enter'], text: 'Fire' },
       { keys: ['Right Shift'], text: 'Boost' },
+      { keys: ['/'], text: 'Rescue' },
+      { keys: ["'"], text: 'Honk' },
     ]),
     keysCard('Gamepad', [
       { keys: ['Left stick'], text: 'Steer' },
       { keys: ['RT'], text: 'Go' },
       { keys: ['A'], text: 'Fire' },
       { keys: ['B'], text: 'Boost' },
+      { keys: ['Y'], text: 'Rescue' },
+      { keys: ['X'], text: 'Honk' },
     ]),
   );
-  titleEl.append(logo, tagline, boatArt, playRow, controls);
+  titleEl.append(logo, tagline, boatArt, playRow, shelfRow, controls);
 
   // ───── setup screen ─────
   const setupEl = el('section', 'ff-screen ff-setup');
@@ -228,46 +335,6 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
   const backRow = el('div', 'ff-row');
   backRow.append(backBtn);
   head.append(backRow, el('h2', 'ff-setup-title ff-ol', 'Get ready!'));
-
-  /** A row of big toggle buttons where exactly one is selected. */
-  interface SegItem<T> {
-    value: T;
-    label: string;
-    sub?: string;
-  }
-  function makeSeg<T>(
-    ariaLabel: string,
-    items: SegItem<T>[],
-    onPick: (v: T) => void,
-  ): { row: HTMLElement; buttons: HTMLButtonElement[]; select: (v: T) => void } {
-    const row = el('div', 'ff-row ff-seg');
-    row.setAttribute('role', 'group');
-    row.setAttribute('aria-label', ariaLabel);
-    const buttons = items.map((it) => {
-      const b = button(it.label, 'ff-btn ff-seg-btn');
-      if (it.sub) b.append(el('span', 'ff-seg-sub', it.sub));
-      b.addEventListener('click', () => {
-        sfx.uiSelect();
-        onPick(it.value);
-      });
-      row.append(b);
-      return b;
-    });
-    return {
-      row,
-      buttons,
-      select(v: T) {
-        items.forEach((it, i) => buttons[i].setAttribute('aria-pressed', String(it.value === v)));
-      },
-    };
-  }
-
-  function field(title: string, ...content: HTMLElement[]): { box: HTMLElement; label: HTMLElement } {
-    const box = el('div', 'ff-field');
-    const label = el('div', 'ff-label', title);
-    box.append(label, ...content);
-    return { box, label };
-  }
 
   function changed(): void {
     // Two humans can't share a boat color: if P1 and P2 collide, P2 gets the next free one.
@@ -280,6 +347,7 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
   }
 
   const playersSeg = makeSeg<1 | 2>(
+    sfx,
     'Players',
     [
       { value: 1, label: '1 Player' },
@@ -291,6 +359,7 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     },
   );
   const botsSeg = makeSeg<number>(
+    sfx,
     'Computer boats',
     Array.from({ length: MAX_BOTS + 1 }, (_, n) => ({ value: n, label: String(n) })),
     (v) => {
@@ -299,18 +368,18 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     },
   );
   const modeSeg = makeSeg<ModeId>(
+    sfx,
     'Game mode',
-    [
-      { value: 'battle', label: 'Dart Battle', sub: 'Tag boats with foam darts. Most tags wins!' },
-      { value: 'race', label: 'Buoy Race', sub: 'Zip through the gates. First across wins!' },
-    ],
+    MODES.map((m) => ({ value: m.id, label: m.label, icon: m.icon, sub: m.sub })),
     (v) => {
       form.mode = v;
       changed();
     },
   );
+  modeSeg.row.classList.add('ff-modes');
   const battleSeg = makeSeg<number>(
-    'Battle length',
+    sfx,
+    'Match length',
     BATTLE_SECONDS.map((s) => ({ value: s, label: s / 60 + ' min' })),
     (v) => {
       form.durationSec = v;
@@ -318,6 +387,7 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     },
   );
   const lapsSeg = makeSeg<number>(
+    sfx,
     'Race laps',
     RACE_LAPS.map((n) => ({ value: n, label: n + (n === 1 ? ' lap' : ' laps') })),
     (v) => {
@@ -326,6 +396,7 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     },
   );
   const skillSeg = makeSeg<BotDifficulty>(
+    sfx,
     'Bot skill',
     [
       { value: 'easy', label: 'Easy' },
@@ -338,18 +409,30 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     },
   );
 
-  const playersField = field('Players', playersSeg.row);
-  const botsField = field('Computer boats', botsSeg.row);
   const modeField = field('Game', modeSeg.row);
+  const playersField = field('Players', playersSeg.row);
+  const teamHint = el('div', 'ff-help');
+  const botsField = field('Computer boats', botsSeg.row, teamHint);
   const lengthField = field('Battle length', battleSeg.row, lapsSeg.row);
-  const skillHint = el('div', 'ff-hint', 'Add some computer boats to pick their skill.');
+  const skillHint = el('div', 'ff-help', 'Add some computer boats to pick their skill.');
   const skillField = field('Bot skill', skillSeg.row, skillHint);
+  const practiceNote = el(
+    'div',
+    'ff-note',
+    `No computer boats here! Pop all ${CONFIG.practice.balloons} balloons as fast as you can. ` +
+      'Gold balloons are worth 3. Dart them, or just drive right through them!',
+  );
 
-  // per-player name + color
+  // per-player name + color + Easy Driving + garage
   interface PlayerCard {
     card: HTMLElement;
     input: HTMLInputElement;
-    swatches: HTMLButtonElement[];
+    swatches: ReturnType<typeof makeSwatches>;
+    easyBtn: HTMLButtonElement;
+    easyState: HTMLElement;
+    easyHint: HTMLElement;
+    garageBtn: HTMLButtonElement;
+    garageSub: HTMLElement;
   }
   function buildPlayerCard(i: 0 | 1): PlayerCard {
     const card = el('div', 'ff-pcard');
@@ -371,44 +454,121 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     input.addEventListener('focus', () => input.select()); // easy to type over the default
     nameRow.append(input);
 
-    const swatchRow = el('div', 'ff-row ff-swatches');
-    swatchRow.setAttribute('role', 'group');
-    swatchRow.setAttribute('aria-label', `Player ${i + 1} boat color`);
-    const swatches = CONFIG.colors.map((c) => {
-      const s = el('button', 'ff-swatch');
-      s.type = 'button';
-      s.setAttribute('data-nav', '');
-      s.style.setProperty('--c', cssColor(c));
-      const nm = colorName(c);
-      s.setAttribute('aria-label', nm);
-      s.title = nm;
-      s.addEventListener('click', () => {
-        if (s.disabled) return;
-        form.colors[i] = c;
-        sfx.uiSelect();
-        changed();
-      });
-      swatchRow.append(s);
-      return s;
+    const swatches = makeSwatches(sfx, `Player ${i + 1} boat color`, CONFIG.colors, (c) => {
+      form.colors[i] = c;
+      changed();
     });
 
-    card.append(nameRow, swatchRow);
-    return { card, input, swatches };
+    // Easy Driving: one big switch, with a sentence about what it does.
+    const easyBtn = button('', 'ff-btn ff-toggle');
+    const easySwitch = el('span', 'ff-switch');
+    easySwitch.append(el('i'));
+    easySwitch.setAttribute('aria-hidden', 'true');
+    const easyState = el('span', 'ff-toggle-state');
+    easyBtn.append(el('span', 'ff-toggle-name', 'Easy Driving'), easySwitch, easyState);
+    easyBtn.addEventListener('click', () => {
+      form.easy[i] = !form.easy[i];
+      sfx.uiSelect();
+      changed();
+    });
+    const easyRow = el('div', 'ff-row');
+    easyRow.append(easyBtn);
+    const easyHint = el('div', 'ff-help');
+
+    const garageBtn = button('🔧 Boat Garage', 'ff-btn ff-garage-btn');
+    const garageSub = el('span', 'ff-seg-sub');
+    garageBtn.append(garageSub);
+    garageBtn.addEventListener('click', () => {
+      sfx.uiSelect();
+      openGarage(i);
+    });
+    const garageRow = el('div', 'ff-row');
+    garageRow.append(garageBtn);
+
+    card.append(nameRow, swatches.row, easyRow, easyHint, garageRow);
+    return { card, input, swatches, easyBtn, easyState, easyHint, garageBtn, garageSub };
   }
   const pcards: [PlayerCard, PlayerCard] = [buildPlayerCard(0), buildPlayerCard(1)];
 
-  const leftCol = el('div', 'ff-col');
-  leftCol.append(playersField.box, botsField.box, modeField.box, lengthField.box);
-  const rightCol = el('div', 'ff-col');
-  rightCol.append(skillField.box, pcards[0].card, pcards[1].card);
-  const grid = el('div', 'ff-card ff-grid');
-  grid.append(leftCol, rightCol);
+  const optsCol = el('div', 'ff-col');
+  optsCol.append(playersField.box, botsField.box, skillField.box, lengthField.box, practiceNote);
+  const grid = el('div', 'ff-grid');
+  grid.append(optsCol, pcards[0].card, pcards[1].card);
+  const setupCard = el('div', 'ff-card ff-setup-card');
+  setupCard.append(modeField.box, grid);
 
   const startBtn = button('Start!', 'ff-btn ff-btn--primary ff-btn--hero');
   const startRow = el('div', 'ff-row ff-start-wrap');
   startRow.append(startBtn);
 
-  setupEl.append(head, grid, startRow);
+  setupEl.append(head, setupCard, startRow);
+
+  // ───── Boat Garage screen (its own module) ─────
+  const garage = createGarage(sfx);
+  garage.el.hidden = true;
+
+  function openGarage(i: 0 | 1): void {
+    garageFor = i;
+    garage.open(
+      {
+        title: `${cleanName(i)}'s boat`,
+        look: form.looks[i],
+        color: form.colors[i],
+        takenBy: (c) => (form.humans === 2 && form.colors[1 - i] === c ? 'P' + (2 - i) : null),
+        onLook: (look) => {
+          form.looks[i] = look;
+          changed();
+        },
+        onColor: (c) => {
+          form.colors[i] = c;
+          changed();
+        },
+      },
+      closeGarage,
+    );
+    showScreen('garage');
+  }
+  function closeGarage(): void {
+    showScreen('setup', pcards[garageFor].garageBtn);
+  }
+
+  // ───── Trophy Shelf screen ─────
+  const shelfEl = el('section', 'ff-screen ff-shelf');
+  shelfEl.hidden = true;
+  const shelfBackBtn = button('← Back', 'ff-btn');
+  const shelfBackRow = el('div', 'ff-row');
+  shelfBackRow.append(shelfBackBtn);
+  const shelfHead = el('div', 'ff-setup-head');
+  shelfHead.append(shelfBackRow, el('h2', 'ff-setup-title ff-ol', 'Trophy Shelf'));
+  const shelfBody = el('div', 'ff-shelf-body');
+  shelfEl.append(shelfHead, shelfBody);
+
+  /** Rebuild the shelf from what is saved right now (a match may have just added trophies). */
+  function renderShelf(): void {
+    shelfBody.replaceChildren();
+    const saved = loadShelf();
+    const colors = loadShelfColors();
+    // The people about to play come first, then everyone else, newest winners first.
+    const current = form.names.slice(0, form.humans).map((_, i) => cleanName(i));
+    const rank = (n: string): number => {
+      const k = current.indexOf(n);
+      return k < 0 ? current.length : k;
+    };
+    const names = Object.keys(saved)
+      .reverse()
+      .sort((a, b) => rank(a) - rank(b));
+    if (names.length === 0) {
+      shelfBody.append(
+        el('p', 'ff-shelf-empty ff-ol', 'No trophies yet. Play a game to win your first one!'),
+        shelfCard('Trophies to win', new Set(), null),
+      );
+      return;
+    }
+    for (const name of names) {
+      const c = colors[name];
+      shelfBody.append(shelfCard(name, new Set(saved[name]), typeof c === 'number' ? c : null));
+    }
+  }
 
   // ───── sound toggle (always reachable) ─────
   const soundRow = el('div', 'ff-row ff-sound-wrap');
@@ -432,63 +592,111 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     if (!sfx.muted) sfx.uiSelect();
   });
 
-  menuEl.append(titleEl, setupEl, soundRow);
+  menuEl.append(titleEl, setupEl, garage.el, shelfEl, soundRow);
 
   // ───── keeping the screen in sync with `form` ─────
+  function teamSplitText(): string {
+    const humans = form.humans;
+    const total = humans + botCount();
+    const mine = Math.max(humans, Math.ceil(total / 2)); // humans + helper boats
+    const helpers = mine - humans;
+    const them = total - mine;
+    const [mineName, theirName] = CONFIG.team.names;
+    const who = humans === 1 ? 'you' : 'you both';
+    const plus = helpers > 0 ? ` + ${helpers} helper boat${helpers === 1 ? '' : 's'}` : '';
+    return `${mineName}: ${who}${plus}. ${theirName}: ${them} boat${them === 1 ? '' : 's'}.`;
+  }
+
   function applyForm(): void {
     const f = form;
     const cap = maxBots();
+    const count = botCount();
+    const hasBots = f.mode !== 'practice';
+
     playersSeg.select(f.humans);
-    botsSeg.select(f.bots);
-    botsSeg.buttons.forEach((b, n) => {
-      b.disabled = n > cap;
-    });
     modeSeg.select(f.mode);
-    lengthField.label.textContent = f.mode === 'battle' ? 'Battle length' : 'Race laps';
-    battleSeg.row.hidden = f.mode !== 'battle';
-    lapsSeg.row.hidden = f.mode !== 'race';
-    battleSeg.select(f.durationSec);
-    lapsSeg.select(f.laps);
+
+    // computer boats (not in Balloon Pop; Team Up needs at least one rival)
+    botsField.box.hidden = !hasBots;
+    botsField.label.textContent = f.mode === 'team' ? 'Computer boats (both teams)' : 'Computer boats';
+    botsSeg.select(count);
+    botsSeg.buttons.forEach((b, n) => {
+      b.disabled = n > cap || n < minBots();
+    });
+    teamHint.hidden = f.mode !== 'team';
+    if (f.mode === 'team') teamHint.textContent = teamSplitText();
+    skillField.box.hidden = !hasBots;
     skillSeg.select(f.skill);
-    const noBots = f.bots === 0;
+    const noBots = count === 0;
     skillSeg.buttons.forEach((b) => {
       b.disabled = noBots;
     });
     skillHint.hidden = !noBots;
 
+    // length: minutes (Dart Battle, Team Up), laps (Buoy Race), nothing (Balloon Pop counts up)
+    lengthField.box.hidden = f.mode === 'practice';
+    lengthField.label.textContent = f.mode === 'race' ? 'Race laps' : f.mode === 'team' ? 'Match length' : 'Battle length';
+    battleSeg.row.hidden = f.mode === 'race';
+    lapsSeg.row.hidden = f.mode !== 'race';
+    battleSeg.select(f.durationSec);
+    lapsSeg.select(f.laps);
+    practiceNote.hidden = f.mode !== 'practice';
+
     pcards.forEach((pc, i) => {
       pc.card.hidden = i >= f.humans;
       pc.card.style.setProperty('--c', cssColor(f.colors[i]));
-      pc.swatches.forEach((s, j) => {
-        const c = CONFIG.colors[j];
-        const mine = f.colors[i] === c;
-        const takenByOther = f.humans === 2 && f.colors[1 - i] === c;
-        s.setAttribute('aria-pressed', String(mine));
-        s.disabled = takenByOther && !mine;
-        if (takenByOther) s.dataset.taken = 'P' + (2 - i);
-        else delete s.dataset.taken;
-      });
+      pc.swatches.sync(f.colors[i], (c) => (f.humans === 2 && f.colors[1 - i] === c ? 'P' + (2 - i) : null));
+      const easy = f.easy[i];
+      pc.easyBtn.setAttribute('aria-pressed', String(easy));
+      pc.easyState.textContent = easy ? 'ON' : 'OFF';
+      pc.easyHint.textContent = easy
+        ? 'Your boat cruises by itself, turns gently and glides past rocks. Just steer and shoot!'
+        : 'You do all the driving: go, brake and steer yourself. For pros!';
+      pc.garageSub.textContent = describeLook(f.looks[i]);
     });
     boatArt.style.setProperty('--boat', cssColor(f.colors[0]));
   }
 
   // ───── screen switching ─────
-  function showScreen(which: 'title' | 'setup'): void {
+  function showScreen(which: Screen, focusEl?: HTMLElement): void {
     screen = which;
     titleEl.hidden = which !== 'title';
     setupEl.hidden = which !== 'setup';
-    if (which === 'setup') setupEl.scrollTop = 0;
+    garage.el.hidden = which !== 'garage';
+    shelfEl.hidden = which !== 'shelf';
+    if (which !== 'garage') garage.close(); // frees the 3D preview
+    if (which === 'setup' && !focusEl) setupEl.scrollTop = 0;
+    if (which === 'garage') garage.el.scrollTop = 0;
+    if (which === 'shelf') {
+      renderShelf();
+      shelfEl.scrollTop = 0;
+    }
     // Land on the big button so Enter / A keeps things moving.
-    (which === 'title' ? playBtn : startBtn).focus({ preventScroll: true });
+    if (which === 'garage') garage.focusFirst();
+    else (focusEl ?? mainButton()).focus({ preventScroll: focusEl === undefined });
+  }
+
+  function mainButton(): HTMLElement {
+    if (screen === 'setup') return startBtn;
+    if (screen === 'shelf') return shelfBackBtn;
+    return playBtn;
   }
 
   playBtn.addEventListener('click', () => {
     sfx.uiSelect();
     showScreen('setup');
   });
+  shelfBtn.addEventListener('click', () => {
+    sfx.uiSelect();
+    showScreen('shelf');
+  });
   backBtn.addEventListener('click', () => {
     sfx.uiMove();
     showScreen('title');
+  });
+  shelfBackBtn.addEventListener('click', () => {
+    sfx.uiMove();
+    showScreen('title', shelfBtn);
   });
   startBtn.addEventListener('click', () => {
     if (started || !onStart) return;
@@ -505,11 +713,18 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
   function buildSetup(): MatchSetup {
     const humans = form.humans;
     const players: MatchSetup['players'] = [];
-    for (let i = 0; i < humans; i++) players.push({ name: cleanName(i), color: form.colors[i] });
+    for (let i = 0; i < humans; i++) {
+      players.push({
+        name: cleanName(i),
+        color: form.colors[i],
+        look: { ...form.looks[i] },
+        easyDriving: form.easy[i],
+      });
+    }
     return {
       mode: form.mode,
       humans,
-      bots: Math.min(form.bots, maxBots()),
+      bots: botCount(),
       botDifficulty: form.skill,
       players,
       durationSec: form.durationSec,
@@ -540,6 +755,12 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
       else if (screen === 'setup') {
         sfx.uiMove();
         showScreen('title');
+      } else if (screen === 'garage') {
+        sfx.uiMove();
+        closeGarage();
+      } else if (screen === 'shelf') {
+        sfx.uiMove();
+        showScreen('title', shelfBtn);
       }
       return;
     }
@@ -551,9 +772,17 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
         if (next) next.focus();
       } else if (inMenu && active instanceof HTMLButtonElement) {
         active.click();
+      } else if (screen === 'garage') {
+        garage.focusFirst();
       } else {
-        (screen === 'title' ? playBtn : startBtn).focus();
+        mainButton().focus();
       }
+      return;
+    }
+    if (screen === 'shelf') {
+      // Nothing to hop between here, so up / down just scroll the shelf.
+      const dy = (down ? 1 : 0) - (up ? 1 : 0);
+      if (dy !== 0) shelfEl.scrollBy({ top: dy * shelfEl.clientHeight * 0.6 });
       return;
     }
     const dx = (right ? 1 : 0) - (left ? 1 : 0);
@@ -571,16 +800,16 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
     started = false;
     form = loadForm();
     if (initial) {
-      form.humans = initial.humans;
-      form.mode = initial.mode;
-      form.bots = Math.max(0, Math.min(MAX_BOTS, initial.bots));
+      form.humans = initial.humans === 2 ? 2 : 1;
+      if (isMode(initial.mode)) form.mode = initial.mode;
+      // Balloon Pop has no computer boats (its setup says 0): keep the saved number for the other modes.
+      if (initial.mode !== 'practice') form.bots = Math.max(0, Math.min(MAX_BOTS, initial.bots));
       form.skill = initial.botDifficulty;
       form.durationSec = nearest(BATTLE_SECONDS, initial.durationSec);
       form.laps = nearest(RACE_LAPS, initial.laps);
+      // Players from an older setup may have no look / easyDriving: the saved ones (or defaults) stay.
       initial.players.forEach((p, i) => {
-        if (i > 1) return;
-        form.names[i] = p.name.slice(0, NAME_MAX);
-        if (CONFIG.colors.includes(p.color)) form.colors[i] = p.color;
+        if (i <= 1) applyPlayer(form, i, p);
       });
     }
     pcards[0].input.value = form.names[0];
@@ -594,6 +823,7 @@ export function createMenu(root: HTMLElement, sfx: Sfx): Menu {
   }
 
   function hide(): void {
+    garage.close();
     menuEl.hidden = true;
     visible = false;
     started = false;

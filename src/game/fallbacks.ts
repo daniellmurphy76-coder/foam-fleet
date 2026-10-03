@@ -12,14 +12,16 @@
 import * as THREE from 'three';
 import { CONFIG } from '../config';
 import type {
-  Boat, BoatControls, BoatInit, Checkpoint, Controller, DartSystem, DartUpdateResult, Effects, Hud,
-  InputManager, MatchSetup, Menu, MenuInput, ModeId, PickupEvent, Pickups, PowerUpKind, Sfx, SpawnPoint,
-  World, ActivePowerUp, DartSpawn,
+  Boat, BoatControls, BoatInit, Balloons, BalloonPop, Checkpoint, Controller, DartSystem, DartTarget,
+  DartUpdateResult, Effects, Hud, InputManager, MatchSetup, Menu, MenuInput, ModeId, Obstacle, PickupEvent,
+  Pickups, PowerUpKind, Sfx, SpawnPoint, World, WorldQuery, ActivePowerUp, DartSpawn,
 } from '../types';
 
 const noop = (): void => {};
 
-export const ZERO_CONTROLS: BoatControls = Object.freeze({ throttle: 0, steer: 0, fire: false, boost: false });
+export const ZERO_CONTROLS: BoatControls = Object.freeze({
+  throttle: 0, steer: 0, fire: false, boost: false, rescue: false, honk: false,
+});
 
 export const EMPTY_MENU: MenuInput = Object.freeze({
   up: false, down: false, left: false, right: false, confirm: false, back: false, pause: false, mute: false,
@@ -36,6 +38,7 @@ export function quietSfx(): Sfx {
   return {
     unlock: noop, fire: noop, hit: noop, shieldBlock: noop, splash: noop, bump: noop, pickup: noop,
     boost: noop, checkpoint: noop, lap: noop, countdown: noop, go: noop, victory: noop,
+    pop: noop, honk: noop, rescue: noop, trophy: noop,
     uiMove: noop, uiSelect: noop, setEngines: noop, setMusic: noop,
     setMuted: (m: boolean) => { muted = m; },
     get muted() { return muted; },
@@ -43,13 +46,16 @@ export function quietSfx(): Sfx {
 }
 
 export function quietFx(): Effects {
-  return { splash: noop, hitBurst: noop, sparkle: noop, wake: noop, update: noop, clear: noop, dispose: noop };
+  return {
+    splash: noop, hitBurst: noop, sparkle: noop, pop: noop, notes: noop, wake: noop, update: noop, clear: noop,
+    dispose: noop,
+  };
 }
 
 export function quietHud(): Hud {
   return {
-    show: noop, hide: noop, update: noop, announce: noop, feed: noop, showPause: noop, hidePause: noop,
-    showResults: noop, hideResults: noop, handleMenuInput: noop,
+    show: noop, hide: noop, update: noop, announce: noop, hint: noop, feed: noop, showPause: noop,
+    hidePause: noop, showResults: noop, hideResults: noop, handleMenuInput: noop,
   };
 }
 
@@ -104,7 +110,10 @@ export function fallbackMenu(root: HTMLElement, defaults: () => MatchSetup): Men
 
 export function fallbackInput(): InputManager {
   const idle = idleController('human');
-  return { poll: noop, humanController: () => idle, menu: EMPTY_MENU, gamepadCount: () => 0, rumble: noop, dispose: noop };
+  return {
+    poll: noop, humanController: () => idle, menu: EMPTY_MENU, schemeOf: () => 'keysA', gamepadCount: () => 0,
+    rumble: noop, dispose: noop,
+  };
 }
 
 // ───────────────────────────── layout helpers ─────────────────────────────
@@ -153,6 +162,49 @@ export function fallbackSpawns(count: number, mode: ModeId, gates: readonly Chec
   return out;
 }
 
+/** Team Up spawns: side A on the left, side B on the right, lined up 10 m apart, all facing the middle. */
+export function fallbackTeamSpawns(countA: number, countB: number): [SpawnPoint[], SpawnPoint[]] {
+  const x = CONFIG.arena.radius * 0.5;
+  const side = (count: number, sign: 1 | -1): SpawnPoint[] => {
+    const out: SpawnPoint[] = [];
+    for (let i = 0; i < count; i++) {
+      const z = (i - (count - 1) / 2) * 10;
+      // Heading pi/2 faces +X, -pi/2 faces -X (forward = (sin h, 0, cos h)).
+      out.push({ x: sign * x, z, heading: sign > 0 ? -Math.PI / 2 : Math.PI / 2 });
+    }
+    return out;
+  };
+  return [side(countA, -1), side(countB, 1)];
+}
+
+/**
+ * Rescue spot for when `world.safeSpot` can't be trusted: stay near (x, z), but step out of every
+ * obstacle (4 m of clearance) and back inside the arena (8 m from the edge). Keeps the heading.
+ */
+export function fallbackSafeSpot(
+  x: number, z: number, heading: number, obstacles: readonly Obstacle[], arenaRadius: number,
+): SpawnPoint {
+  for (let pass = 0; pass < 6; pass++) {
+    for (const o of obstacles) {
+      const dx = x - o.x;
+      const dz = z - o.z;
+      const min = o.radius + 4;
+      const d = Math.hypot(dx, dz);
+      if (d < min) {
+        x = d > 1e-3 ? o.x + (dx / d) * min : o.x + min;
+        z = d > 1e-3 ? o.z + (dz / d) * min : o.z;
+      }
+    }
+    const edge = arenaRadius - 8;
+    const r = Math.hypot(x, z);
+    if (r > edge) {
+      x *= edge / r;
+      z *= edge / r;
+    }
+  }
+  return { x, z, heading };
+}
+
 // ───────────────────────────── world, pickups, darts ─────────────────────────────
 
 /** A flat blue disc with sun and sky. Enough to see boats on. */
@@ -178,6 +230,8 @@ export function fallbackWorld(scene: THREE.Scene, mode: ModeId): World {
     waveHeight: () => 0,
     waveNormal: (_x, _z, _t, out) => out.set(0, 1, 0),
     spawnPoints: (count, m) => fallbackSpawns(count, m ?? mode, checkpoints),
+    teamSpawnPoints: fallbackTeamSpawns,
+    safeSpot: (x, z, heading) => fallbackSafeSpot(x, z, heading, [], R),
     update: noop,
     dispose() {
       scene.remove(water, hemi, sun);
@@ -194,9 +248,113 @@ export function fallbackPickups(): Pickups {
   return { positions: [], update: () => NO_EVENTS, clear: noop, dispose: noop };
 }
 
-const NO_DART_RESULT: DartUpdateResult = { hits: [], waterSplashes: [] };
+const NO_DART_RESULT: DartUpdateResult = { hits: [], targetHits: [], waterSplashes: [] };
 export function fallbackDarts(): DartSystem {
   return { spawn: noop, update: () => NO_DART_RESULT, activeCount: 0, clear: noop, dispose: noop };
+}
+
+// ───────────────────────────── balloons ─────────────────────────────
+
+const NO_POPS: BalloonPop[] = [];
+const STAND_IN_BALLOON_COLORS = [0xff5a5f, 0x4dabf7, 0x69db7c, 0xff8fc7, 0xb197fc, 0xffa94d];
+const BALLOON_HEIGHT = 1.6;
+const BALLOON_RADIUS = 0.9;
+
+interface StandInBalloon extends DartTarget {
+  alive: boolean;
+  readonly mesh: THREE.Mesh;
+  readonly value: number;
+  readonly color: number;
+}
+
+/**
+ * Plain balloons on a spiral, for when the real Balloon Pop module can't be built. Same rules as the real
+ * thing (every goldEvery-th is gold and worth 3; popped by a dart or by driving through), minus the polish.
+ */
+export function fallbackBalloons(scene: THREE.Scene, world: WorldQuery): Balloons {
+  const count = Math.max(1, Math.round(CONFIG.practice.balloons));
+  const goldEvery = Math.floor(CONFIG.practice.goldEvery);
+  const R = world.arenaRadius;
+  const geometry = new THREE.SphereGeometry(BALLOON_RADIUS, 12, 8);
+  const materials = new Map<number, THREE.MeshStandardMaterial>();
+  const materialFor = (color: number): THREE.MeshStandardMaterial => {
+    let m = materials.get(color);
+    if (!m) {
+      m = new THREE.MeshStandardMaterial({ color, flatShading: true, roughness: 0.35 });
+      materials.set(color, m);
+    }
+    return m;
+  };
+  const items: StandInBalloon[] = [];
+  for (let k = 0; k < count; k++) {
+    const angle = k * 2.399963; // golden angle: spreads the balloons evenly
+    const ring = R * (0.2 + 0.55 * Math.sqrt((k + 0.5) / count));
+    let x = Math.cos(angle) * ring;
+    let z = Math.sin(angle) * ring;
+    for (let pass = 0; pass < 4; pass++) {
+      for (const o of world.obstacles) {
+        const dx = x - o.x;
+        const dz = z - o.z;
+        const min = o.radius + 7;
+        const d = Math.hypot(dx, dz);
+        if (d < min) {
+          x = d > 1e-3 ? o.x + (dx / d) * min : o.x + min;
+          z = d > 1e-3 ? o.z + (dz / d) * min : o.z;
+        }
+      }
+    }
+    const gold = goldEvery > 0 && (k + 1) % goldEvery === 0;
+    const color = gold ? 0xffd23f : STAND_IN_BALLOON_COLORS[k % STAND_IN_BALLOON_COLORS.length];
+    const mesh = new THREE.Mesh(geometry, materialFor(color));
+    mesh.position.set(x, BALLOON_HEIGHT, z);
+    mesh.castShadow = true;
+    scene.add(mesh);
+    items.push({
+      id: k, position: mesh.position, radius: BALLOON_RADIUS, alive: true, mesh, value: gold ? 3 : 1, color,
+    });
+  }
+  let remaining = count;
+
+  const popOne = (b: StandInBalloon, boatId: number): BalloonPop => {
+    b.alive = false;
+    b.mesh.visible = false;
+    remaining--;
+    return { targetId: b.id, boatId, position: b.position.clone(), value: b.value, color: b.color };
+  };
+
+  return {
+    targets: items,
+    total: count,
+    get remaining() { return remaining; },
+    update(t, _dt, boats) {
+      let pops = NO_POPS;
+      for (const b of items) {
+        if (!b.alive) continue;
+        b.position.y = world.waveHeight(b.position.x, b.position.z, t) + BALLOON_HEIGHT + Math.sin(t * 1.3 + b.id) * 0.12;
+        for (const boat of boats) {
+          const dx = boat.position.x - b.position.x;
+          const dz = boat.position.z - b.position.z;
+          const reach = boat.radius + 1;
+          if (dx * dx + dz * dz < reach * reach) {
+            if (pops === NO_POPS) pops = [];
+            pops.push(popOne(b, boat.id));
+            break;
+          }
+        }
+      }
+      return pops;
+    },
+    pop(targetId, boatId) {
+      const b = items[targetId];
+      return b && b.alive ? popOne(b, boatId) : null;
+    },
+    dispose() {
+      for (const b of items) scene.remove(b.mesh);
+      geometry.dispose();
+      for (const m of materials.values()) m.dispose();
+      items.length = 0;
+    },
+  };
 }
 
 // ───────────────────────────── a plain box boat ─────────────────────────────
@@ -225,6 +383,8 @@ class FallbackBoat implements Boat {
   readonly name: string;
   readonly color: number;
   readonly isHuman: boolean;
+  readonly team: number;
+  readonly easyDriving: boolean;
   private readonly hull: THREE.Mesh;
 
   constructor(init: BoatInit) {
@@ -232,6 +392,8 @@ class FallbackBoat implements Boat {
     this.name = init.name;
     this.color = init.color;
     this.isHuman = init.isHuman;
+    this.team = init.team;
+    this.easyDriving = init.easyDriving;
     this.heading = init.spawn.heading;
     this.hull = new THREE.Mesh(
       new THREE.BoxGeometry(2, 0.9, 4.5),
@@ -275,6 +437,9 @@ class FallbackBoat implements Boat {
     this.object.position.copy(this.position);
     this.object.rotation.y = this.heading;
   }
+
+  /** Rescue: the same as a respawn here (the stand-in has no ammo or power-ups to keep). */
+  teleport(spot: SpawnPoint): void { this.respawn(spot); }
 
   dispose(): void {
     this.object.removeFromParent();

@@ -4,6 +4,7 @@
  */
 export { createWorld } from '../world/world';
 export { createPickups } from '../world/pickups';
+export { createBalloons } from '../world/balloons';
 export { createBoat, resolveBoatCollisions } from '../entities/boat';
 export { createDartSystem } from '../combat/darts';
 export { createEffects } from '../fx/effects';
@@ -12,3 +13,4 @@ export { createBotController } from '../ai/bot';
 export { createHud } from '../ui/hud';
 export { createMenu } from '../ui/menu';
 export { createSfx } from '../audio/sfx';
+export { awardTrophies } from '../ui/trophies';

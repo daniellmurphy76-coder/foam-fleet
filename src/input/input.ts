@@ -8,21 +8,33 @@
  *                   which pad belong to which player, fresh every frame (so you can plug
  *                   in a pad in the middle of a match).
  *   4. MENU       - one-frame "button went down" flags for the menus and pause screen.
+ *   5. ASSIST     - for Easy Driving boats the human controller also runs assist.ts
+ *                   (auto-cruise and bumper rails) on top of what the player pressed.
+ *
+ * Buttons:  layout A = W/S/A/D, Space fire, Left Shift boost, R rescue, Q honk.
+ *           layout B = arrows, Enter fire, Right Shift boost, / rescue, ' (quote) honk.
+ *           pad      = stick/RT/LT drive, A or RB fire, B or LB boost, Y rescue, X honk.
+ * Rescue and honk are plain "held" flags; the game core acts on the moment they go down.
  *
  * Steering convention (from types.ts): steer +1 = turn RIGHT. Right on a stick, D, or the
  * Right Arrow is therefore +1.
  */
 import type { BoatControls, Controller, ControllerContext, InputManager, MenuInput } from '../types';
+import { EasyAssist } from './assist';
 
 // ───────────────────────────── Tunables ─────────────────────────────
 
 /** Keyboard steering takes this long to ramp from 0 to full lock (and back). */
 const KEY_STEER_RAMP_SEC = 0.12;
+/** Easy Driving boats get a lazier ramp, so a mashed key is a gentle turn instead of a twitch. */
+const EASY_STEER_RAMP_SEC = 0.22;
 /** Flipping straight from left to right ramps this many times faster, so it feels snappy. */
 const KEY_STEER_FLIP_BOOST = 2;
 /** Ignore tiny stick wobble; everything past this is rescaled so it still reaches 1. */
 const STICK_DEADZONE = 0.15;
 const TRIGGER_DEADZONE = 0.05;
+/** A stick counts as "pushed" for the purpose of "which device is this player using?" past this. */
+const STICK_ACTIVE = 0.5;
 /** A stick counts as "pushed" in a menu past ON, and stays pushed until it drops below OFF. */
 const STICK_MENU_ON = 0.6;
 const STICK_MENU_OFF = 0.35;
@@ -53,25 +65,34 @@ const DIR_BITS: readonly number[] = [M_UP, M_DOWN, M_LEFT, M_RIGHT];
 
 // ───────────────────────────── Keyboard table ─────────────────────────────
 
-/** Every key we care about (KeyboardEvent.code) and which menu buttons it presses. */
-const KEY_TABLE: ReadonlyArray<readonly [code: string, menuBits: number]> = [
-  ['KeyW', M_UP],
-  ['KeyS', M_DOWN],
-  ['KeyA', M_LEFT],
-  ['KeyD', M_RIGHT],
-  ['Space', M_CONFIRM],
-  ['ShiftLeft', 0],
-  ['ArrowUp', M_UP],
-  ['ArrowDown', M_DOWN],
-  ['ArrowLeft', M_LEFT],
-  ['ArrowRight', M_RIGHT],
-  ['Enter', M_CONFIRM],
-  ['ShiftRight', 0],
-  ['NumpadEnter', M_CONFIRM],
-  ['Escape', M_BACK | M_PAUSE],
-  ['Backspace', M_BACK],
-  ['KeyP', M_PAUSE],
-  ['KeyM', M_MUTE],
+/** Which player layout a key belongs to (for "what is this player driving with?"). */
+const G_NONE = 0;
+const G_A = 1;
+const G_B = 2;
+
+/** Every key we care about (KeyboardEvent.code), which menu buttons it presses, and its layout. */
+const KEY_TABLE: ReadonlyArray<readonly [code: string, menuBits: number, group: number]> = [
+  ['KeyW', M_UP, G_A],
+  ['KeyS', M_DOWN, G_A],
+  ['KeyA', M_LEFT, G_A],
+  ['KeyD', M_RIGHT, G_A],
+  ['Space', M_CONFIRM, G_A],
+  ['ShiftLeft', 0, G_A],
+  ['KeyR', 0, G_A],
+  ['KeyQ', 0, G_A],
+  ['ArrowUp', M_UP, G_B],
+  ['ArrowDown', M_DOWN, G_B],
+  ['ArrowLeft', M_LEFT, G_B],
+  ['ArrowRight', M_RIGHT, G_B],
+  ['Enter', M_CONFIRM, G_B],
+  ['ShiftRight', 0, G_B],
+  ['Slash', 0, G_B],
+  ['Quote', 0, G_B],
+  ['NumpadEnter', M_CONFIRM, G_B],
+  ['Escape', M_BACK | M_PAUSE, G_NONE],
+  ['Backspace', M_BACK, G_NONE],
+  ['KeyP', M_PAUSE, G_NONE],
+  ['KeyM', M_MUTE, G_NONE],
 ];
 
 function keyIndex(code: string): number {
@@ -84,12 +105,16 @@ const K_A = keyIndex('KeyA');
 const K_D = keyIndex('KeyD');
 const K_SPACE = keyIndex('Space');
 const K_LSHIFT = keyIndex('ShiftLeft');
+const K_R = keyIndex('KeyR');
+const K_Q = keyIndex('KeyQ');
 const K_UP = keyIndex('ArrowUp');
 const K_DOWN = keyIndex('ArrowDown');
 const K_LEFT = keyIndex('ArrowLeft');
 const K_RIGHT = keyIndex('ArrowRight');
 const K_ENTER = keyIndex('Enter');
 const K_RSHIFT = keyIndex('ShiftRight');
+const K_SLASH = keyIndex('Slash');
+const K_QUOTE = keyIndex('Quote');
 const K_NUMENTER = keyIndex('NumpadEnter');
 const K_ESCAPE = keyIndex('Escape');
 
@@ -102,10 +127,22 @@ interface Scheme {
   fire: number;
   fireAlt: number;
   boost: number;
+  rescue: number;
+  honk: number;
 }
 
-const SCHEME_A: Scheme = { up: K_W, down: K_S, left: K_A, right: K_D, fire: K_SPACE, fireAlt: -1, boost: K_LSHIFT };
-const SCHEME_B: Scheme = { up: K_UP, down: K_DOWN, left: K_LEFT, right: K_RIGHT, fire: K_ENTER, fireAlt: K_NUMENTER, boost: K_RSHIFT };
+const SCHEME_A: Scheme = { up: K_W, down: K_S, left: K_A, right: K_D, fire: K_SPACE, fireAlt: -1, boost: K_LSHIFT, rescue: K_R, honk: K_Q };
+const SCHEME_B: Scheme = {
+  up: K_UP,
+  down: K_DOWN,
+  left: K_LEFT,
+  right: K_RIGHT,
+  fire: K_ENTER,
+  fireAlt: K_NUMENTER,
+  boost: K_RSHIFT,
+  rescue: K_SLASH,
+  honk: K_QUOTE,
+};
 
 // ───────────────────────────── Small helpers ─────────────────────────────
 
@@ -147,6 +184,8 @@ interface PadSnapshot {
   throttle: number;
   fire: boolean;
   boost: boolean;
+  rescue: boolean;
+  honk: boolean;
 }
 
 /** Remembers what a pad's menu buttons did last frame so we can spot the moment they go down. */
@@ -160,6 +199,7 @@ interface PadMenuMemory {
 const PAD_A = 0;
 const PAD_B = 1;
 const PAD_X = 2;
+const PAD_Y = 3;
 const PAD_LB = 4;
 const PAD_RB = 5;
 const PAD_LT = 6;
@@ -189,6 +229,13 @@ function padAxis(gp: Gamepad, i: number): number {
   return v === undefined || Number.isNaN(v) ? 0 : v;
 }
 
+/** Is anything on this pad being pressed or pushed right now? (Used to tell which device a player is using.) */
+function padTouched(gp: Gamepad, rawX: number, rawY: number): boolean {
+  if (Math.abs(rawX) > STICK_ACTIVE || Math.abs(rawY) > STICK_ACTIVE) return true;
+  for (let i = 0; i < gp.buttons.length; i++) if (gp.buttons[i].pressed) return true;
+  return false;
+}
+
 /** Skip odd devices that show up as "gamepads" (some mice, headsets) but have no real controls. */
 function looksLikeGamepad(gp: Gamepad): boolean {
   return gp.connected && gp.buttons.length >= 4 && gp.axes.length >= 2;
@@ -207,15 +254,18 @@ export function createInput(target: Window): InputManager {
   const keyByCode = new Map<string, number>();
   KEY_TABLE.forEach((row, i) => keyByCode.set(row[0], i));
   let pendingMenu = 0; // menu buttons pressed since the last poll()
+  // When each keyboard layout (G_A, G_B) was last touched, for schemeOf(). -1 = never.
+  const keyActiveAt = new Float64Array(3).fill(-1);
 
   // ---- gamepad state (rebuilt every poll) ----
   let padCount = 0;
   const pads: PadSnapshot[] = [];
   const padMemory: PadMenuMemory[] = [];
   for (let i = 0; i < MAX_PADS; i++) {
-    pads.push({ steer: 0, throttle: 0, fire: false, boost: false });
+    pads.push({ steer: 0, throttle: 0, fire: false, boost: false, rescue: false, honk: false });
     padMemory.push({ buttons: 0, dirHeld: new Uint8Array(4), dirNextAt: new Float64Array(4) });
   }
+  const padActiveAt = new Float64Array(MAX_PADS).fill(-1); // when each pad was last touched
   const dirAsserted = new Uint8Array(4); // scratch, reused every frame
 
   // ---- what the game reads ----
@@ -249,6 +299,8 @@ export function createInput(target: Window): InputManager {
     if (typing) return;
     held[i] = 1;
     if (!e.repeat) tapped[i] = TAP_LIFE_POLLS;
+    const group = KEY_TABLE[i][2];
+    if (group !== G_NONE) keyActiveAt[group] = clock.now();
   }
 
   function onKeyUp(e: KeyboardEvent): void {
@@ -272,6 +324,7 @@ export function createInput(target: Window): InputManager {
   target.addEventListener('keydown', onKeyDown, true);
   target.addEventListener('keyup', onKeyUp, true);
   target.addEventListener('blur', onBlur);
+
   doc.addEventListener('visibilitychange', onVisibility);
 
   /** Is this key down right now (or tapped since last time)? Reading a tap uses it up. */
@@ -304,7 +357,10 @@ export function createInput(target: Window): InputManager {
     const rawY = padAxis(gp, 1);
 
     // --- driving ---
+    // Squared response: gentle near the center for fine control, still full lock at the edge.
+    // (The d-pad is digital, so it skips the curve and always means full lock.)
     let steer = deadzone(rawX, STICK_DEADZONE);
+    steer *= Math.abs(steer);
     const dpadSteer = (padButton(gp, PAD_DPAD_RIGHT) ? 1 : 0) - (padButton(gp, PAD_DPAD_LEFT) ? 1 : 0);
     steer = biggest(steer, dpadSteer);
 
@@ -316,7 +372,10 @@ export function createInput(target: Window): InputManager {
     snap.steer = steer;
     snap.throttle = clamp(throttle, -1, 1);
     snap.fire = padButton(gp, PAD_A) || padButton(gp, PAD_RB);
-    snap.boost = padButton(gp, PAD_B) || padButton(gp, PAD_X) || padButton(gp, PAD_LB);
+    snap.boost = padButton(gp, PAD_B) || padButton(gp, PAD_LB);
+    snap.rescue = padButton(gp, PAD_Y);
+    snap.honk = padButton(gp, PAD_X);
+    if (padTouched(gp, rawX, rawY)) padActiveAt[n] = now;
 
     // --- menus: A/B/Start/Back fire once per press ---
     let bits = 0;
@@ -361,6 +420,9 @@ export function createInput(target: Window): InputManager {
     snap.throttle = 0;
     snap.fire = false;
     snap.boost = false;
+    snap.rescue = false;
+    snap.honk = false;
+    padActiveAt[n] = -1;
     const mem = padMemory[n];
     mem.buttons = 0;
     mem.dirHeld.fill(0);
@@ -425,14 +487,15 @@ export function createInput(target: Window): InputManager {
 
   const controllers: Controller[] = [];
   function makeHumanController(slot: 0 | 1, humans: 1 | 2): Controller {
-    const out: BoatControls = { throttle: 0, steer: 0, fire: false, boost: false };
+    const out: BoatControls = { throttle: 0, steer: 0, fire: false, boost: false, rescue: false, honk: false };
     const asg: Assignment = { useA: false, useB: false, padFrom: 0, padTo: 0 };
+    const assist = new EasyAssist();
     let rampA = 0; // smoothed keyboard steer per layout
     let rampB = 0;
 
-    /** Move `current` toward the key target at KEY_STEER_RAMP_SEC per full swing. */
-    function ramp(current: number, wanted: number, dt: number): number {
-      let rate = 1 / KEY_STEER_RAMP_SEC;
+    /** Move `current` toward the key target, taking `seconds` for a full swing from 0 to lock. */
+    function ramp(current: number, wanted: number, dt: number, seconds: number): number {
+      let rate = 1 / seconds;
       if (wanted * current < 0) rate *= KEY_STEER_FLIP_BOOST;
       const step = rate * dt;
       if (wanted > current) return Math.min(wanted, current + step);
@@ -441,28 +504,36 @@ export function createInput(target: Window): InputManager {
 
     return {
       kind: 'human',
-      update(_ctx: ControllerContext, dt: number): BoatControls {
+      update(ctx: ControllerContext, dt: number): BoatControls {
         resolveSlot(slot, humans, padCount, asg);
+        const easy = ctx.self.easyDriving;
+        const rampSec = easy ? EASY_STEER_RAMP_SEC : KEY_STEER_RAMP_SEC;
         let steer = 0;
         let throttle = 0;
         let fire = false;
         let boost = false;
+        let rescue = false;
+        let honk = false;
 
         if (asg.useA) {
-          rampA = ramp(rampA, keyAxis(SCHEME_A.right, SCHEME_A.left), dt);
+          rampA = ramp(rampA, keyAxis(SCHEME_A.right, SCHEME_A.left), dt, rampSec);
           steer = biggest(steer, rampA);
           throttle = biggest(throttle, keyAxis(SCHEME_A.up, SCHEME_A.down));
           fire = fire || keyDown(SCHEME_A.fire);
           boost = boost || keyDown(SCHEME_A.boost);
+          rescue = rescue || keyDown(SCHEME_A.rescue);
+          honk = honk || keyDown(SCHEME_A.honk);
         } else {
           rampA = 0;
         }
         if (asg.useB) {
-          rampB = ramp(rampB, keyAxis(SCHEME_B.right, SCHEME_B.left), dt);
+          rampB = ramp(rampB, keyAxis(SCHEME_B.right, SCHEME_B.left), dt, rampSec);
           steer = biggest(steer, rampB);
           throttle = biggest(throttle, keyAxis(SCHEME_B.up, SCHEME_B.down));
           fire = fire || keyDown(SCHEME_B.fire) || keyDown(SCHEME_B.fireAlt);
           boost = boost || keyDown(SCHEME_B.boost);
+          rescue = rescue || keyDown(SCHEME_B.rescue);
+          honk = honk || keyDown(SCHEME_B.honk);
         } else {
           rampB = 0;
         }
@@ -472,12 +543,28 @@ export function createInput(target: Window): InputManager {
           throttle = biggest(throttle, p.throttle);
           fire = fire || p.fire;
           boost = boost || p.boost;
+          rescue = rescue || p.rescue;
+          honk = honk || p.honk;
         }
 
-        out.steer = clamp(steer, -1, 1);
-        out.throttle = clamp(throttle, -1, 1);
+        steer = clamp(steer, -1, 1);
+        throttle = clamp(throttle, -1, 1);
+        if (easy) {
+          // Auto-cruise + bumper rails sit on top of whatever the player asked for.
+          assist.update(ctx.self, ctx.world, steer, throttle, dt);
+          steer = assist.steer;
+          throttle = assist.throttle;
+          if (assist.braking) boost = false; // no rocket start right at a shoreline
+        } else {
+          assist.reset();
+        }
+
+        out.steer = steer;
+        out.throttle = throttle;
         out.fire = fire;
         out.boost = boost;
+        out.rescue = rescue;
+        out.honk = honk;
         return out;
       },
     };
@@ -516,6 +603,7 @@ export function createInput(target: Window): InputManager {
   // ───────────── the public object ─────────────
 
   const rumbleAsg: Assignment = { useA: false, useB: false, padFrom: 0, padTo: 0 };
+  const schemeAsg: Assignment = { useA: false, useB: false, padFrom: 0, padTo: 0 };
 
   return {
     menu,
@@ -546,6 +634,32 @@ export function createInput(target: Window): InputManager {
         controllers[key] = c;
       }
       return c;
+    },
+
+    schemeOf(slot: 0 | 1, humans: 1 | 2): 'keysA' | 'keysB' | 'gamepad' {
+      // Whichever device this player touched most recently, out of the ones they own right now.
+      resolveSlot(slot, humans, padCount, schemeAsg);
+      let bestAt = -1;
+      let best: 'keysA' | 'keysB' | 'gamepad' | null = null;
+      if (schemeAsg.useA && keyActiveAt[G_A] > bestAt) {
+        bestAt = keyActiveAt[G_A];
+        best = 'keysA';
+      }
+      if (schemeAsg.useB && keyActiveAt[G_B] > bestAt) {
+        bestAt = keyActiveAt[G_B];
+        best = 'keysB';
+      }
+      for (let n = schemeAsg.padFrom; n < schemeAsg.padTo; n++) {
+        if (padActiveAt[n] > bestAt) {
+          bestAt = padActiveAt[n];
+          best = 'gamepad';
+        }
+      }
+      if (best !== null) return best;
+      // Nothing touched yet. Browsers only show a pad after a button press, so a pad that is
+      // here is a pad somebody is holding; otherwise fall back to this slot's keyboard layout.
+      if (schemeAsg.padTo > schemeAsg.padFrom) return 'gamepad';
+      return schemeAsg.useB && !schemeAsg.useA ? 'keysB' : 'keysA';
     },
 
     gamepadCount(): number {
@@ -582,10 +696,13 @@ export function createInput(target: Window): InputManager {
       target.removeEventListener('keydown', onKeyDown, true);
       target.removeEventListener('keyup', onKeyUp, true);
       target.removeEventListener('blur', onBlur);
+
       doc.removeEventListener('visibilitychange', onVisibility);
       clearKeys();
       pendingMenu = 0;
       padCount = 0;
+      keyActiveAt.fill(-1);
+      padActiveAt.fill(-1);
       controllers.length = 0;
       menu.up = menu.down = menu.left = menu.right = false;
       menu.confirm = menu.back = menu.pause = menu.mute = false;

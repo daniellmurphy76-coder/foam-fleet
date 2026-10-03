@@ -86,6 +86,39 @@ export const CONFIG = {
     finishGraceSec: 60,
   },
 
+  easyDriving: {
+    /** Easy Driving top speed compared to normal (0.8 = 80%). */
+    speedScale: 0.8,
+    /** How much gentler Easy Driving steering is (0.65 = 65% of normal turning). */
+    turnScale: 0.65,
+    /** How fast the boat cruises by itself when you aren't pressing go (0 to 1). */
+    cruiseThrottle: 0.7,
+    /** How hard darts push an Easy Driving boat (0.4 = 40% of normal). */
+    knockbackScale: 0.4,
+    /** Bumper rails: how strongly the boat steers itself away from islands (0 to 1). */
+    bumperStrength: 0.7,
+    /** Stuck for this many seconds? The boat rescues itself. */
+    autoRescueSec: 2.5,
+  },
+
+  rescue: {
+    /** Seconds before you can use the rescue button again. */
+    cooldownSec: 3,
+  },
+
+  team: {
+    /** Team Up team names: the players' team first. */
+    names: ['Splash Squad', 'Pirate Pals'],
+    colors: [0x0a84ff, 0xff3b30],
+  },
+
+  practice: {
+    /** How many balloons float around the lagoon in Balloon Pop. */
+    balloons: 30,
+    /** Every this-many-th balloon is gold and worth 3 points. */
+    goldEvery: 5,
+  },
+
   bots: {
     /**
      * How wobbly the computer boats' aim is, in degrees. Bigger = they miss more.
@@ -106,6 +139,8 @@ export const CONFIG = {
     height: 4.5,
     lookAhead: 7,
     fov: 65,
+    /** Easy Driving camera: higher and farther back so you can see more. */
+    easy: { distance: 13, height: 6.5, lookAhead: 9 },
   },
 
   /** Boat paint colors to pick from. */

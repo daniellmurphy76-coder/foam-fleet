@@ -6,7 +6,7 @@ import * as THREE from 'three';
 import { CONFIG } from '../config';
 import type { Boat, Viewport, WorldQuery } from '../types';
 import { reportError } from './debug';
-import { clamp, damp, dampAngle } from './util';
+import { clamp, damp, dampAngle, topSpeedOf } from './util';
 
 const NEAR = 0.4;
 /** Far enough for any sky dome the world builds. */
@@ -51,10 +51,19 @@ function keepClear(cam: THREE.Camera, world: WorldQuery, t: number): void {
   }
 }
 
+/** How fast the camera swings around behind the boat (bigger = snappier). Easy Driving is gentler. */
+const YAW_FOLLOW = 5;
+const YAW_FOLLOW_EASY = 3;
+
 export class ChaseCamera {
   readonly camera = new THREE.PerspectiveCamera(CONFIG.camera.fov, 16 / 9, NEAR, FAR);
-  /** The direction the camera faces, as a heading. The HUD arrow is measured from this. */
+  /** The direction the camera faces, as a heading. The HUD arrow and the mini-map are measured from this. */
   viewHeading = 0;
+
+  /** Easy Driving players get a higher, farther-back camera that follows turns more smoothly. */
+  private readonly view: { distance: number; height: number; lookAhead: number };
+  private readonly yawFollow: number;
+  private readonly topSpeed: number;
 
   private heading = 0; // smoothed heading the camera swings around to
   private readonly pos = new THREE.Vector3(); // smoothed camera position
@@ -64,6 +73,12 @@ export class ChaseCamera {
   private trauma = 0; // screen shake, 0..1
   private kickAmt = 0; // brief push-back when firing
   private shakeClock = 0;
+
+  constructor(easyDriving = false) {
+    this.view = easyDriving ? CONFIG.camera.easy : CONFIG.camera;
+    this.yawFollow = easyDriving ? YAW_FOLLOW_EASY : YAW_FOLLOW;
+    this.topSpeed = topSpeedOf(easyDriving);
+  }
 
   setAspect(aspect: number): void {
     this.camera.aspect = aspect > 0 ? aspect : 1;
@@ -82,10 +97,10 @@ export class ChaseCamera {
 
   /** Jump straight to the right spot behind the boat (no smoothing). */
   snap(boat: Boat, world: WorldQuery, t: number): void {
-    const cfg = CONFIG.camera;
+    const cfg = this.view;
     this.heading = boat.heading;
     this.boostK = 0;
-    this.fov = cfg.fov;
+    this.fov = CONFIG.camera.fov;
     this.trauma = 0;
     this.kickAmt = 0;
     const sin = Math.sin(this.heading);
@@ -100,11 +115,11 @@ export class ChaseCamera {
   update(dt: number, boat: Boat, world: WorldQuery, t: number): void {
     const bp = boat.position;
     if (!Number.isFinite(bp.x + bp.y + bp.z)) return; // a broken boat must not blank the screen
-    const cfg = CONFIG.camera;
+    const cfg = this.view;
 
-    const speed01 = clamp(Math.abs(boat.speed) / CONFIG.boat.maxSpeed, 0, 1);
+    const speed01 = clamp(Math.abs(boat.speed) / this.topSpeed, 0, 1);
     this.boostK = damp(this.boostK, boat.boosting ? 1 : 0, 6, dt);
-    this.heading = dampAngle(this.heading, boat.heading, 5, dt);
+    this.heading = dampAngle(this.heading, boat.heading, this.yawFollow, dt);
 
     // A touch further back when going fast.
     const dist = cfg.distance + 1.5 * speed01 + this.boostK;
@@ -118,7 +133,7 @@ export class ChaseCamera {
     this.look.z = damp(this.look.z, bp.z + cos * cfg.lookAhead, 12, dt);
 
     // Wider field of view = more speed. Boost adds a lot more.
-    const targetFov = cfg.fov + 6 * speed01 + 8 * this.boostK;
+    const targetFov = CONFIG.camera.fov + 6 * speed01 + 8 * this.boostK;
     this.fov = damp(this.fov, targetFov, 5, dt);
     this.apply(dt, world, t);
   }

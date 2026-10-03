@@ -1,27 +1,32 @@
 /**
  * Dart Battle: tag the other boats with foam darts. Most tags when the clock hits zero wins.
  * Ties are broken by who got tagged fewer times.
+ *
+ * Team Up (team.ts) builds on this: same clock, same scoring, but the team score decides the winner.
  */
 import type * as THREE from 'three';
 import { CONFIG } from '../../config';
-import type { Boat, MatchResult, RaceHudInfo, ResultRow } from '../../types';
-import type { GameMode, GateTargets, ModeHost } from './mode';
+import type { Boat, Checkpoint, ModeId, RaceHudInfo, ResultRow, TeamScore } from '../../types';
+import type { GameMode, GateTargets, ModeHost, ModeOutcome, ModeResult } from './mode';
+
+const NO_GATES: readonly Checkpoint[] = [];
 
 export class BattleMode implements GameMode {
-  readonly id = 'battle' as const;
+  readonly id: ModeId = 'battle';
   readonly stunSeconds = CONFIG.battle.stunSeconds;
   readonly ranking: Boat[];
+  readonly gateList = NO_GATES;
   over = false;
 
-  private elapsed = 0;
-  private readonly duration: number;
-  private readonly score: number[];
-  private readonly hitsTaken: number[];
+  protected elapsed = 0;
+  protected readonly duration: number;
+  protected readonly score: number[];
+  protected readonly hitsTaken: number[];
   private readonly rank: number[];
   private warned30 = false;
   private lastBeep = -1;
 
-  constructor(private readonly host: ModeHost) {
+  constructor(protected readonly host: ModeHost) {
     const n = host.boats.length;
     this.duration = Math.max(5, host.setup.durationSec || CONFIG.battle.durationSec);
     this.score = new Array<number>(n).fill(0);
@@ -63,11 +68,14 @@ export class BattleMode implements GameMode {
     this.resort();
   }
 
+  onBalloon(): void {}
+
   gates(_boatId: number, out: GateTargets): void {
     out.next = null;
     out.following = null;
   }
   gatePosition(): THREE.Vector3 | null { return null; }
+  nextGate(): number | null { return null; }
   isFinished(): boolean { return false; }
 
   timeLeft(): number { return Math.max(0, this.duration - this.elapsed); }
@@ -75,21 +83,41 @@ export class BattleMode implements GameMode {
   scoreOf(boatId: number): number { return this.score[boatId] ?? 0; }
   rankOf(boatId: number): number { return this.rank[boatId] || 1; }
   raceInfo(): RaceHudInfo | null { return null; }
+  teams(): TeamScore[] | null { return null; }
+  balloonCount(): { remaining: number; total: number } | null { return null; }
 
-  result(): MatchResult {
-    const rows: ResultRow[] = this.ranking.map((b, i) => {
+  outcome(boatId: number): ModeOutcome {
+    return { won: !this.isTied() && this.ranking[0]?.id === boatId, finished: false, finishTime: null };
+  }
+
+  result(): ModeResult {
+    const first = this.ranking[0];
+    return {
+      mode: this.id,
+      rows: this.rows(),
+      title: this.isTied() ? "It's a tie!" : `${first.name} wins!`,
+      teams: null,
+    };
+  }
+
+  /** The results table, best first. */
+  protected rows(): ResultRow[] {
+    return this.ranking.map((b, i) => {
       const s = this.score[b.id];
       return {
-        id: b.id, name: b.name, color: b.color, score: s, isHuman: b.isHuman,
+        id: b.id, name: b.name, color: b.color, score: s, isHuman: b.isHuman, team: b.team,
         place: i + 1, detail: `${s} ${s === 1 ? 'hit' : 'hits'}`,
       };
     });
+  }
+
+  /** Dead level with second place on both hits and hits taken. */
+  private isTied(): boolean {
     const first = this.ranking[0];
     const second = this.ranking[1];
-    const tied = second !== undefined
+    return second !== undefined
       && this.score[first.id] === this.score[second.id]
       && this.hitsTaken[first.id] === this.hitsTaken[second.id];
-    return { mode: 'battle', rows, title: tied ? "It's a tie!" : `${first.name} wins!` };
   }
 
   /** Most hits first; fewer hits taken breaks a tie; boat id keeps the order steady. */

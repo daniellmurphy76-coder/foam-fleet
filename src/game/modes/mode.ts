@@ -1,9 +1,11 @@
 /**
- * The small interface every game mode (Dart Battle, Buoy Race) implements.
+ * The small interface every game mode (Dart Battle, Buoy Race, Team Up, Balloon Pop) implements.
  * The Match calls these hooks; the mode decides what counts as scoring and winning.
  */
 import type * as THREE from 'three';
-import type { Boat, Checkpoint, Hud, MatchResult, MatchSetup, ModeId, RaceHudInfo, Sfx, World } from '../../types';
+import type {
+  Balloons, BalloonPop, Boat, Checkpoint, Hud, MatchResult, MatchSetup, ModeId, RaceHudInfo, Sfx, TeamScore, World,
+} from '../../types';
 
 /** What a mode needs to know about the match it lives in. */
 export interface ModeHost {
@@ -13,6 +15,8 @@ export interface ModeHost {
   readonly world: World;
   readonly hud: Hud;
   readonly sfx: Sfx;
+  /** Balloon Pop's balloons; null in every other mode. */
+  readonly balloons: Balloons | null;
   /** Which human viewport a boat belongs to (0 or 1), or -1 for a computer boat. */
   slotOf(boatId: number): number;
 }
@@ -23,6 +27,19 @@ export interface GateTargets {
   following: Checkpoint | null;
 }
 
+/** How one boat did, for trophies. Only asked for once the match is over. */
+export interface ModeOutcome {
+  /** Won the match (Team Up: their team won; Balloon Pop: popped the most, or the only player). */
+  won: boolean;
+  /** Race: crossed the finish line. Balloon Pop: every balloon got popped. */
+  finished: boolean;
+  /** Race / Balloon Pop: seconds it took, else null. */
+  finishTime: number | null;
+}
+
+/** A mode's result; the Match adds the per-player stats and trophy awards on top. */
+export type ModeResult = Omit<MatchResult, 'stats' | 'awards'>;
+
 export interface GameMode {
   readonly id: ModeId;
   /** How long a boat is wobbly after a dart hit in this mode. */
@@ -31,6 +48,8 @@ export interface GameMode {
   readonly over: boolean;
   /** All boats, best first. Updated as the match goes on. */
   readonly ranking: readonly Boat[];
+  /** Race: the gates, in order, for the mini-map. Empty in every other mode. */
+  readonly gateList: readonly Checkpoint[];
 
   /** "GO!" just happened: start the clock. */
   begin(): void;
@@ -38,11 +57,15 @@ export interface GameMode {
   update(dt: number): void;
   /** A dart tagged `target` (shield did not block it). */
   onTag(shooter: Boat, target: Boat): void;
+  /** Balloon Pop: a balloon popped (by a dart or by ramming). */
+  onBalloon(pop: BalloonPop): void;
 
   /** Race: which gates this boat should aim for. Battle: both null. */
   gates(boatId: number, out: GateTargets): void;
   /** Race: where the HUD arrow should point for this boat (null in battle or once finished). */
   gatePosition(boatId: number): THREE.Vector3 | null;
+  /** Race: index into gateList of this boat's next gate (null in other modes or once finished). */
+  nextGate(boatId: number): number | null;
   /** Race: finished boats stop being driven by their controller. */
   isFinished(boatId: number): boolean;
 
@@ -52,6 +75,12 @@ export interface GameMode {
   /** 1-based placement. */
   rankOf(boatId: number): number;
   raceInfo(boatId: number): RaceHudInfo | null;
+  /** Team Up: both teams, the humans' team first. null otherwise. */
+  teams(): TeamScore[] | null;
+  /** Balloon Pop: balloons left. null otherwise. */
+  balloonCount(): { remaining: number; total: number } | null;
 
-  result(): MatchResult;
+  /** Only meaningful once `over`. */
+  outcome(boatId: number): ModeOutcome;
+  result(): ModeResult;
 }

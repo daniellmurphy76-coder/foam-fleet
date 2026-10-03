@@ -11,8 +11,21 @@ import { foam, reportError } from './debug';
 type AnyFn = (this: unknown, ...args: unknown[]) => unknown;
 
 /**
+ * The methods v2 added to each service. If a module has not caught up yet, guard() hands out a
+ * do-nothing stand-in for them (and logs it once) instead of letting `service.method is not a function`
+ * knock a whole simulation step over.
+ */
+export const V2_METHODS = {
+  sfx: ['pop', 'honk', 'rescue', 'trophy'],
+  fx: ['pop', 'notes'],
+  hud: ['hint'],
+  input: ['schemeOf'],
+} as const;
+
+/**
  * Wrap an object so that calling any of its methods can never throw. `safeReturns`
  * says what to hand back for methods that return something (default: undefined).
+ * `required` lists methods that must exist: a missing one becomes a logged no-op.
  *
  * Only used for services whose methods return nothing important (sound, effects,
  * HUD, menu, input). Hot objects like boats and the world are NOT proxied, because
@@ -22,8 +35,10 @@ export function guard<T extends object>(
   label: string,
   target: T,
   safeReturns: Record<string, () => unknown> = {},
+  required: readonly string[] = [],
 ): T {
   const cache = new Map<PropertyKey, { orig: unknown; wrapped: AnyFn }>();
+  const standIns = new Map<string, AnyFn>();
   return new Proxy(target, {
     get(obj, prop) {
       let value: unknown;
@@ -32,6 +47,15 @@ export function guard<T extends object>(
       } catch (e) {
         reportError(`${label}.${String(prop)}`, e);
         return safeReturns[String(prop)]?.();
+      }
+      if (value === undefined && typeof prop === 'string' && required.includes(prop)) {
+        let standIn = standIns.get(prop);
+        if (!standIn) {
+          reportError(`${label}.${prop}`, 'method is missing, using a do-nothing stand-in');
+          standIn = () => safeReturns[prop]?.();
+          standIns.set(prop, standIn);
+        }
+        return standIn;
       }
       if (typeof value !== 'function') return value;
       const hit = cache.get(prop);

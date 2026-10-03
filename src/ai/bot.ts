@@ -10,6 +10,9 @@
  *   4. GO       - pick throttle (ease off in corners) and boost.
  *   5. SHOOT    - fire when a boat is lined up with the nose.
  *
+ * Teams (Team Up): a bot never chases or shoots a teammate, holds its fire while a teammate is
+ * in the line of fire, and an ally prefers opponents that are close to its human buddy.
+ *
  * Difficulty and personality live in profile.ts. The math helpers are in steering.ts.
  *
  * Handy reminder (types.ts): steer +1 turns RIGHT, which DECREASES heading. All the sign
@@ -58,6 +61,38 @@ const RACE_PICKUP_CONE = 0.5; // radians either side of the line to the gate
 /** Race: if a bot spends this long within GATE_NEAR meters of a gate without passing it, it is circling. */
 const GATE_NEAR = 45;
 const GATE_LOST_SEC = 5;
+
+// ---- teams (Team Up) ----
+// `Boat.team` is the boat's own id in free-for-all modes, so "same team" never matches another
+// boat there and the rules below only bite in Team Up.
+/** Hold fire when a teammate is in the line of fire within this many meters. */
+const HOLD_FIRE_M = 25;
+/** A teammate is "in the way" if the darts would pass within its hit radius plus this much. */
+const HOLD_FIRE_LANE_PAD = 0.8;
+/** An ally weighs an opponent this much (x) when that opponent is right next to a human buddy... */
+const GUARD_FACTOR = 0.45;
+/** ...within GUARD_NEAR meters of the human; the pull fades out to nothing by GUARD_FAR meters. */
+const GUARD_NEAR = 15;
+const GUARD_FAR = 55;
+
+/** Distance from (x, z) to the nearest HUMAN teammate of `self` (not counting itself); Infinity if it has none. */
+function distToHumanBuddy(boats: readonly Boat[], self: Boat, x: number, z: number): number {
+  let best = Infinity;
+  for (let i = 0; i < boats.length; i++) {
+    const h = boats[i];
+    if (!h.isHuman || h.id === self.id || h.team !== self.team) continue;
+    const d = Math.hypot(h.position.x - x, h.position.z - z);
+    if (d < best) best = d;
+  }
+  return best;
+}
+
+/** Is the point (dx, dz), measured from the shooter, within `lane` meters of the ray (ux, uz) and 1..`reach` meters along it? */
+function inLane(dx: number, dz: number, ux: number, uz: number, reach: number, lane: number): boolean {
+  const ahead = dx * ux + dz * uz;
+  if (ahead <= 1 || ahead > reach) return false;
+  return Math.abs(dx * uz - dz * ux) <= lane;
+}
 
 /** A crate sitting on an island or rock can never be collected, so do not chase it. */
 function crateIsReachable(ctx: ControllerContext, x: number, z: number): boolean {
@@ -130,7 +165,8 @@ class Bot implements Controller {
   private readonly fireStop: number;
   private readonly fireRange: number;
 
-  private readonly out: BoatControls = { throttle: 0, steer: 0, fire: false, boost: false };
+  /** Bots never use the rescue or honk buttons (they get unstuck on their own). */
+  private readonly out: BoatControls = { throttle: 0, steer: 0, fire: false, boost: false, rescue: false, honk: false };
   private readonly avoid = new Avoider();
 
   private clock = 0;
@@ -234,9 +270,9 @@ class Bot implements Controller {
     const self = ctx.self;
     const sk = this.skill;
 
-    // Notice being tagged (the boat becomes "stunned"). Only battles care.
+    // Notice being tagged (the boat becomes "stunned"). Battles and Team Up care; in a race a hit is only a stun.
     const stunned = self.stunned;
-    if (stunned && !this.wasStunned && ctx.mode === 'battle') this.onTagged(self.heading);
+    if (stunned && !this.wasStunned && (ctx.mode === 'battle' || ctx.mode === 'team')) this.onTagged(self.heading);
     this.wasStunned = stunned;
 
     // Stuck on something? Reversing takes over everything until we are free.
@@ -394,11 +430,16 @@ class Bot implements Controller {
     for (let i = 0; i < boats.length; i++) {
       const b = boats[i];
       if (b.id === self.id) continue;
+      if (b.team === self.team) continue; // never chase a teammate
       // Nearest boat wins, with some randomness. Human boats are a slightly tastier target.
       // (ControllerContext has no scores, so "chase the leader" is not possible here.)
       let score = Math.hypot(b.position.x - px, b.position.z - pz) * (0.85 + 0.3 * this.rng());
       if (b.isHuman) score *= 0.88;
       if (b === this.target) score *= 0.8; // stick with the current target unless something is clearly better
+      // Team Up allies look after their human buddy: opponents hovering near the human look closer.
+      // (Always 1 for a bot with no human teammate.)
+      const guard = smoothstep(GUARD_NEAR, GUARD_FAR, distToHumanBuddy(boats, self, b.position.x, b.position.z));
+      score *= lerp(GUARD_FACTOR, 1, guard);
       // Spread out: every OTHER bot already chasing this boat makes it a less tempting target.
       score *= crowdPenalty(countChasers(chasers, self.id, b.id));
       if (score < bestScore) {
@@ -691,7 +732,7 @@ class Bot implements Controller {
     const boats = ctx.boats;
     for (let i = 0; i < boats.length; i++) {
       const b = boats[i];
-      if (b.id === self.id) continue;
+      if (b.id === self.id || b.team === self.team) continue; // teammates are friends, not targets
       const dx = b.position.x - px;
       const dz = b.position.z - pz;
       const ahead = dx * fx + dz * fz; // distance along the nose
@@ -710,6 +751,9 @@ class Bot implements Controller {
     // No darts left (and no Rapid Fire): do not hold the button down.
     if (fire && self.ammo <= 0 && !(self.powerUp !== null && self.powerUp.kind === 'rapid')) fire = false;
 
+    // A teammate right in the way? Hold your fire until they are clear.
+    if (fire && this.teammateInLine(ctx)) fire = false;
+
     // Easier bots shoot in short bursts with pauses in between.
     if (sk.burstOffMax > 0) {
       this.burstLeft -= dt;
@@ -724,6 +768,43 @@ class Bot implements Controller {
 
     this.firing = fire;
     return fire;
+  }
+
+  /**
+   * Is a teammate on the path the darts would take, within HOLD_FIRE_M? The darts fly toward the
+   * boat the blaster is locked onto, or straight ahead when nothing is locked. (Darts pass through
+   * teammates anyway; holding fire just looks and feels friendlier.) A teammate beyond the locked
+   * boat is not in the way, so the check only reaches as far as that boat.
+   */
+  private teammateInLine(ctx: ControllerContext): boolean {
+    const self = ctx.self;
+    const boats = ctx.boats;
+    const px = self.position.x;
+    const pz = self.position.z;
+    let ux = Math.sin(self.heading);
+    let uz = Math.cos(self.heading);
+    let reach = HOLD_FIRE_M;
+    if (self.aimTargetId !== null) {
+      for (let i = 0; i < boats.length; i++) {
+        const b = boats[i];
+        if (b.id !== self.aimTargetId) continue;
+        const dx = b.position.x - px;
+        const dz = b.position.z - pz;
+        const d = Math.hypot(dx, dz);
+        if (d > 1) {
+          ux = dx / d;
+          uz = dz / d;
+          reach = Math.min(reach, d);
+        }
+        break;
+      }
+    }
+    for (let i = 0; i < boats.length; i++) {
+      const b = boats[i];
+      if (b.id === self.id || b.team !== self.team) continue;
+      if (inLane(b.position.x - px, b.position.z - pz, ux, uz, reach, b.hitRadius + HOLD_FIRE_LANE_PAD)) return true;
+    }
+    return false;
   }
 
   // ───────────────────────────── Unstick ─────────────────────────────

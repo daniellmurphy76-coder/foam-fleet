@@ -1,4 +1,4 @@
-import type { Sfx } from '../types';
+import type { HornId, Sfx } from '../types';
 
 /**
  * Synthesized sound effects and music (Web Audio, no asset files).
@@ -68,10 +68,18 @@ interface ToneOpts {
   vol: number;
   attack?: number;
   lowpass?: number;
+  /**
+   * 0..1: stay at full volume for this share of the note before fading (horns need a steady "BEEEP";
+   * without it a note starts fading right away, like a plucked string).
+   */
+  hold?: number;
   /** Absolute audio-clock time; default is "right now". */
   when?: number;
   bus?: AudioNode;
 }
+
+/** The shortest gap between two honks of the same horn (the long foghorn can't be spammed). */
+const HORN_GAP: Record<HornId, number> = { beep: 0.12, duck: 0.2, foghorn: 0.5, clown: 0.25 };
 
 interface NoiseOpts {
   dur: number;
@@ -130,8 +138,10 @@ export function createSfx(): Sfx {
       osc.frequency.exponentialRampToValueAtTime(Math.max(1, o.f1), t0 + o.dur);
     }
     const amp = ctx.createGain();
+    const attack = o.attack ?? 0.006;
     amp.gain.setValueAtTime(0.0001, t0);
-    amp.gain.linearRampToValueAtTime(Math.max(0.0002, o.vol), t0 + (o.attack ?? 0.006));
+    amp.gain.linearRampToValueAtTime(Math.max(0.0002, o.vol), t0 + attack);
+    if (o.hold) amp.gain.setValueAtTime(Math.max(0.0002, o.vol), t0 + Math.max(attack, o.dur * o.hold));
     amp.gain.exponentialRampToValueAtTime(0.0001, t0 + o.dur);
     let filter: BiquadFilterNode | null = null;
     if (o.lowpass) {
@@ -327,6 +337,96 @@ export function createSfx(): Sfx {
     for (const f of [523.25, 659.25, 783.99]) {
       tone(a, { type: 'triangle', f0: f, dur: 0.95, vol: 0.1, attack: 0.02, when: t + 1.1 });
     }
+  }
+
+  // Balloon "pop": a crisp click-burst plus a quick falling blip. Each pop is pitched a little differently,
+  // so a bunch of balloons doesn't sound like a machine.
+  function makePop(a: Graph): void {
+    const r = 0.88 + Math.random() * 0.28;
+    noise(a, { dur: 0.07, vol: 0.4, type: 'highpass', f0: 1800 * r, f1: 5200, q: 0.7, attack: 0.001 });
+    tone(a, { f0: 1100 * r, f1: 200 * r, dur: 0.09, vol: 0.38, attack: 0.001 });
+    tone(a, { type: 'triangle', f0: 260 * r, f1: 90, dur: 0.07, vol: 0.2, attack: 0.001 });
+  }
+
+  // Horns (the one chosen in the Boat Garage). Each is a few steady notes, so they use `hold`.
+  let hornKind: HornId = 'beep';
+
+  // "Beep beep!": two bright car-horn toots, a major third apart so it sounds friendly.
+  function makeHornBeep(a: Graph): void {
+    const t = a.ctx.currentTime + 0.005;
+    for (let i = 0; i < 2; i++) {
+      const when = t + i * 0.16;
+      tone(a, { type: 'square', f0: 523.25, dur: 0.12, vol: 0.15, attack: 0.005, lowpass: 2400, hold: 0.7, when });
+      tone(a, { type: 'square', f0: 659.25, dur: 0.12, vol: 0.12, attack: 0.005, lowpass: 2400, hold: 0.7, when });
+    }
+  }
+
+  // "Quack quack!": a nasal buzz that slides down, with a tiny click on the front of each quack.
+  function makeHornDuck(a: Graph): void {
+    const t = a.ctx.currentTime + 0.005;
+    for (let i = 0; i < 2; i++) {
+      const when = t + i * 0.2;
+      const r = i === 0 ? 1 : 0.9; // the second quack is a little lower
+      tone(a, { type: 'sawtooth', f0: 560 * r, f1: 330 * r, dur: 0.17, vol: 0.22, attack: 0.01, lowpass: 1500, hold: 0.5, when });
+      tone(a, { type: 'square', f0: 1120 * r, f1: 700 * r, dur: 0.15, vol: 0.06, attack: 0.01, lowpass: 2600, hold: 0.4, when });
+      noise(a, { dur: 0.05, vol: 0.12, type: 'bandpass', f0: 1800, f1: 1100, q: 1.4, attack: 0.002, when });
+    }
+  }
+
+  // "BRAAAAP": a big ship's foghorn. Two low buzzes a hair apart wobble against each other, plus a fifth.
+  function makeHornFog(a: Graph): void {
+    const t = a.ctx.currentTime + 0.005;
+    tone(a, { type: 'sawtooth', f0: 98, f1: 90, dur: 1.0, vol: 0.3, attack: 0.07, lowpass: 520, hold: 0.7, when: t });
+    tone(a, { type: 'sawtooth', f0: 100.5, f1: 92, dur: 1.0, vol: 0.26, attack: 0.07, lowpass: 520, hold: 0.7, when: t });
+    tone(a, { type: 'square', f0: 147, f1: 135, dur: 0.95, vol: 0.1, attack: 0.09, lowpass: 600, hold: 0.7, when: t });
+    noise(a, { dur: 0.9, vol: 0.05, type: 'lowpass', f0: 400, f1: 250, attack: 0.1, when: t });
+  }
+
+  // "HOOONK-eek!": a rubber-bulb honk that bends up, then a squeaky little tail.
+  function makeHornClown(a: Graph): void {
+    const t = a.ctx.currentTime + 0.005;
+    tone(a, { type: 'sawtooth', f0: 300, f1: 370, dur: 0.26, vol: 0.2, attack: 0.012, lowpass: 1400, hold: 0.6, when: t });
+    tone(a, { type: 'square', f0: 304, f1: 374, dur: 0.26, vol: 0.12, attack: 0.012, lowpass: 1400, hold: 0.6, when: t });
+    tone(a, { f0: 880, f1: 1560, dur: 0.14, vol: 0.18, attack: 0.008, hold: 0.5, when: t + 0.24 });
+    tone(a, { type: 'triangle', f0: 1760, f1: 3000, dur: 0.1, vol: 0.05, attack: 0.008, when: t + 0.24 });
+  }
+
+  function makeHonk(a: Graph): void {
+    switch (hornKind) {
+      case 'duck': makeHornDuck(a); break;
+      case 'foghorn': makeHornFog(a); break;
+      case 'clown': makeHornClown(a); break;
+      default: makeHornBeep(a); // 'beep', and anything unexpected from an old save
+    }
+  }
+
+  // Rescue: a bubbly "bloop" up and a whoosh, then a splash and a little sparkle as the boat lands.
+  function makeRescue(a: Graph): void {
+    const t = a.ctx.currentTime + 0.005;
+    tone(a, { f0: 260, f1: 1100, dur: 0.22, vol: 0.28, attack: 0.01, hold: 0.5, when: t });
+    noise(a, { dur: 0.4, vol: 0.2, type: 'bandpass', f0: 500, f1: 3000, q: 0.9, attack: 0.1, when: t });
+    noise(a, { dur: 0.3, vol: 0.2, type: 'lowpass', f0: 1200, f1: 300, attack: 0.01, when: t + 0.25 });
+    const notes = [1318.5, 1568, 2093, 2637];
+    for (let i = 0; i < notes.length; i++) bell(a, notes[i], t + 0.26 + i * 0.07, 0.35, 0.14);
+  }
+
+  // Trophy fanfare: a quick rising run (G C E G), then a held, sparkling C chord. All C major, so it sits
+  // nicely on top of the end of the victory tune that plays just before it.
+  function makeTrophy(a: Graph): void {
+    const t = a.ctx.currentTime + 0.01;
+    const run = [783.99, 1046.5, 1318.5, 1568];
+    for (let i = 0; i < run.length; i++) {
+      const when = t + i * 0.1;
+      tone(a, { type: 'sawtooth', f0: run[i], dur: 0.16, vol: 0.1, attack: 0.008, lowpass: 3000, hold: 0.5, when });
+      tone(a, { type: 'triangle', f0: run[i], dur: 0.16, vol: 0.14, attack: 0.008, hold: 0.5, when });
+    }
+    const end = t + 0.46;
+    for (const f of [1046.5, 1318.5, 1568, 2093]) {
+      tone(a, { type: 'triangle', f0: f, dur: 0.9, vol: 0.11, attack: 0.012, when: end });
+    }
+    bell(a, 2093, end + 0.05, 0.9, 0.12);
+    bell(a, 3136, end + 0.16, 0.7, 0.1);
+    bell(a, 2637, end + 0.27, 0.8, 0.1);
   }
 
   function makeUiMove(a: Graph): void {
@@ -606,6 +706,13 @@ export function createSfx(): Sfx {
       play('go', 0.5, makeBeep);
     },
     victory: () => play('victory', 1.5, makeVictory),
+    pop: () => play('pop', 0.03, makePop),
+    honk: (horn: HornId) => {
+      hornKind = horn;
+      play('honk-' + horn, HORN_GAP[horn] ?? 0.15, makeHonk);
+    },
+    rescue: () => play('rescue', 0.5, makeRescue),
+    trophy: () => play('trophy', 0.6, makeTrophy),
     uiMove: () => play('uiMove', 0.03, makeUiMove),
     uiSelect: () => play('uiSelect', 0.06, makeUiSelect),
     setEngines,

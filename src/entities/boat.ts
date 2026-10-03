@@ -11,6 +11,11 @@
  *      (that squeeze is the fun drifty feel: the boat keeps sliding for a moment after a turn).
  *   4. We put the parts back together and move the boat, then bounce it off the lagoon edge and islands.
  *
+ * Easy Driving (kid-friendly handling, on when `init.easyDriving`) changes that recipe in a few places:
+ * slower top speed, gentler and smoother turning, no drift (the grip step is almost instant), softer hits,
+ * and "shore sliding": touching an island or the lagoon edge never bounces the boat backward, it just
+ * glides along the coast. Normal handling is untouched.
+ *
  * Steering sign (see types.ts): steer +1 = right = heading DECREASES.
  * forward = (sin heading, 0, cos heading), right = (-cos heading, 0, sin heading).
  */
@@ -19,7 +24,7 @@ import { CONFIG } from '../config';
 import type {
   ActivePowerUp, Boat, BoatControls, BoatInit, BumpEvent, DartSpawn, PowerUpKind, SpawnPoint, WorldQuery,
 } from '../types';
-import { buildBoatRig, SHIELD_SIZE, type BoatRig } from './boatModel';
+import { buildBoatRig, FLAG_YAW, MARKER_HEIGHT, SHIELD_SIZE, type BoatRig } from './boatModel';
 
 // ───────────────────────────── feel knobs (module-private) ─────────────────────────────
 // The ones a kid would tweak (top speed, accel, turn rate...) are in CONFIG.boat / CONFIG.blaster.
@@ -48,6 +53,19 @@ const SPIN_DECAY = 4.5; // how quickly a hit-spin dies away (per second)
 const GRIP_SLOW = 2.5; // when barely moving (so a sideways shove actually slides you)
 const GRIP_FAST = 8; // at speed (about 15 degrees of slip at full turn: "a little drift")
 const SLIP_KEEP = 0.8; // how much of the squeezed-out sideways speed turns into forward speed
+
+// Easy Driving (the knobs a kid would tweak -- speed, turning, knockback -- are in CONFIG.easyDriving)
+const EASY_ACCEL = 0.85; // acceleration compared to normal handling
+const EASY_YAW_RESPONSE = 4; // turn rate eases toward its target with a 0.25 s time constant (no twitch)
+const EASY_GRIP = 40; // sideways speed is squeezed away almost instantly: no drift
+const EASY_STUN_THRUST = 0.6; // a stunned Easy Driving boat keeps more engine than a normal one
+const EASY_STUN_SHAKE = 0.3; // stun wobble and hit-spin are this much of normal
+const EASY_EDGE_PUSH = 0.35; // the lagoon edge nudges an Easy Driving boat back only this hard
+const SLIDE_KEEP = 0.85; // a full-speed shore hit keeps this much of the sideways (along-the-shore) speed
+const SLIDE_FULL_HIT = 6; // m/s of impact that counts as a "full" hit for the line above
+const SLIDE_TURN = 7; // how eagerly the nose swings toward the shore tangent (per second)
+const SLIDE_TURN_MAX = 2.2; // ...but never faster than this (rad/s): gentle
+const SLIDE_MEMORY = 0.4; // seconds a head-on shore hit remembers which way it chose to slide
 
 // Lagoon edge: a soft cushion, then a hard wall
 const EDGE_MARGIN = 14;
@@ -119,6 +137,8 @@ class FoamBoat implements Boat {
   readonly name: string;
   readonly color: number;
   readonly isHuman: boolean;
+  readonly team: number;
+  readonly easyDriving: boolean;
   readonly object: THREE.Object3D;
   /** The very same vector as object.position, so moving one moves the other. */
   readonly position: THREE.Vector3;
@@ -160,6 +180,8 @@ class FoamBoat implements Boat {
   // motion
   private yawRate = 0; // current turn rate (rad/s, negative = turning right)
   private spin = 0; // extra turn rate from being hit or bonking something
+  private slideSign = 0; // Easy Driving: which way a head-on shore hit chose to slide (0 = not chosen)
+  private slideT = 0; // ...and how long that choice is remembered
   private prevForward = 0;
   private accel = 0; // smoothed forward acceleration, drives nose-up and head tilt
 
@@ -187,7 +209,9 @@ class FoamBoat implements Boat {
     this.name = init.name;
     this.color = init.color;
     this.isHuman = init.isHuman;
-    this.rig = buildBoatRig(init.style, init.color, init.id);
+    this.team = init.team;
+    this.easyDriving = init.easyDriving;
+    this.rig = buildBoatRig(init.look, init.color, init.id, init.marker);
     this.object = this.rig.root;
     this.position = this.rig.root.position;
     this.respawn(init.spawn);
@@ -209,6 +233,23 @@ class FoamBoat implements Boat {
   get shielded(): boolean { return this._shielded; }
   get stunned(): boolean { return this.stunTimer > 0; }
   get aimTargetId(): number | null { return this._aimTargetId; }
+
+  // Handling numbers, scaled for Easy Driving (read from CONFIG each time so live tweaks work).
+  private get topSpeed(): number {
+    return CONFIG.boat.maxSpeed * (this.easyDriving ? CONFIG.easyDriving.speedScale : 1);
+  }
+  private get boostTop(): number {
+    return CONFIG.boat.boostSpeed * (this.easyDriving ? CONFIG.easyDriving.speedScale : 1);
+  }
+  private get accelBase(): number {
+    return CONFIG.boat.accel * (this.easyDriving ? EASY_ACCEL : 1);
+  }
+  private get turnBase(): number {
+    return CONFIG.boat.turnRate * (this.easyDriving ? CONFIG.easyDriving.turnScale : 1);
+  }
+  private get stunThrust(): number {
+    return this.easyDriving ? EASY_STUN_THRUST : STUN_THRUST;
+  }
 
   private refreshAxes(): void {
     if (this.heading !== this.axesHeading) {
@@ -260,7 +301,7 @@ class FoamBoat implements Boat {
         this._boosting = true;
         this.refreshAxes();
         const vf = this.velocity.x * this.sinH + this.velocity.z * this.cosH;
-        const kick = clamp(CONFIG.boat.boostSpeed - vf, 0, BOOST_KICK);
+        const kick = clamp(this.boostTop - vf, 0, BOOST_KICK);
         this.velocity.x += this.sinH * kick;
         this.velocity.z += this.cosH * kick;
       }
@@ -301,19 +342,29 @@ class FoamBoat implements Boat {
   /** One small slice of driving physics. See the map at the top of the file. */
   private stepPhysics(h: number, world: WorldQuery): void {
     const cfg = CONFIG.boat;
+    const easy = this.easyDriving;
     const vel = this.velocity;
     const pos = this.position;
     const stunned = this.stunTimer > 0;
+    const maxSpeed = this.topSpeed;
+    const accel = this.accelBase;
+    const stunThrust = this.stunThrust;
+
+    if (this.slideT > 0) {
+      this.slideT -= h;
+      if (this.slideT <= 0) this.slideSign = 0; // been clear of the shore a while: forget the choice
+    }
 
     // 1. Steering: turn rate grows with speed (but you can still pivot slowly when stopped).
     this.refreshAxes();
     let vf = vel.x * this.sinH + vel.z * this.cosH;
-    const speedRatio = Math.abs(vf) / cfg.maxSpeed;
-    const turnScale =
+    const speedRatio = Math.abs(vf) / maxSpeed;
+    const turnShape =
       lerp(PIVOT_TURN, 1, smoothstep(0, FULL_TURN_AT, speedRatio)) *
       (1 - 0.22 * clamp01((speedRatio - 0.7) / 0.8)); // a touch wider when really flying
-    const targetYaw = -this.inSteer * cfg.turnRate * turnScale; // steer +1 = right = heading goes DOWN
-    this.yawRate += (targetYaw - this.yawRate) * (1 - Math.exp(-YAW_RESPONSE * h));
+    const targetYaw = -this.inSteer * this.turnBase * turnShape; // steer +1 = right = heading goes DOWN
+    // Easy Driving eases into the turn more slowly, so a jab at the key never makes the boat twitch.
+    this.yawRate += (targetYaw - this.yawRate) * (1 - Math.exp(-(easy ? EASY_YAW_RESPONSE : YAW_RESPONSE) * h));
     this.spin *= Math.exp(-SPIN_DECAY * h);
     this.heading += (this.yawRate + this.spin) * h;
     this.refreshAxes();
@@ -327,7 +378,8 @@ class FoamBoat implements Boat {
 
     // 3. Grip: squeeze the sideways speed away; give some of it back as forward speed.
     const absF = Math.abs(vf);
-    const grip = lerp(GRIP_SLOW, GRIP_FAST, smoothstep(1, 9, absF)) * (this._boosting ? 0.8 : 1);
+    // Easy Driving has near-perfect grip, so the boat goes where the nose points (no drift).
+    const grip = easy ? EASY_GRIP : lerp(GRIP_SLOW, GRIP_FAST, smoothstep(1, 9, absF)) * (this._boosting ? 0.8 : 1);
     const vlGripped = vl * Math.exp(-grip * h);
     if (absF > 0.01) {
       const share = SLIP_KEEP * clamp01(absF / 6);
@@ -338,10 +390,10 @@ class FoamBoat implements Boat {
     // 4. Throttle moves the forward speed toward a target.
     let thr = this.inThrottle;
     if (this._boosting) thr = Math.max(thr, 1);
-    if (stunned) thr *= STUN_THRUST;
-    const topSpeed = this._boosting ? cfg.boostSpeed : cfg.maxSpeed;
+    if (stunned) thr *= stunThrust;
+    const topSpeed = this._boosting ? this.boostTop : maxSpeed;
     const target = thr >= 0 ? thr * topSpeed : thr * cfg.reverseSpeed;
-    const push = cfg.accel * (this._boosting ? BOOST_ACCEL : 1) * (stunned ? STUN_THRUST : 1);
+    const push = accel * (this._boosting ? BOOST_ACCEL : 1) * (stunned ? stunThrust : 1);
     if (Math.abs(thr) < 0.04) {
       // Letting go: water drag plus a little friction so we really stop.
       vf *= Math.exp(-cfg.drag * h);
@@ -354,7 +406,7 @@ class FoamBoat implements Boat {
     } else if (vf > target) {
       if (thr < -0.04) {
         // Pressing reverse: brake hard while still going forward, then back up.
-        const rate = vf > 0 ? cfg.accel * BRAKE_MUL : push;
+        const rate = vf > 0 ? accel * BRAKE_MUL : push;
         vf = Math.max(vf - rate * h, target);
       } else {
         // Target is lower than our speed (boost ended, half throttle, stun): settle smoothly.
@@ -397,19 +449,75 @@ class FoamBoat implements Boat {
       vel.x -= nx * vr * f;
       vel.z -= nz * vr * f;
     }
-    const nudge = EDGE_PUSH * k * k * h;
+    const nudge = EDGE_PUSH * (this.easyDriving ? EASY_EDGE_PUSH : 1) * k * k * h;
     vel.x -= nx * nudge;
     vel.z -= nz * nudge;
     const maxD = R - this.radius;
     if (d > maxD) {
       pos.x = nx * maxD;
       pos.z = nz * maxD;
+      if (this.easyDriving) {
+        // The edge is a shore too: glide along it (the water is toward the middle, so the normal points inward).
+        this.shoreSlide(-nx, -nz, h);
+        return;
+      }
       const vr2 = vel.x * nx + vel.z * nz;
       if (vr2 > 0) {
         vel.x -= nx * vr2 * (1 + EDGE_BOUNCE);
         vel.z -= nz * vr2 * (1 + EDGE_BOUNCE);
       }
     }
+  }
+
+  /**
+   * Easy Driving shore contact. (nx, nz) is the unit normal pointing from the shore out into the water
+   * and the boat has already been moved back onto the shore line. Instead of bouncing:
+   *  - the part of the velocity going into the shore is removed (never backward),
+   *  - the along-the-shore part is kept (about 85% after a hard hit, more after a glancing one),
+   *  - and if the nose points into the shore it swings toward whichever shore tangent is closest to the
+   *    current heading, so the boat glides along the coast and never ends up wedged nose-in.
+   */
+  private shoreSlide(nx: number, nz: number, h: number): void {
+    const vel = this.velocity;
+    const vn = vel.x * nx + vel.z * nz;
+    if (vn < 0) {
+      const impact = -vn;
+      vel.x -= nx * vn;
+      vel.z -= nz * vn;
+      const keep = 1 - (1 - SLIDE_KEEP) * clamp01(impact / SLIDE_FULL_HIT);
+      vel.x *= keep;
+      vel.z *= keep;
+      if (impact > 2) this.jolt(nx, nz, impact * 0.5); // a small shiver, no spin
+    }
+    this.slideT = SLIDE_MEMORY;
+
+    // Backing into the shore: just stop there, no nose swinging.
+    this.refreshAxes();
+    if (this.velocity.x * this.sinH + this.velocity.z * this.cosH < -0.5) return;
+    const fn = this.sinH * nx + this.cosH * nz; // < 0: the nose points into the shore
+    if (fn > -0.02) return;
+
+    // The two shore tangents are +-(-nz, nx). Pick the one the nose is closest to.
+    const tx = -nz;
+    const tz = nx;
+    const alongHeading = Math.atan2(tx, tz); // the heading that runs along +tangent
+    const dotF = this.sinH * tx + this.cosH * tz;
+    let sgn: number;
+    if (Math.abs(dotF) > 0.2) {
+      sgn = dotF > 0 ? 1 : -1;
+      this.slideSign = sgn;
+    } else {
+      // Nearly head-on: both tangents are equally close. Choose by the way the player is steering (else by
+      // boat id) and stick with it, so the nose does not flip-flop between the two.
+      if (this.slideSign === 0) {
+        const want = this.inSteer > 0.1 ? -1 : this.inSteer < -0.1 ? 1 : this.id % 2 === 0 ? 1 : -1; // wanted sign of the turn (steer right = heading goes down)
+        this.slideSign = (angleDiff(alongHeading, this.heading) > 0 ? 1 : -1) * want;
+      }
+      sgn = this.slideSign;
+    }
+    const targetHeading = sgn > 0 ? alongHeading : alongHeading + Math.PI;
+    const d = angleDiff(targetHeading, this.heading);
+    this.heading += clamp(d * SLIDE_TURN, -SLIDE_TURN_MAX, SLIDE_TURN_MAX) * h;
   }
 
   /** Islands, rocks and landmarks are circles: push out, bounce with damping, never stick. */
@@ -436,6 +544,10 @@ class FoamBoat implements Boat {
       }
       pos.x = o.x + nx * minD; // snap to the shore
       pos.z = o.z + nz * minD;
+      if (this.easyDriving) {
+        this.shoreSlide(nx, nz, h); // glide along the island instead of bouncing off it
+        continue;
+      }
       const vn = vel.x * nx + vel.z * nz;
       if (vn >= 0) continue; // already moving away
       const impact = -vn;
@@ -461,7 +573,6 @@ class FoamBoat implements Boat {
 
   /** Bobbing and the targets the hull tilts toward. */
   private sampleWaves(dt: number, t: number, world: WorldQuery): void {
-    const cfg = CONFIG.boat;
     const pos = this.position;
     pos.y = world.waveHeight(pos.x, pos.z, t);
     world.waveNormal(pos.x, pos.z, t, _n);
@@ -477,18 +588,19 @@ class FoamBoat implements Boat {
     this.prevForward = vf;
     this.accel += (rawAcc - this.accel) * (1 - Math.exp(-dt * 8));
 
-    const spd = clamp(Math.abs(vf) / cfg.maxSpeed, 0, 1.3);
+    const maxSpeed = this.topSpeed;
+    const spd = clamp(Math.abs(vf) / maxSpeed, 0, 1.3);
     // Nose up when speeding up (and a bit when planing fast), nose down when braking.
     this.pitchTarget =
       wavePitch -
-      clamp(this.accel / cfg.accel, -1.2, 1.2) * 0.11 -
-      clamp01(vf / cfg.maxSpeed) * 0.05 -
+      clamp(this.accel / this.accelBase, -1.2, 1.2) * 0.11 -
+      clamp01(vf / maxSpeed) * 0.05 -
       (this._boosting ? 0.05 : 0);
     // Bank into the turn: lean right when turning right (the faster, the more).
-    this.rollTarget = waveRoll + (-this.yawRate / cfg.turnRate) * (0.1 + 0.26 * spd);
+    this.rollTarget = waveRoll + (-this.yawRate / this.turnBase) * (0.1 + 0.26 * spd);
   }
 
-  /** Aim assist: pick the nearest boat roughly in front of us. Generous at close range. */
+  /** Aim assist: pick the nearest boat roughly in front of us. Generous at close range. Teammates are never targets. */
   private pickAimTarget(others: readonly Boat[]): void {
     const range = CONFIG.blaster.aimAssistRange;
     const cone = (CONFIG.blaster.aimAssistDeg * Math.PI) / 180;
@@ -496,7 +608,7 @@ class FoamBoat implements Boat {
     let best = Infinity;
     for (let i = 0; i < others.length; i++) {
       const o = others[i];
-      if (o === this || o.id === this.id) continue;
+      if (o === this || o.id === this.id || o.team === this.team) continue;
       const dx = o.position.x - this.position.x;
       const dz = o.position.z - this.position.z;
       const d = Math.hypot(dx, dz);
@@ -548,7 +660,7 @@ class FoamBoat implements Boat {
   /** Springs, turret, captain, flame, shield: everything that is just for looks. */
   private animate(dt: number, t: number, others: readonly Boat[]): void {
     const rig = this.rig;
-    const cfg = CONFIG.boat;
+    const maxSpeed = this.topSpeed;
 
     // Hull tilt springs (a few small steps keep the springs stable).
     const n = Math.max(1, Math.ceil(dt / (1 / 90)));
@@ -566,15 +678,15 @@ class FoamBoat implements Boat {
     let wobYaw = 0;
     if (this.stunTimer > 0) {
       this.wobblePhase += dt * 32;
-      const w = clamp01(this.stunTimer / Math.max(0.05, this.stunDuration));
+      const w = clamp01(this.stunTimer / Math.max(0.05, this.stunDuration)) * (this.easyDriving ? EASY_STUN_SHAKE : 1);
       wobRoll = Math.sin(this.wobblePhase) * 0.16 * w;
       wobPitch = Math.cos(this.wobblePhase * 0.8) * 0.06 * w;
       wobYaw = Math.sin(this.wobblePhase * 0.6) * 0.14 * w;
     }
     rig.root.rotation.set(this.pitch + wobPitch, this.heading + wobYaw, this.roll + wobRoll);
 
-    // White flash on the paint when hit.
-    rig.hullMat.emissiveIntensity = this.flash * 0.9;
+    // White flash on the paint (hull, painted deck and pattern decals) when hit.
+    this.setFlash(this.flash * 0.9);
 
     // Turret: swing toward the aim target (clamped), match the dart's elevation.
     let yawT = 0;
@@ -612,11 +724,19 @@ class FoamBoat implements Boat {
 
     // Captain looks into the turn and tips his head back when you floor it.
     this.headYaw += (-this.inSteer * 0.5 - this.headYaw) * (1 - Math.exp(-dt * 9));
-    rig.head.rotation.set(-clamp(this.accel / cfg.accel, -1, 1) * 0.12, this.headYaw, this.inSteer * 0.08);
+    rig.head.rotation.set(-clamp(this.accel / this.accelBase, -1, 1) * 0.12, this.headYaw, this.inSteer * 0.08);
 
-    // Pennant flutters faster the faster we go.
-    const spd = clamp01(Math.abs(this.velocity.x * this.sinH + this.velocity.z * this.cosH) / cfg.maxSpeed);
-    rig.flag.rotation.y = Math.sin(t * 13 + this.id) * 0.3 * (0.25 + spd) - this.yawRate * 0.1;
+    // Flag flutters harder the faster we go; the propeller beanie spins faster too; the team diamond bobs and turns.
+    const spd = clamp01(Math.abs(this.velocity.x * this.sinH + this.velocity.z * this.cosH) / maxSpeed);
+    if (rig.hasFlag) {
+      rig.flag.rotation.y = FLAG_YAW + Math.sin(t * 11 + this.id) * 0.22 * (0.3 + spd) - this.yawRate * 0.12;
+      rig.flag.rotation.z = Math.sin(t * 8.3 + this.id * 1.7) * 0.06 * (0.3 + spd);
+    }
+    if (rig.propeller) rig.propeller.rotation.y += dt * (9 + 26 * spd);
+    if (rig.marker) {
+      rig.marker.position.y = MARKER_HEIGHT + Math.sin(t * 3 + this.id) * 0.1;
+      rig.marker.rotation.y = t * 1.8;
+    }
 
     // Engine flame (boost)
     const flameTarget = this._boosting ? 1 : 0;
@@ -646,6 +766,12 @@ class FoamBoat implements Boat {
     } else {
       rig.shield.visible = false;
     }
+  }
+
+  /** Set the white hit-flash glow on every paint material (hull, painted deck, pattern decals). */
+  private setFlash(v: number): void {
+    const mats = this.rig.paintMats;
+    for (let i = 0; i < mats.length; i++) mats[i].emissiveIntensity = v;
   }
 
   /** A quick tilt kick from a bump or hit. (push = the direction the boat is being pushed.) */
@@ -723,18 +849,20 @@ class FoamBoat implements Boat {
       this.shieldPop = SHIELD_POP_TIME;
       return false;
     }
-    // Shove along the dart's direction (sideways on the water only).
+    // Shove along the dart's direction (sideways on the water only). Easy Driving boats get a gentler shove.
+    const easy = this.easyDriving;
+    const knock = CONFIG.boat.knockback * (easy ? CONFIG.easyDriving.knockbackScale : 1);
     const hl = Math.hypot(direction.x, direction.z);
     if (hl > 1e-4) {
       const dx = direction.x / hl;
       const dz = direction.z / hl;
-      this.velocity.x += dx * CONFIG.boat.knockback;
-      this.velocity.z += dz * CONFIG.boat.knockback;
-      this.jolt(dx, dz, CONFIG.boat.knockback * 2.5);
+      this.velocity.x += dx * knock;
+      this.velocity.z += dz * knock;
+      this.jolt(dx, dz, knock * 2.5);
       // Spin a little, depending on which side got hit.
       this.refreshAxes();
       const side = -dx * this.cosH + dz * this.sinH; // dart pushing the boat to the right?
-      this.spin += (Math.abs(side) > 0.05 ? -Math.sign(side) : this.id % 2 === 0 ? 1 : -1) * 1.8;
+      this.spin += (Math.abs(side) > 0.05 ? -Math.sign(side) : this.id % 2 === 0 ? 1 : -1) * 1.8 * (easy ? EASY_STUN_SHAKE : 1);
     }
     this.stunTimer = Math.max(this.stunTimer, stunSeconds);
     this.stunDuration = this.stunTimer;
@@ -770,6 +898,8 @@ class FoamBoat implements Boat {
     this.velocity.set(0, 0, 0);
     this.yawRate = 0;
     this.spin = 0;
+    this.slideSign = 0;
+    this.slideT = 0;
     this.prevForward = 0;
     this.accel = 0;
 
@@ -803,9 +933,10 @@ class FoamBoat implements Boat {
     this.inThrottle = 0;
     this.inSteer = 0;
 
+    // A nice resting pose, so a boat that is shown without ever being updated (the Garage) still looks right.
     const rig = this.rig;
     rig.root.rotation.set(0, this.heading, 0);
-    rig.hullMat.emissiveIntensity = 0;
+    this.setFlash(0);
     rig.blasterGlowMat.emissiveIntensity = 0;
     rig.sideBarrels.visible = false;
     rig.muzzleFlash.visible = false;
@@ -814,6 +945,33 @@ class FoamBoat implements Boat {
     rig.turretYaw.rotation.y = 0;
     rig.turretPitch.rotation.x = -AIM_UP;
     rig.turretRecoil.position.z = 0;
+    rig.head.rotation.set(0, 0, 0);
+    rig.flag.rotation.set(0, FLAG_YAW, 0);
+    if (rig.marker) rig.marker.position.y = MARKER_HEIGHT;
+  }
+
+  teleport(spot: SpawnPoint): void {
+    // Rescue: new spot, standing still, calm. Ammo, boost, shield and power-ups stay exactly as they were.
+    this.position.set(spot.x, this.position.y, spot.z); // y follows the waves on the next update
+    this.heading = spot.heading;
+    this.axesHeading = Number.NaN;
+    this.refreshAxes();
+    this.velocity.set(0, 0, 0);
+    this.yawRate = 0;
+    this.spin = 0;
+    this.slideSign = 0;
+    this.slideT = 0;
+    this.prevForward = 0;
+    this.accel = 0;
+    this.stunTimer = 0;
+    this.stunDuration = 0;
+    this.flash = 0;
+    this.wobblePhase = 0;
+    this.pitchVel = 0;
+    this.rollVel = 0;
+    this._aimTargetId = null;
+    this.setFlash(0);
+    this.rig.root.rotation.set(this.pitch, this.heading, this.roll);
   }
 
   dispose(): void {

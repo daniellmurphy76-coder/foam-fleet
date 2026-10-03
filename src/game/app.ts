@@ -14,11 +14,11 @@ import { foam, installErrorCapture, reportError, type FoamSnapshot } from './deb
 import {
   EMPTY_MENU, fallbackHud, fallbackInput, fallbackMenu, idleController, quietHud, quietSfx,
 } from './fallbacks';
-import { buildOrFallback, guard } from './guard';
+import { V2_METHODS, buildOrFallback, guard } from './guard';
 import { Match, STEP } from './match';
 import { createHud, createInput, createMenu, createSfx } from './modules';
 import { defaultSetup, sanitizeSetup, setupFromQuery } from './setup';
-import { clamp, wrapPi } from './util';
+import { clamp, topSpeedOf, wrapPi } from './util';
 
 type AppState = 'menu' | 'countdown' | 'playing' | 'paused' | 'results';
 
@@ -104,13 +104,24 @@ class FoamApp {
     this.renderer = renderer;
 
     // Services. Each is wrapped so a throwing module is logged instead of freezing the loop.
-    this.sfx = guard('sfx', buildOrFallback('createSfx', () => createSfx(), quietSfx));
+    this.sfx = guard('sfx', buildOrFallback('createSfx', () => createSfx(), quietSfx), {}, V2_METHODS.sfx);
     this.input = guard(
       'input',
       buildOrFallback('createInput', () => createInput(window), fallbackInput),
-      { humanController: () => idleController('human'), menu: () => EMPTY_MENU, gamepadCount: () => 0 },
+      {
+        humanController: () => idleController('human'),
+        menu: () => EMPTY_MENU,
+        gamepadCount: () => 0,
+        schemeOf: () => 'keysA',
+      },
+      V2_METHODS.input,
     );
-    this.hud = guard('hud', buildOrFallback('createHud', () => createHud(hudRoot, this.sfx), () => fallbackHud(hudRoot)));
+    this.hud = guard(
+      'hud',
+      buildOrFallback('createHud', () => createHud(hudRoot, this.sfx), () => fallbackHud(hudRoot)),
+      {},
+      V2_METHODS.hud,
+    );
     this.menu = guard(
       'menu',
       buildOrFallback('createMenu', () => createMenu(menuRoot, this.sfx), () => fallbackMenu(menuRoot, defaultSetup)),
@@ -245,7 +256,7 @@ class FoamApp {
     // Clear the per-player panels (reticle, ammo, boost, scoreboard) off the podium screen. hide() only
     // touches the live layer, so the results overlay shown right below is unaffected.
     this.hud.hide();
-    this.hud.showResults(match.mode.result(), () => this.startMatch(match.setup), () => this.enterMenu());
+    this.hud.showResults(match.result(), () => this.startMatch(match.setup), () => this.enterMenu());
     this.sfx.victory();
   }
 
@@ -377,10 +388,7 @@ class FoamApp {
     if (k !== this.countdownShown && k < secs) {
       this.countdownShown = k;
       const n = secs - k;
-      this.hud.announce(String(n), {
-        ms: 900,
-        sub: k === 0 ? (m.setup.mode === 'race' ? 'Race through the gates!' : 'Tag the other boats!') : undefined,
-      });
+      this.hud.announce(String(n), { ms: 900, sub: k === 0 ? this.countdownSub(m.setup.mode) : undefined });
       this.sfx.countdown(n);
     }
     m.step(STEP, false, false);
@@ -390,6 +398,16 @@ class FoamApp {
       this.hud.announce('GO!', { ms: 900 });
       this.sfx.go();
       this.setState('playing');
+    }
+  }
+
+  /** The line under the first countdown number. */
+  private countdownSub(mode: MatchSetup['mode']): string {
+    switch (mode) {
+      case 'race': return 'Race through the gates!';
+      case 'team': return `${CONFIG.team.names[0]} vs ${CONFIG.team.names[1]}!`;
+      case 'practice': return 'Pop all the balloons!';
+      default: return 'Tag the other boats!';
     }
   }
 
@@ -457,13 +475,18 @@ class FoamApp {
         race: mode.raceInfo(i),
         arrow,
         lockedTarget: lockId != null ? m.boats[lockId]?.name ?? null : null,
+        boatId: boat.id,
+        team: boat.team,
+        viewHeading: m.cams[i].viewHeading,
+        nextGate: mode.nextGate(i),
+        easyDriving: boat.easyDriving,
       });
     }
     const scoreboard: ScoreRow[] = [];
     const ranking = mode.ranking;
     for (let i = 0; i < ranking.length; i++) {
       const b = ranking[i];
-      scoreboard.push({ id: b.id, name: b.name, color: b.color, score: mode.scoreOf(b.id), isHuman: b.isHuman });
+      scoreboard.push({ id: b.id, name: b.name, color: b.color, score: mode.scoreOf(b.id), isHuman: b.isHuman, team: b.team });
     }
     return {
       mode: mode.id,
@@ -472,6 +495,9 @@ class FoamApp {
       players,
       viewports: this.viewports,
       scoreboard,
+      teams: mode.teams(),
+      balloons: mode.balloonCount(),
+      map: m.mapState(),
     };
   }
 
@@ -486,7 +512,7 @@ class FoamApp {
           levels.push(
             this.state === 'countdown'
               ? 0.18 + 0.08 * Math.sin(m.t * 9)
-              : clamp(Math.abs(m.boats[i].speed) / CONFIG.boat.maxSpeed, 0, 1),
+              : clamp(Math.abs(m.boats[i].speed) / topSpeedOf(m.boats[i].easyDriving), 0, 1),
           );
         }
       }
@@ -614,6 +640,9 @@ class FoamApp {
       errors: foam.errors.slice(),
       timeLeft: null,
       raceTime: null,
+      balloons: null,
+      teams: null,
+      humans: [],
       fallbacks: foam.fallbacks.slice(),
       render: {
         calls: info.render.calls,
@@ -627,6 +656,21 @@ class FoamApp {
       snap.darts = m.darts.activeCount;
       snap.timeLeft = m.mode.timeLeft();
       snap.raceTime = m.mode.raceTime();
+      snap.balloons = m.mode.balloonCount();
+      snap.teams = m.mode.teams();
+      for (const p of m.players) {
+        snap.humans.push({
+          slot: p.slot,
+          hits: p.hits,
+          tagsOnOtherHuman: p.tagsOnOtherHuman,
+          timesTagged: p.timesTagged,
+          balloons: p.balloons,
+          boostSeconds: round(p.boostSeconds, 1),
+          pickups: p.pickups,
+          honks: p.honks,
+          rescues: p.rescues,
+        });
+      }
       for (const b of m.boats) {
         const race = m.mode.raceInfo(b.id);
         snap.boats.push({
@@ -641,6 +685,8 @@ class FoamApp {
           stunned: b.stunned,
           boost: round(b.boost, 2),
           shielded: b.shielded,
+          team: b.team,
+          easy: b.easyDriving,
           powerUp: b.powerUp ? b.powerUp.kind : null,
           lap: race ? race.lap : null,
           gate: race ? race.checkpoint : null,
