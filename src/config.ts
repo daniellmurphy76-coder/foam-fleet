@@ -1,0 +1,125 @@
+/**
+ * Foam Fleet: game tuning knobs.
+ *
+ * Change a number, save the file, and the game reloads with your change.
+ * Try making the darts faster, the boats zippier, or the battles longer!
+ */
+export const CONFIG = {
+  arena: {
+    /** How big the lagoon is (meters from the middle to the edge). */
+    radius: 160,
+  },
+
+  boat: {
+    /** Top speed going forward (meters per second). */
+    maxSpeed: 22,
+    /** Top speed in reverse. */
+    reverseSpeed: 8,
+    /** How fast the boat speeds up. */
+    accel: 16,
+    /** How quickly the boat slows down when you let go. */
+    drag: 0.9,
+    /** How fast the boat turns (radians per second at full steer). */
+    turnRate: 2.3,
+    /** Top speed while boosting. */
+    boostSpeed: 34,
+    /** How fast the boost meter empties while boosting (per second). */
+    boostDrain: 0.45,
+    /** How fast the boost meter refills (per second). */
+    boostRecharge: 0.12,
+    /** Bumping size for boats. */
+    radius: 1.7,
+    /** How big a target the boat is for darts. */
+    hitRadius: 1.9,
+    /** How hard a dart pushes a boat. */
+    knockback: 5,
+  },
+
+  blaster: {
+    /** Darts in a full blaster. */
+    magazine: 6,
+    /** Seconds between shots. */
+    cooldown: 0.22,
+    /** Seconds to reload an empty blaster. */
+    reloadTime: 1.4,
+    /** When you are not shooting, get one dart back every this many seconds. */
+    trickleReload: 0.8,
+    /** How fast darts fly (meters per second). */
+    dartSpeed: 48,
+    /** How much darts drop (foam darts are floaty). */
+    dartGravity: 6,
+    /** Seconds before a dart that hits nothing disappears. */
+    dartLife: 2.6,
+    /** Seconds a dart stays stuck to a boat it hit. */
+    stuckDartLife: 6,
+    /** Aim-assist cone, in degrees either side of straight ahead. */
+    aimAssistDeg: 14,
+    /** Aim-assist only locks on to boats closer than this. */
+    aimAssistRange: 70,
+    /** Angle between the three darts of a Triple Shot. */
+    tripleSpreadDeg: 9,
+  },
+
+  powerUps: {
+    /** How long Triple Shot and Rapid Fire last (seconds). */
+    durationSec: 10,
+    /** Seconds before a collected crate comes back. */
+    respawnSec: 12,
+    /** Most crates floating at once. */
+    maxActive: 5,
+  },
+
+  battle: {
+    /** Battle length in seconds (180 = 3 minutes). */
+    durationSec: 180,
+    /** Points for each dart hit. */
+    pointsPerHit: 1,
+    /** Seconds a hit boat is wobbly and slow. */
+    stunSeconds: 0.6,
+  },
+
+  race: {
+    laps: 3,
+    /** Seconds a hit boat is wobbly and slow during a race (darts don't score here). */
+    stunSeconds: 1.1,
+    /** After the first player crosses the finish, how long everyone else gets to finish. */
+    finishGraceSec: 60,
+  },
+
+  bots: {
+    /**
+     * How wobbly the computer boats' aim is, in degrees. Bigger = they miss more.
+     * (Players always get full aim assist; this only makes the bots miss.)
+     */
+    aimErrorDeg: { easy: 8, normal: 6, hard: 3.5 },
+  },
+
+  match: {
+    defaultBots: 3,
+    /** Most boats on the water at once (humans + bots). */
+    maxBoats: 8,
+    countdownSec: 3,
+  },
+
+  camera: {
+    distance: 11,
+    height: 4.5,
+    lookAhead: 7,
+    fov: 65,
+  },
+
+  /** Boat paint colors to pick from. */
+  colors: [0xff3b30, 0x0a84ff, 0x30d158, 0xffd60a, 0xff9f0a, 0xbf5af2, 0xff6fae, 0x40e0d0],
+
+  /** Names for computer-controlled boats. */
+  botNames: [
+    'Captain Barnacle',
+    'Salty Sal',
+    'Admiral Splash',
+    'Bubbles',
+    'Commodore Quack',
+    'Rusty Anchor',
+    'Gilly',
+    'Sir Soggy',
+  ],
+};

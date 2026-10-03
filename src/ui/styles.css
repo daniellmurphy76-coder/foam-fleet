@@ -1,0 +1,1369 @@
+/*
+ * Foam Fleet UI: title/setup menu, in-match HUD, pause and results screens.
+ * Bright, rounded, chunky, high contrast. Class names all start with "ff-".
+ *
+ * Sizing notes for the curious:
+ *  - Menu and overlays size things with clamp(min, vmin-based, max) so they scale with the window.
+ *  - Each HUD viewport panel has its own --u scale (set from JS) and the whole HUD has --g,
+ *    so text stays big in a single window and shrinks sensibly in 2-player split screen.
+ */
+
+/* ───────────────────────── base ───────────────────────── */
+
+.ff-ui {
+  --ff-navy: #0b2a5b;
+  --ff-deep: #06173d;
+  --ff-sun: #ffd23f;
+  --ff-orange: #ff8a1f;
+  --ff-orange-dk: #b34d00;
+  --ff-red: #d9261c;
+  --ff-panel: rgba(6, 23, 61, 0.9); /* dark pill behind HUD text so it reads over any water */
+
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  font-family: "Fredoka", system-ui, sans-serif;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: #fff;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.ff-ui *,
+.ff-ui *::before,
+.ff-ui *::after {
+  box-sizing: border-box;
+}
+.ff-ui [hidden] {
+  display: none !important;
+}
+
+/* Chunky outlined text: a ring of dark shadows makes round, even outlines at any size. */
+.ff-ol {
+  --r: 0.07em;
+  --ol: var(--ff-navy);
+  text-shadow:
+    var(--r) 0 0 var(--ol),
+    calc(var(--r) * 0.87) calc(var(--r) * 0.5) 0 var(--ol),
+    calc(var(--r) * 0.5) calc(var(--r) * 0.87) 0 var(--ol),
+    0 var(--r) 0 var(--ol),
+    calc(var(--r) * -0.5) calc(var(--r) * 0.87) 0 var(--ol),
+    calc(var(--r) * -0.87) calc(var(--r) * 0.5) 0 var(--ol),
+    calc(var(--r) * -1) 0 0 var(--ol),
+    calc(var(--r) * -0.87) calc(var(--r) * -0.5) 0 var(--ol),
+    calc(var(--r) * -0.5) calc(var(--r) * -0.87) 0 var(--ol),
+    0 calc(var(--r) * -1) 0 var(--ol),
+    calc(var(--r) * 0.5) calc(var(--r) * -0.87) 0 var(--ol),
+    calc(var(--r) * 0.87) calc(var(--r) * -0.5) 0 var(--ol),
+    0 calc(var(--r) * 1.9) 0 var(--ol);
+}
+
+/* ───────────────────────── buttons ───────────────────────── */
+
+.ff-btn {
+  pointer-events: auto;
+  appearance: none;
+  -webkit-appearance: none;
+  position: relative;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.1em;
+  min-height: clamp(52px, 8.4vmin, 76px);
+  padding: 0.3em 1em;
+  border: 0;
+  border-radius: 22px;
+  background: #fff;
+  color: var(--ff-navy);
+  font: inherit;
+  font-weight: 700;
+  font-size: clamp(18px, 3.2vmin, 30px);
+  line-height: 1.1;
+  text-align: center;
+  cursor: pointer;
+  box-shadow: 0 6px 0 rgba(11, 42, 91, 0.5), 0 10px 18px rgba(0, 0, 0, 0.18);
+  transition: transform 0.08s ease-out, box-shadow 0.08s ease-out;
+}
+.ff-btn:hover:not(:disabled) {
+  transform: translateY(-2px);
+}
+.ff-btn:active:not(:disabled) {
+  transform: translateY(4px);
+  box-shadow: 0 2px 0 rgba(11, 42, 91, 0.5), 0 4px 8px rgba(0, 0, 0, 0.18);
+}
+.ff-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.ff-btn--primary {
+  background: var(--ff-orange);
+  box-shadow: 0 6px 0 var(--ff-orange-dk), 0 10px 18px rgba(0, 0, 0, 0.2);
+}
+.ff-btn--primary:active:not(:disabled) {
+  box-shadow: 0 2px 0 var(--ff-orange-dk), 0 4px 8px rgba(0, 0, 0, 0.2);
+}
+.ff-btn--hero {
+  min-height: clamp(64px, 12vmin, 120px);
+  padding: 0.2em 2.2em;
+  font-size: clamp(30px, 6.4vmin, 60px);
+  border-radius: 34px;
+}
+.ff-btn--xl {
+  min-height: clamp(60px, 10vmin, 96px);
+  padding: 0.2em 1.6em;
+  font-size: clamp(26px, 5vmin, 44px);
+}
+
+/* The focus ring for keyboard/gamepad: orange glow plus a navy edge, so it shows on white and on blue. */
+.ff-nav .ff-btn:focus,
+.ff-nav .ff-swatch:focus,
+.ff-nav .ff-input:focus,
+.ff-btn:focus-visible,
+.ff-swatch:focus-visible,
+.ff-input:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 6px var(--ff-orange), 0 0 0 10px var(--ff-navy);
+}
+.ff-nav .ff-btn:focus:not(:disabled),
+.ff-btn:focus-visible:not(:disabled) {
+  transform: scale(1.03);
+}
+
+/* ───────────────────────── menu: backdrop ───────────────────────── */
+
+.ff-menu {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  /* The game core draws a live demo lagoon (six bots sailing around) on the canvas BEHIND the menu,
+     so this is only a light scrim to help the logo read. Everything on top has its own outline or card. */
+  background: linear-gradient(180deg, rgba(6, 23, 61, 0.28) 0%, rgba(6, 23, 61, 0.06) 45%, rgba(6, 23, 61, 0.32) 100%);
+}
+/* The painted sun and waves would fight the real 3D ones, so they stay hidden (bubbles are fine). */
+.ff-sun,
+.ff-waves {
+  display: none;
+}
+.ff-bg {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.ff-sun {
+  position: absolute;
+  left: 6vw;
+  top: 7vh;
+  width: 15vmin;
+  height: 15vmin;
+  border-radius: 50%;
+  background: #fff3a8;
+  box-shadow: 0 0 0 2.2vmin rgba(255, 233, 102, 0.45), 0 0 0 4.6vmin rgba(255, 233, 102, 0.22);
+}
+.ff-bubble {
+  position: absolute;
+  bottom: -80px;
+  left: var(--x);
+  width: var(--s);
+  height: var(--s);
+  border-radius: 50%;
+  border: 3px solid rgba(255, 255, 255, 0.75);
+  background: rgba(255, 255, 255, 0.18);
+  animation: ff-rise var(--d) linear infinite;
+  animation-delay: var(--dl);
+}
+.ff-waves {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 15vmin;
+  overflow: hidden;
+}
+.ff-waves::before,
+.ff-waves::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: calc(100% + 480px);
+  height: 100%;
+  background-repeat: repeat-x;
+  background-size: 480px 100%;
+  background-position: left bottom;
+  animation: ff-wave 9s linear infinite;
+}
+.ff-waves::before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 240 60' preserveAspectRatio='none'%3E%3Cpath d='M0 30 Q30 8 60 30 T120 30 T180 30 T240 30 V60 H0Z' fill='%23ffffff' fill-opacity='.35'/%3E%3C/svg%3E");
+}
+.ff-waves::after {
+  height: 72%;
+  animation-duration: 6s;
+  animation-direction: reverse;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 240 60' preserveAspectRatio='none'%3E%3Cpath d='M0 28 Q30 6 60 28 T120 28 T180 28 T240 28 V60 H0Z' fill='%23ffffff' fill-opacity='.5'/%3E%3C/svg%3E");
+}
+
+/* ───────────────────────── menu: screens ───────────────────────── */
+
+.ff-screen {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  overflow-y: auto;
+  overflow-x: hidden;
+  pointer-events: auto;
+  padding: clamp(12px, 3vmin, 32px) clamp(12px, 3vw, 40px) 40px;
+}
+
+/* title */
+.ff-title {
+  justify-content: center;
+  gap: clamp(8px, 2.2vmin, 24px);
+}
+.ff-logo {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0 0.35em;
+  font-size: clamp(54px, 15vmin, 150px);
+  line-height: 1;
+  text-align: center;
+  rotate: -3deg;
+}
+.ff-logo-word {
+  display: inline-flex;
+  white-space: nowrap;
+}
+.ff-logo-letter {
+  --r: 0.06em;
+  display: inline-block;
+  font-weight: 700;
+  color: #fff;
+  animation: ff-bob 2.6s ease-in-out infinite;
+  animation-delay: calc(var(--i) * -0.22s);
+}
+.ff-logo-word--2 .ff-logo-letter {
+  color: var(--ff-sun);
+}
+.ff-tagline {
+  margin: 0;
+  font-size: clamp(18px, 3.2vmin, 32px);
+  text-align: center;
+  --r: 0.08em;
+}
+.ff-boat-art {
+  --boat: #ff3b30;
+  width: clamp(150px, 27vmin, 270px);
+  animation: ff-bob2 3.2s ease-in-out infinite;
+  filter: drop-shadow(0 8px 0 rgba(6, 23, 61, 0.18));
+}
+.ff-boat-art svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+.ff-boat-art .hull {
+  fill: var(--boat);
+}
+.ff-title .ff-btn--hero {
+  margin: clamp(2px, 1vmin, 10px) 0;
+}
+
+.ff-controls {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: clamp(8px, 1.6vmin, 16px);
+  width: min(1000px, 100%);
+}
+.ff-keys {
+  flex: 1 1 250px;
+  padding: clamp(8px, 1.6vmin, 16px) clamp(12px, 2vmin, 20px);
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.95);
+  color: var(--ff-navy);
+  font-size: clamp(14px, 2.3vmin, 20px);
+  box-shadow: 0 5px 0 rgba(11, 42, 91, 0.3);
+}
+.ff-keys-head {
+  margin: 0 0 0.3em;
+  font-size: 1.15em;
+  font-weight: 700;
+}
+.ff-keys-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6em;
+  margin: 0.25em 0;
+  line-height: 1.5;
+}
+.ff-keys-caps {
+  flex: none;
+  display: inline-flex;
+  gap: 0.2em;
+}
+.ff-key {
+  display: inline-block;
+  min-width: 1.7em;
+  padding: 0.05em 0.45em 0.1em;
+  border: 2px solid var(--ff-navy);
+  border-radius: 0.45em;
+  background: #fff;
+  box-shadow: 0 3px 0 var(--ff-navy);
+  font: inherit;
+  font-weight: 700;
+  text-align: center;
+  white-space: nowrap;
+}
+
+/* sound toggle (top-right on both screens) */
+.ff-sound-wrap {
+  position: absolute;
+  top: clamp(10px, 2vmin, 20px);
+  right: clamp(10px, 2vmin, 20px);
+  z-index: 3;
+}
+.ff-sound {
+  flex-direction: row;
+  min-height: clamp(44px, 6.4vmin, 56px);
+  padding: 0.2em 0.9em;
+  font-size: clamp(16px, 2.6vmin, 22px);
+  border-radius: 18px;
+}
+.ff-sound-icon {
+  width: 1.4em;
+  height: 1.4em;
+  flex: none;
+}
+.ff-sound-icon .slash {
+  display: none;
+}
+.ff-sound-icon.is-off .slash {
+  display: inline;
+}
+
+/* setup */
+.ff-setup {
+  gap: clamp(8px, 1.6vmin, 16px);
+  justify-content: flex-start;
+}
+.ff-setup-head {
+  display: flex;
+  align-items: center;
+  gap: clamp(10px, 2vmin, 20px);
+  width: min(1100px, 100%);
+}
+.ff-setup-head .ff-btn {
+  min-height: clamp(46px, 7vmin, 62px);
+  font-size: clamp(18px, 2.8vmin, 26px);
+  flex-direction: row;
+}
+.ff-setup-title {
+  margin: 0;
+  font-size: clamp(30px, 6.4vmin, 60px);
+  line-height: 1;
+  --r: 0.06em;
+}
+.ff-card {
+  pointer-events: auto;
+  border-radius: 28px;
+  background: rgba(255, 255, 255, 0.96);
+  color: var(--ff-navy);
+  box-shadow: 0 8px 0 rgba(11, 42, 91, 0.28), 0 22px 40px rgba(0, 0, 0, 0.22);
+}
+.ff-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: clamp(10px, 2.4vmin, 28px);
+  width: min(1100px, 100%);
+  padding: clamp(12px, 2.4vmin, 26px);
+}
+.ff-col {
+  display: flex;
+  flex-direction: column;
+  gap: clamp(8px, 1.8vmin, 18px);
+  min-width: 0;
+}
+@media (max-width: 860px) {
+  .ff-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.ff-field {
+  display: flex;
+  flex-direction: column;
+  gap: clamp(4px, 1vmin, 10px);
+  min-width: 0;
+}
+.ff-label {
+  font-size: clamp(16px, 2.6vmin, 24px);
+  font-weight: 700;
+  color: var(--ff-navy);
+}
+.ff-hint {
+  font-size: clamp(13px, 2vmin, 18px);
+  font-weight: 500;
+  color: var(--ff-navy);
+}
+.ff-seg {
+  display: flex;
+  gap: clamp(6px, 1.2vmin, 12px);
+}
+.ff-seg-btn {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: clamp(46px, 7vmin, 66px);
+  padding: 0.2em 0.5em;
+  font-size: clamp(17px, 3vmin, 28px);
+  border: 4px solid transparent;
+  background: #eef6ff;
+}
+.ff-seg-sub {
+  font-size: 0.62em;
+  font-weight: 500;
+  line-height: 1.2;
+}
+/* Selected = sunny face + navy border + check badge (never color alone). */
+.ff-seg-btn[aria-pressed="true"] {
+  background: var(--ff-sun);
+  border-color: var(--ff-navy);
+}
+.ff-seg-btn[aria-pressed="true"]::after {
+  content: "";
+  position: absolute;
+  top: -9px;
+  right: -9px;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--ff-navy) no-repeat center / 14px 14px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'%3E%3Cpath d='M2.5 7.5 L5.6 10.5 L11.5 3.5' fill='none' stroke='%23ffffff' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
+.ff-pcard {
+  display: flex;
+  flex-direction: column;
+  gap: clamp(6px, 1.2vmin, 12px);
+  padding: clamp(8px, 1.6vmin, 16px);
+  border-radius: 20px;
+  background: #eef6ff;
+  border-left: 10px solid var(--c, var(--ff-navy));
+}
+.ff-input {
+  pointer-events: auto;
+  width: 100%;
+  min-height: clamp(46px, 7vmin, 62px);
+  padding: 0.25em 0.7em;
+  border: 4px solid var(--ff-navy);
+  border-radius: 16px;
+  background: #fff;
+  color: var(--ff-navy);
+  font: inherit;
+  font-weight: 700;
+  font-size: clamp(18px, 3vmin, 28px);
+  -webkit-user-select: text;
+  user-select: text;
+}
+.ff-swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: clamp(6px, 1.2vmin, 12px);
+  padding: 6px 10px 8px;
+}
+.ff-swatch {
+  pointer-events: auto;
+  appearance: none;
+  -webkit-appearance: none;
+  position: relative;
+  flex: none;
+  width: clamp(36px, 6vmin, 52px);
+  height: clamp(36px, 6vmin, 52px);
+  padding: 0;
+  border: 4px solid #fff;
+  border-radius: 50%;
+  background: var(--c);
+  cursor: pointer;
+  box-shadow: 0 0 0 3px var(--ff-navy);
+  transition: transform 0.08s ease-out;
+}
+.ff-swatch:hover:not(:disabled) {
+  transform: scale(1.1);
+}
+.ff-swatch[aria-pressed="true"] {
+  box-shadow: 0 0 0 3px var(--ff-navy), 0 0 0 7px var(--ff-sun), 0 0 0 10px var(--ff-navy);
+}
+.ff-swatch[aria-pressed="true"]::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 46%;
+  width: 28%;
+  height: 52%;
+  border: solid #fff;
+  border-width: 0 5px 5px 0;
+  transform: translate(-50%, -50%) rotate(45deg);
+  filter: drop-shadow(0 0 2px rgba(0, 0, 0, 0.8));
+}
+.ff-swatch:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.ff-swatch[data-taken]::before {
+  content: attr(data-taken);
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  padding: 0 4px;
+  border-radius: 6px;
+  background: var(--ff-deep);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+.ff-start-wrap {
+  width: min(1100px, 100%);
+  padding-bottom: 8px;
+}
+.ff-start-wrap .ff-btn {
+  width: 100%;
+  flex-direction: row;
+}
+
+/* ───────────────────────── HUD: live layer ───────────────────────── */
+
+.ff-live {
+  --g: 1;
+  --uf: 1; /* the first viewport's panel scale (--u), set from hud.ts: the feed needs it to clear panels sized in --u */
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.ff-panels {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.ff-vp {
+  --u: 1;
+  --pc: #fff;
+  position: absolute;
+  pointer-events: none;
+}
+
+/* top-left: name + score / race position */
+.ff-tag {
+  position: absolute;
+  left: calc(16px * var(--u));
+  top: calc(16px * var(--u));
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: calc(8px * var(--u));
+}
+.ff-live.is-split .ff-tag {
+  top: calc(84px * var(--g)); /* leave room for the timer on the divider */
+}
+.ff-name {
+  max-width: calc(300px * var(--u));
+  padding: calc(3px * var(--u)) calc(16px * var(--u)) calc(5px * var(--u));
+  border: calc(3px * var(--u)) solid var(--pc);
+  border-radius: 999px;
+  background: var(--ff-panel);
+  color: var(--pc);
+  font-size: calc(28px * var(--u));
+  font-weight: 700;
+  line-height: 1.1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-shadow: 0 2px 0 rgba(0, 0, 0, 0.6);
+}
+.ff-scorebox,
+.ff-racebox {
+  display: flex;
+  align-items: baseline;
+  gap: calc(10px * var(--u));
+  padding: calc(2px * var(--u)) calc(18px * var(--u)) calc(6px * var(--u));
+  border-radius: calc(22px * var(--u));
+  background: var(--ff-panel);
+}
+.ff-vp:not(.is-race) .ff-racebox,
+.ff-vp.is-race .ff-scorebox {
+  display: none;
+}
+.ff-scorelbl {
+  font-size: calc(18px * var(--u));
+  font-weight: 600;
+}
+.ff-scorenum {
+  display: inline-block;
+  min-width: 1.1ch;
+  font-size: calc(64px * var(--u));
+  font-weight: 700;
+  line-height: 1;
+  text-align: center;
+}
+.ff-scorenum.pop,
+.ff-place.pop {
+  animation: ff-pop 0.45s ease-out;
+}
+.ff-racebox {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0;
+}
+.ff-place {
+  display: inline-block;
+  font-size: calc(58px * var(--u));
+  font-weight: 700;
+  line-height: 1.05;
+}
+.ff-raceline {
+  font-size: calc(24px * var(--u));
+  font-weight: 600;
+  line-height: 1.15;
+}
+
+/* race arrow: points at the next gate */
+.ff-arrow {
+  position: absolute;
+  left: 50%;
+  top: calc(92px * var(--g));
+  width: calc(88px * var(--u));
+  height: calc(88px * var(--u));
+  margin-left: calc(-44px * var(--u));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: calc(4px * var(--u)) solid #fff;
+  border-radius: 50%;
+  background: var(--ff-panel);
+}
+.ff-live.is-split .ff-arrow {
+  top: calc(16px * var(--u));
+}
+.ff-arrow svg {
+  width: 72%;
+  height: 72%;
+}
+
+/* reticle */
+.ff-reticle {
+  position: absolute;
+  left: 50%;
+  top: 46%;
+  width: calc(84px * var(--u));
+  height: calc(84px * var(--u));
+  translate: -50% -50%;
+}
+.ff-reticle svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+.ff-ret-back,
+.ff-ret-main {
+  fill: none;
+  stroke-linecap: round;
+}
+.ff-ret-back {
+  stroke: rgba(6, 23, 61, 0.85);
+  stroke-width: 11;
+}
+.ff-ret-main {
+  stroke: #fff;
+  stroke-width: 5;
+}
+.ff-ret-lock {
+  display: none;
+  fill: none;
+  stroke: #ff5a4d;
+  stroke-width: 7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  filter: drop-shadow(0 0 1.5px #fff) drop-shadow(0 0 1.5px #fff);
+}
+/* locked on: bright red with a white halo so it pops against both water and sky */
+.ff-reticle.is-locked .ff-ret-main {
+  stroke: #ff4a3d;
+}
+.ff-reticle.is-locked .ff-ret-back {
+  stroke: rgba(255, 255, 255, 0.95);
+}
+.ff-reticle.is-locked .ff-ret-lock {
+  display: inline;
+}
+.ff-reticle.is-locked svg {
+  animation: ff-lock 0.35s ease-out both;
+}
+.ff-lockname {
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  translate: -50% 0;
+  margin-top: calc(8px * var(--u));
+  padding: calc(2px * var(--u)) calc(16px * var(--u)) calc(4px * var(--u));
+  border: calc(3px * var(--u)) solid #fff;
+  border-radius: 999px;
+  background: var(--ff-red);
+  color: #fff;
+  font-size: calc(24px * var(--u));
+  font-weight: 700;
+  line-height: 1.15;
+  white-space: nowrap;
+}
+
+/* bottom-left: power-up, ammo, boost */
+.ff-cluster {
+  position: absolute;
+  left: calc(16px * var(--u));
+  bottom: calc(16px * var(--u));
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: calc(8px * var(--u));
+}
+.ff-power {
+  --k: var(--ff-orange);
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: calc(10px * var(--u));
+  overflow: hidden;
+  padding: calc(5px * var(--u)) calc(18px * var(--u)) calc(11px * var(--u)) calc(8px * var(--u));
+  border: calc(3px * var(--u)) solid #fff;
+  border-radius: 999px;
+  background: var(--k);
+  color: var(--ff-deep);
+}
+.ff-power-icon {
+  flex: none;
+  width: calc(38px * var(--u));
+  height: calc(38px * var(--u));
+}
+.ff-power-icon svg {
+  width: 100%;
+  height: 100%;
+}
+.ff-power-text {
+  display: flex;
+  align-items: baseline;
+  gap: calc(10px * var(--u));
+  font-size: calc(22px * var(--u));
+  font-weight: 700;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+.ff-power-secs {
+  min-width: 2ch;
+  font-size: calc(30px * var(--u));
+  text-align: right;
+}
+.ff-power-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: calc(7px * var(--u));
+  background: var(--ff-deep);
+  transform-origin: left center;
+}
+.ff-shield {
+  display: flex;
+  align-items: center;
+  gap: calc(8px * var(--u));
+  padding: calc(4px * var(--u)) calc(18px * var(--u)) calc(5px * var(--u)) calc(8px * var(--u));
+  border: calc(3px * var(--u)) solid #fff;
+  border-radius: 999px;
+  background: #aef0ff;
+  color: var(--ff-deep);
+  font-size: calc(22px * var(--u));
+  font-weight: 700;
+  line-height: 1.1;
+}
+.ff-shield svg {
+  width: calc(30px * var(--u));
+  height: calc(30px * var(--u));
+}
+.ff-ammo {
+  display: flex;
+  align-items: center;
+  gap: calc(10px * var(--u));
+  padding: calc(7px * var(--u)) calc(16px * var(--u)) calc(7px * var(--u)) calc(8px * var(--u));
+  border-radius: calc(24px * var(--u));
+  background: var(--ff-panel);
+}
+.ff-reload {
+  position: relative;
+  flex: none;
+  width: calc(44px * var(--u));
+  height: calc(44px * var(--u));
+  border-radius: 50%;
+  background: conic-gradient(var(--ff-sun) calc(var(--p, 0) * 360deg), rgba(255, 255, 255, 0.28) 0);
+  visibility: hidden;
+}
+.ff-reload.on {
+  visibility: visible;
+}
+.ff-reload::after {
+  content: "";
+  position: absolute;
+  inset: calc(7px * var(--u));
+  border-radius: 50%;
+  background: var(--ff-deep);
+}
+.ff-reload svg {
+  position: absolute;
+  inset: calc(11px * var(--u));
+  z-index: 1;
+  width: calc(22px * var(--u));
+  height: calc(22px * var(--u));
+}
+.ff-darts {
+  display: flex;
+  gap: calc(6px * var(--u));
+}
+.ff-dart {
+  width: calc(18px * var(--u));
+  height: calc(46px * var(--u));
+}
+.ff-dart.is-spent {
+  opacity: 0.28;
+  filter: grayscale(1);
+}
+.ff-boost {
+  display: flex;
+  align-items: center;
+  gap: calc(10px * var(--u));
+  padding: calc(5px * var(--u)) calc(16px * var(--u)) calc(6px * var(--u));
+  border-radius: calc(20px * var(--u));
+  background: var(--ff-panel);
+}
+.ff-boost-lbl {
+  font-size: calc(20px * var(--u));
+  font-weight: 700;
+}
+.ff-boost-track {
+  width: calc(170px * var(--u));
+  height: calc(22px * var(--u));
+  overflow: hidden;
+  border: calc(3px * var(--u)) solid #fff;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.2);
+}
+.ff-boost-fill {
+  width: 100%;
+  height: 100%;
+  background: #33d6ff;
+  transform-origin: left center;
+}
+
+/* announcements (big bouncy text) */
+.ff-ann {
+  --base: calc(120px * var(--u));
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 78%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+.ff-ann--global {
+  --base: calc(150px * var(--g));
+  inset: 0;
+  height: auto;
+}
+.ff-ann-in {
+  max-width: 94%;
+  text-align: center;
+  opacity: 0;
+}
+.ff-ann-in.on {
+  animation: ff-ann var(--ms, 1200ms) cubic-bezier(0.2, 0.9, 0.3, 1) both;
+}
+.ff-ann-text {
+  font-size: calc(var(--base) * var(--s, 1));
+  font-weight: 700;
+  line-height: 1;
+  color: #fff;
+}
+.ff-ann-sub {
+  margin-top: 0.3em;
+  font-size: calc(var(--base) * 0.22);
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--ff-sun);
+}
+
+/* top-center timer */
+.ff-timer {
+  position: absolute;
+  left: 50%;
+  top: calc(10px * var(--g));
+  translate: -50% 0;
+  min-width: calc(160px * var(--g));
+  padding: calc(2px * var(--g)) calc(26px * var(--g)) calc(6px * var(--g));
+  border: calc(4px * var(--g)) solid #fff;
+  border-radius: calc(30px * var(--g));
+  background: var(--ff-panel);
+  font-size: calc(56px * var(--g));
+  font-weight: 700;
+  line-height: 1.15;
+  text-align: center;
+  white-space: nowrap;
+}
+.ff-timer.is-race {
+  min-width: calc(230px * var(--g));
+}
+.ff-timer.is-urgent {
+  border-color: var(--ff-sun); /* red + yellow border + pulse, so it is not only a color change */
+  background: var(--ff-red);
+  animation: ff-urgent 0.5s ease-in-out infinite alternate;
+}
+
+/* top-right scoreboard */
+.ff-sb {
+  position: absolute;
+  top: calc(14px * var(--g));
+  right: calc(14px * var(--g));
+  width: calc(250px * var(--g));
+  display: flex;
+  flex-direction: column;
+  gap: calc(4px * var(--g));
+  font-size: calc(21px * var(--g));
+}
+.ff-sbrow {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  padding: 0.12em 0.7em 0.18em 0.4em;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: var(--ff-panel);
+  color: #fff;
+  font-weight: 600;
+  line-height: 1.25;
+}
+.ff-sbrow.is-human {
+  border-color: var(--ff-sun);
+  background: #fff;
+  color: var(--ff-navy);
+  font-weight: 700;
+}
+.ff-sb-rank {
+  flex: none;
+  width: 1.1em;
+  text-align: center;
+  opacity: 0.85;
+}
+.ff-sb-dot {
+  flex: none;
+  width: 0.9em;
+  height: 0.9em;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: var(--c, #fff);
+  box-shadow: 0 0 0 2px var(--ff-navy);
+}
+.ff-sb-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ff-sb-score {
+  flex: none;
+  min-width: 1.4em;
+  text-align: right;
+  font-weight: 700;
+}
+.ff-sb.is-race .ff-sb-score {
+  display: none;
+}
+
+/*
+ * Top-center event feed: compact, newest line on top, three at most (hud.ts trims it).
+ * It hangs just under the timer (which ends ~90g down). Its width stays under 40% of the window so it
+ * can't touch the 2-player arrows (centered at 25% and 75%) or the top-right scoreboard.
+ * --uf is the HUD panel scale (--u) of the first viewport, copied onto .ff-live by hud.ts, because the
+ * pieces the feed must step around (arrow, name/score panels) are sized in --u while the feed is in --g.
+ */
+.ff-feed {
+  position: absolute;
+  left: 50%;
+  top: calc(98px * var(--g));
+  translate: -50% 0;
+  width: min(36%, calc(520px * var(--g)));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: calc(4px * var(--g));
+  font-size: calc(19px * var(--g));
+}
+/* 1 player, race: the next-gate arrow (92g down, 88u tall) hangs under the timer, so go under it. */
+.ff-live.is-race .ff-feed {
+  top: calc(98px * var(--g) + 88px * var(--uf));
+}
+/* 2 players: each name/score panel starts 16u from its half's left edge, so player 2's sits flush against the
+   center line and would sit under a centered feed. Drop the feed to just below those panels (84g + ~125u tall).
+   Race panels are taller (place + lap + gate lines, ~177u). */
+.ff-live.is-split .ff-feed {
+  top: calc(92px * var(--g) + 128px * var(--uf));
+}
+.ff-live.is-split.is-race .ff-feed {
+  top: calc(92px * var(--g) + 182px * var(--uf));
+}
+.ff-feed-item {
+  max-width: 100%;
+  padding: 0.1em 0.8em 0.16em 0.6em;
+  border-radius: 999px;
+  background: var(--ff-panel);
+  color: #fff;
+  font-weight: 600;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  animation: ff-feed 4.6s ease-out forwards;
+}
+.ff-feed-item::before {
+  content: "";
+  display: inline-block;
+  width: 0.6em;
+  height: 0.6em;
+  margin-right: 0.5em;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: var(--fc, #fff);
+  vertical-align: baseline;
+}
+
+/* ───────────────────────── pause + results overlays ───────────────────────── */
+
+.ff-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: clamp(8px, 2vmin, 24px);
+  background: rgba(6, 23, 61, 0.55);
+  pointer-events: none;
+}
+.ff-card--dark {
+  background: #0b3b86;
+  color: #fff;
+  border: 6px solid #fff;
+}
+.ff-card--pause {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: clamp(10px, 2vmin, 20px);
+  min-width: min(90vw, 480px);
+  padding: clamp(18px, 4vmin, 40px) clamp(22px, 6vmin, 64px);
+  text-align: center;
+}
+.ff-card--pause .ff-row {
+  display: flex;
+}
+.ff-card--pause .ff-btn {
+  flex: 1;
+  flex-direction: row;
+}
+.ff-h1 {
+  margin: 0 0 0.1em;
+  font-size: clamp(40px, 10vmin, 96px);
+  line-height: 1;
+  color: var(--ff-sun);
+  --r: 0.06em;
+}
+
+.ff-card--results {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: clamp(8px, 1.8vmin, 18px);
+  width: min(1100px, 100%);
+  max-height: 100%;
+  padding: clamp(12px, 2.6vmin, 28px);
+  overflow-y: auto;
+}
+.ff-res-title {
+  margin: 0;
+  font-size: clamp(30px, 8vmin, 76px);
+  line-height: 1.05;
+  text-align: center;
+  color: var(--ff-sun);
+  --r: 0.06em;
+}
+.ff-res-body {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: clamp(10px, 2.4vmin, 28px);
+  align-items: end;
+}
+@media (max-width: 800px) {
+  .ff-res-body {
+    grid-template-columns: 1fr;
+  }
+}
+.ff-podium {
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  gap: clamp(6px, 1.6vmin, 16px);
+}
+.ff-pod {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: clamp(96px, 20vmin, 200px);
+  min-width: 0;
+  animation: ff-rise-in 0.6s cubic-bezier(0.2, 0.9, 0.3, 1.2) both;
+  animation-delay: var(--dl, 0s);
+}
+.ff-pod-disc {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: clamp(44px, 9vmin, 84px);
+  height: clamp(44px, 9vmin, 84px);
+  border: 4px solid #fff;
+  border-radius: 50%;
+  background: var(--c);
+}
+.ff-pod-disc svg {
+  width: 72%;
+  height: 72%;
+}
+.ff-crown {
+  position: absolute;
+  left: 50%;
+  top: -48%;
+  width: 70%;
+  translate: -50% 0;
+}
+.ff-pod-name {
+  max-width: 100%;
+  margin-top: 0.2em;
+  overflow: hidden;
+  font-size: clamp(16px, 3vmin, 28px);
+  font-weight: 700;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ff-pod-detail {
+  margin-bottom: 0.3em;
+  font-size: clamp(13px, 2.2vmin, 20px);
+  font-weight: 500;
+  line-height: 1.15;
+}
+.ff-pod-block {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  border-radius: 14px 14px 0 0;
+  color: var(--ff-navy);
+  font-size: clamp(26px, 7vmin, 64px);
+  font-weight: 700;
+}
+.ff-pod--p1 .ff-pod-block {
+  height: clamp(70px, 16vmin, 150px);
+  background: #ffd23f;
+}
+.ff-pod--p2 .ff-pod-block {
+  height: clamp(54px, 12vmin, 112px);
+  background: #e4ebf5;
+}
+.ff-pod--p3 .ff-pod-block {
+  height: clamp(42px, 9vmin, 84px);
+  background: #f2a65a;
+}
+.ff-table {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+.ff-trow {
+  display: flex;
+  align-items: center;
+  gap: 0.6em;
+  min-height: clamp(30px, 5.2vmin, 44px);
+  padding: 0.1em 0.8em 0.14em 0.5em;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+  font-size: clamp(15px, 2.6vmin, 24px);
+  font-weight: 600;
+  line-height: 1.2;
+}
+.ff-trow.is-human {
+  background: #fff;
+  color: var(--ff-navy);
+  font-weight: 700;
+}
+.ff-trow-place {
+  flex: none;
+  width: 1.8em;
+  text-align: center;
+  font-weight: 700;
+}
+.ff-trow-dot {
+  flex: none;
+  width: 0.9em;
+  height: 0.9em;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: var(--c);
+  box-shadow: 0 0 0 2px var(--ff-navy);
+}
+.ff-trow-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ff-trow-star {
+  flex: none;
+  width: 1em;
+  height: 1em;
+  vertical-align: -0.12em;
+}
+.ff-trow-detail {
+  flex: none;
+  text-align: right;
+}
+.ff-res-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: clamp(10px, 2vmin, 24px);
+}
+.ff-res-actions .ff-btn {
+  flex-direction: row;
+  min-width: min(100%, 260px);
+}
+
+/* confetti */
+.ff-confetti {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.ff-confetti i {
+  position: absolute;
+  top: -6vh;
+  left: var(--x);
+  width: var(--w);
+  height: calc(var(--w) * 1.6);
+  border-radius: 3px;
+  background: var(--c);
+  animation: ff-fall var(--d) linear infinite;
+  animation-delay: var(--dl);
+}
+
+/* ───────────────────────── animations ───────────────────────── */
+
+@keyframes ff-bob {
+  0%, 100% { transform: translateY(0) rotate(0deg); }
+  50% { transform: translateY(-0.06em) rotate(2deg); }
+}
+@keyframes ff-bob2 {
+  0%, 100% { transform: translateY(0) rotate(-2deg); }
+  50% { transform: translateY(-10px) rotate(2deg); }
+}
+@keyframes ff-rise {
+  from { transform: translateY(0); opacity: 0.9; }
+  to { transform: translateY(-115vh); opacity: 0.2; }
+}
+@keyframes ff-wave {
+  from { transform: translateX(0); }
+  to { transform: translateX(-480px); }
+}
+@keyframes ff-pop {
+  0% { scale: 1; }
+  35% { scale: 1.45; }
+  100% { scale: 1; }
+}
+@keyframes ff-lock {
+  0% { scale: 1.6; opacity: 0.4; }
+  100% { scale: 1; opacity: 1; }
+}
+@keyframes ff-urgent {
+  from { scale: 1; }
+  to { scale: 1.1; }
+}
+@keyframes ff-ann {
+  0% { opacity: 0; transform: scale(0.4) rotate(-6deg); }
+  12% { opacity: 1; transform: scale(1.25) rotate(3deg); }
+  22% { transform: scale(0.92) rotate(-2deg); }
+  32% { transform: scale(1.06) rotate(0deg); }
+  42% { transform: scale(1); }
+  82% { opacity: 1; transform: scale(1); }
+  100% { opacity: 0; transform: scale(1.12); }
+}
+@keyframes ff-feed {
+  0% { opacity: 0; transform: translateY(-12px) scale(0.92); } /* drops in from the timer above */
+  7% { opacity: 1; transform: none; }
+  80% { opacity: 1; transform: none; }
+  100% { opacity: 0; transform: none; }
+}
+@keyframes ff-rise-in {
+  0% { opacity: 0; transform: translateY(40px) scale(0.8); }
+  100% { opacity: 1; transform: none; }
+}
+@keyframes ff-fall {
+  from { transform: translateY(0) rotate(0deg); }
+  to { transform: translateY(112vh) rotate(720deg); }
+}
+/* Fade-only versions for people who asked their system for less motion. */
+@keyframes ff-fade-ann {
+  0% { opacity: 0; }
+  10% { opacity: 1; }
+  85% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ff-logo-letter,
+  .ff-boat-art,
+  .ff-bubble,
+  .ff-waves::before,
+  .ff-waves::after,
+  .ff-confetti i,
+  .ff-timer.is-urgent,
+  .ff-scorenum.pop,
+  .ff-place.pop,
+  .ff-reticle.is-locked svg {
+    animation: none;
+  }
+  .ff-ann-in.on {
+    animation: ff-fade-ann var(--ms, 1200ms) linear both;
+  }
+  .ff-feed-item {
+    animation: ff-fade-ann 4.6s linear forwards;
+  }
+  .ff-pod {
+    animation: none;
+  }
+  .ff-btn {
+    transition: none;
+  }
+}
