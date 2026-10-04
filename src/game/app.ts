@@ -28,6 +28,7 @@ import { V2_METHODS, buildOrFallback, guard } from './guard';
 import { Match, STEP } from './match';
 import { createBotController, createHud, createInput, createMenu, createSfx, loadGuestNet, loadHostNet } from './modules';
 import { defaultPlayer, defaultSetup, sanitizeSetup, setupFromQuery } from './setup';
+import { watchForUpdates, type UpdateWatcher } from './updates';
 import { clamp, topSpeedOf, wrapPi } from './util';
 
 type AppState = 'menu' | 'countdown' | 'playing' | 'paused' | 'results';
@@ -93,6 +94,8 @@ const probe = (o: object | null, key: keyof NetProbe): number => {
 class FoamApp {
   private state: AppState = 'menu';
   private readonly root: HTMLElement;
+  /** "A new version is ready!" banner (menus only). */
+  private readonly updates: UpdateWatcher;
   private readonly renderer: THREE.WebGLRenderer;
   private readonly sfx: Sfx;
   private readonly input: InputManager;
@@ -151,6 +154,7 @@ class FoamApp {
     const params = new URLSearchParams(window.location.search);
     const root = document.getElementById('app') ?? document.body;
     this.root = root;
+    this.updates = watchForUpdates(root);
     const hudRoot = layer(root, 'hud');
     const menuRoot = layer(root, 'menu');
 
@@ -261,6 +265,7 @@ class FoamApp {
   private setState(next: AppState): void {
     this.state = next;
     foam.state = next;
+    this.updates.setAllowed(next === 'menu');
     this.syncTouch();
     this.mirrorState(next);
   }
